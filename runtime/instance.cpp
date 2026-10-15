@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "instance.h"
+#include "child.h"
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -31,33 +32,12 @@ std::string apk_sha256(const std::string& path) {
     Fd apk(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     struct stat info{};
     require(apk.get() >= 0 && fstat(apk.get(), &info) == 0 && S_ISREG(info.st_mode), "open APK");
-    int pipefd[2];
-    require(pipe2(pipefd, O_CLOEXEC) == 0, "hash pipe");
-    Fd input(pipefd[0]), output(pipefd[1]);
-    const auto pid = fork();
-    require(pid >= 0, "hash fork");
-    if (pid == 0) {
-        sigset_t empty;
-        sigemptyset(&empty);
-        sigprocmask(SIG_SETMASK, &empty, nullptr);
-        alarm(30);
-        if (dup2(apk.get(), STDIN_FILENO) < 0 || dup2(output.get(), STDOUT_FILENO) < 0) _exit(126);
-        execl("/system/bin/sha256sum", "sha256sum", static_cast<char*>(nullptr));
-        _exit(127);
-    }
-    output = Fd();
-    std::string hash;
-    char buffer[128];
-    while (true) {
-        auto count = read(input.get(), buffer, sizeof(buffer));
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) break;
-        if (hash.size() < 256) hash.append(buffer, static_cast<size_t>(count));
-    }
-    int status = 0;
-    pid_t waited;
-    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
-    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) || hash.size() < 65 || hash[64] != ' ' ||
+    ChildOptions options;
+    options.argv = {"/system/bin/sha256sum"};
+    options.stdio[0] = apk.get();
+    auto result = Child(options).communicate({}, std::chrono::seconds(30), 256);
+    const auto& hash = result.output;
+    if (result.exit_code || result.timed_out || result.truncated || hash.size() < 65 || hash[64] != ' ' ||
         hash.substr(0, 64).find_first_not_of("0123456789abcdef") != std::string::npos)
         throw std::runtime_error("APK SHA-256 failed");
     return hash.substr(0, 64);
