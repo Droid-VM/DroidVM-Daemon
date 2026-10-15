@@ -2,6 +2,8 @@
 // Extracted from the existing console/ipc_proto.cpp JSON and frame contract.
 #include "wire.h"
 #include <memory>
+#include <ostream>
+#include <streambuf>
 #include <stdexcept>
 
 namespace droidvm::wire {
@@ -35,5 +37,33 @@ std::string stringify(const Json::Value& value, bool pretty) {
     Json::StreamWriterBuilder builder;
     builder["indentation"] = pretty ? "  " : "";
     return Json::writeString(builder, value);
+}
+std::string stringify_bounded(const Json::Value& value, size_t max_bytes) {
+    class Buffer final : public std::streambuf {
+    public:
+        explicit Buffer(size_t limit) : limit_(limit) { data.reserve(limit); }
+        std::string data;
+    private:
+        size_t limit_;
+        std::streamsize xsputn(const char* text, std::streamsize count) override {
+            if (count < 0 || static_cast<size_t>(count) > limit_ - data.size())
+                throw std::length_error("JSON output exceeds reservation");
+            data.append(text, static_cast<size_t>(count));
+            return count;
+        }
+        int_type overflow(int_type byte) override {
+            if (traits_type::eq_int_type(byte, traits_type::eof())) return traits_type::not_eof(byte);
+            const char value = traits_type::to_char_type(byte);
+            xsputn(&value, 1);
+            return byte;
+        }
+    } buffer(max_bytes);
+    std::ostream output(&buffer);
+    output.exceptions(std::ios::badbit | std::ios::failbit);
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
+    writer->write(value, &output);
+    return std::move(buffer.data);
 }
 }

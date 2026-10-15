@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "common/fd.h"
+#include "common/identity.h"
 #include <string>
 #include <string_view>
 
 namespace droidvm {
-std::string random_id(bool uuid);
 std::string apk_sha256(const std::string& path);
 class Instance {
 public:

@@ -2,6 +2,7 @@
 #pragma once
 #include <json/json.h>
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -11,4 +12,6 @@ uint32_t payload_size(const void* header);
 std::string frame(std::string_view json, bool trailing_nul = false);
 Json::Value parse(std::string_view json);
 std::string stringify(const Json::Value& value, bool pretty = false);
+// Stop writing as soon as the encoded result would exceed the reservation.
+std::string stringify_bounded(const Json::Value& value, size_t max_bytes);
 }
