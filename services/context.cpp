@@ -14,6 +14,8 @@ const char* error_code_name(ErrorCode code) {
         case ErrorCode::task_epoch_mismatch: return "TASK_EPOCH_MISMATCH";
         case ErrorCode::task_not_found: return "TASK_NOT_FOUND";
         case ErrorCode::not_cancellable: return "NOT_CANCELLABLE";
+        case ErrorCode::resync_required: return "RESYNC_REQUIRED";
+        case ErrorCode::snapshot_expired: return "SNAPSHOT_EXPIRED";
     }
     return "INTERNAL";
 }

@@ -2,6 +2,7 @@
 #include "runtime/instance.h"
 #include "services/system.h"
 #include "transport/server.h"
+#include "transport/dispatcher.h"
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
 #include <signal.h>
@@ -16,7 +17,7 @@ int main(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--help") {
                 std::cout << "Usage: droidvmd --run-dir <existing-directory> --apk <installed-apk> [--force]\n"
-                             "Development native daemon; currently auth/ping/version/capabilities only.\n";
+                             "Development native daemon; system and task observation APIs only.\n";
                 return 0;
             } else if (arg == "--force") force = true;
             else if (arg == "--run-dir" && i + 1 < argc) directory = argv[++i];
@@ -34,9 +35,12 @@ int main(int argc, char** argv) {
         prctl(PR_SET_NAME, "droidvmd");
         droidvm::Instance instance(directory, force);
         const auto token = droidvm::random_id(false);
+        const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
+        droidvm::TaskService tasks;
         droidvm::SystemService system([&] { return instance.token_exists(); }, [&] { return instance.read_token(); },
-                                      droidvm::apk_sha256(apk));
-        return droidvm::serve(instance, system, token.c_str(), signal_fd.get());
+                                      hash, tasks.epoch());
+        droidvm::RequestDispatcher dispatcher(system, tasks);
+        return droidvm::serve(instance, dispatcher, token.c_str(), signal_fd.get());
     } catch (const std::exception& error) {
         std::cerr << "droidvmd: " << error.what() << '\n';
         return 1;

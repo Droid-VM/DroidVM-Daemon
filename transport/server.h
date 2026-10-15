@@ -2,6 +2,6 @@
 #pragma once
 namespace droidvm {
 class Instance;
-class SystemService;
-int serve(Instance& instance, SystemService& service, const char* token, int signal_fd);
+class RequestDispatcher;
+int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd);
 }

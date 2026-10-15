@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "system.h"
-#include "runtime/instance.h"
 #include "build_metadata.h"
 
 namespace droidvm {
@@ -12,9 +11,9 @@ Json::Value failure(const char* message) {
     return result;
 }
 }
-SystemService::SystemService(std::function<bool()> token_exists, std::function<std::string()> read_token, std::string apk_hash)
+SystemService::SystemService(std::function<bool()> token_exists, std::function<std::string()> read_token, std::string apk_hash, std::string epoch)
     : token_exists_(std::move(token_exists)), read_token_(std::move(read_token)),
-      apk_hash_(std::move(apk_hash)), epoch_(random_id(true)) {}
+      apk_hash_(std::move(apk_hash)), epoch_(std::move(epoch)) {}
 Json::Value SystemService::execute(Caller& caller, const std::string& command, const Json::Value& request) const {
     Json::Value result(Json::objectValue);
     result["success"] = true;

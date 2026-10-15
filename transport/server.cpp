@@ -3,7 +3,7 @@
 #include "common/fd.h"
 #include "common/wire.h"
 #include "runtime/instance.h"
-#include "services/system.h"
+#include "dispatcher.h"
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -24,7 +24,7 @@ constexpr size_t max_clients = 64, max_input = 32u << 20, max_output = 16u << 20
 constexpr size_t per_client_output = 2u << 20, io_budget = 64u << 10;
 struct Client {
     Fd fd;
-    Caller caller{random_id(true), false};
+    ClientSession session{{random_id(true), false}, {}, 0};
     std::string incoming;
     uint32_t payload = 0;
     size_t queued = 0, sent = 0;
@@ -50,7 +50,7 @@ std::string request_id(const Json::Value& request) {
     return id;
 }
 }
-int serve(Instance& instance, SystemService& service, const char* token, int signal_fd) {
+int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd) {
     Fd epoll(epoll_create1(EPOLL_CLOEXEC));
     Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (epoll.get() < 0 || listener.get() < 0) throw std::runtime_error("create listener failed");
@@ -70,8 +70,11 @@ int serve(Instance& instance, SystemService& service, const char* token, int sig
     uint64_t next_id = 3;
     size_t input_reserved = 0, output_reserved = 0;
     std::array<epoll_event, 32> events{};
+    bool subscribed = false;
     while (true) {
-        int count = epoll_wait(epoll.get(), events.data(), events.size(), -1);
+        // Only subscribed connections need a bounded tail-poll interval. Signals
+        // and network IO still wake epoll immediately; workers run no transport code.
+        int count = epoll_wait(epoll.get(), events.data(), events.size(), subscribed ? 25 : -1);
         if (count < 0 && errno == EINTR) continue;
         if (count < 0) throw std::runtime_error("epoll_wait failed");
         for (int i = 0; i < count; ++i) {
@@ -79,7 +82,10 @@ int serve(Instance& instance, SystemService& service, const char* token, int sig
             const auto flags = events[i].events;
             if (id == 2) {
                 signalfd_siginfo signal{};
-                if (read(signal_fd, &signal, sizeof(signal)) == sizeof(signal)) return 128 + signal.ssi_signo;
+                if (read(signal_fd, &signal, sizeof(signal)) == sizeof(signal)) {
+                    for (auto& [key, client] : clients) service.disconnected(client->session);
+                    return 128 + signal.ssi_signo;
+                }
                 continue;
             }
             if (id == 1) {
@@ -134,7 +140,7 @@ int serve(Instance& instance, SystemService& service, const char* token, int sig
                         if (!request.isObject() || request.get("type", Json::Value()) != "request" || !request["command"].isString()) continue;
                         const auto correlation = request_id(request);
                         if (correlation.empty()) continue;
-                        auto response = service.execute(client.caller, request["command"].asString(), request);
+                        auto response = service.execute(client.session, request["command"].asString(), request);
                         response["type"] = "response";
                         response["request_id"] = correlation;
                         auto frame = wire::frame(wire::stringify(response), true);
@@ -171,10 +177,40 @@ int serve(Instance& instance, SystemService& service, const char* token, int sig
                     (client.eof ? 0u : unsigned(EPOLLIN | EPOLLRDHUP)) | (client.outgoing.empty() ? 0u : unsigned(EPOLLOUT)));
             } catch (const std::exception&) { alive = false; }
             if (!alive) {
+                service.disconnected(client.session);
                 input_reserved -= client.payload;
                 output_reserved -= client.queued;
                 epoll_ctl(epoll.get(), EPOLL_CTL_DEL, client.fd.get(), nullptr);
                 clients.erase(found);
+            }
+        }
+        subscribed = false;
+        for (auto it = clients.begin(); it != clients.end();) {
+            auto& client = *it->second;
+            bool alive = true;
+            try {
+                if (!client.eof && !client.session.subscription.empty()) {
+                    if (auto value = service.events(client.session)) {
+                        auto frame = wire::frame(wire::stringify(*value), true);
+                        if (frame.size() > per_client_output - client.queued || frame.size() > max_output - output_reserved) alive = false;
+                        else {
+                            client.queued += frame.size();
+                            output_reserved += frame.size();
+                            client.outgoing.push_back(std::move(frame));
+                            watch(epoll.get(), EPOLL_CTL_MOD, client.fd.get(), it->first, EPOLLIN | EPOLLRDHUP | EPOLLOUT);
+                        }
+                    }
+                }
+            } catch (const std::exception&) { alive = false; }
+            if (alive) {
+                subscribed |= !client.eof && !client.session.subscription.empty();
+                ++it;
+            } else {
+                service.disconnected(client.session);
+                input_reserved -= client.payload;
+                output_reserved -= client.queued;
+                epoll_ctl(epoll.get(), EPOLL_CTL_DEL, client.fd.get(), nullptr);
+                it = clients.erase(it);
             }
         }
     }

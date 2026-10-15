@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -24,6 +25,29 @@ const char* task_state_name(TaskState state) {
         case TaskState::cancelled: return "cancelled";
     }
     return "failed";
+}
+Json::Value task_summary(const TaskView& task) {
+    Json::Value value;
+    value["epoch"] = task.ref.epoch;
+    value["task_id"] = task.ref.id;
+    value["revision"] = std::to_string(task.revision);
+    value["kind"] = task.kind;
+    value["owner"] = task.owner;
+    value["resource"] = task.resource;
+    value["state"] = task_state_name(task.state);
+    value["cancellable"] = task.cancellable;
+    value["phase"] = task.progress.phase;
+    value["unit"] = task.progress.unit;
+    value["completed"] = std::to_string(task.progress.completed);
+    if (task.progress.total) value["total"] = std::to_string(*task.progress.total);
+    value["created_monotonic_ms"] = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(task.created.time_since_epoch()).count());
+    if (task.finished) value["finished_monotonic_ms"] = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(task.finished->time_since_epoch()).count());
+    value["result_available"] = task.state == TaskState::succeeded;
+    if (task.error) {
+        value["error"]["code"] = error_code_name(*task.error);
+        value["error"]["message"] = task.message;
+    }
+    return value;
 }
 TaskCompletion TaskCompletion::success(Json::Value value) {
     return {TaskState::succeeded, std::move(value), ErrorCode::internal, {}};
@@ -47,19 +71,31 @@ struct Job { std::shared_ptr<Record> record; TaskService::Work work; };
 struct Shared {
     std::mutex mutex;
     std::condition_variable ready;
-    const std::string epoch = random_id(true);
+    EventJournal events;
+    const std::string epoch;
     TaskLimits limits;
     TaskService::Now now;
     std::unordered_map<std::string, std::shared_ptr<Record>> records;
     std::deque<Job> queue;
     size_t reserved = 0;
     bool stopping = false;
-    Shared(TaskLimits limits, TaskService::Now now) : limits(limits), now(std::move(now)) {}
+    Shared(TaskLimits limits, TaskService::Now now, EventLimits event_limits)
+        : events(event_limits, now), epoch(events.epoch()), limits(limits), now(std::move(now)) {}
+    void changed(Record& record) noexcept {
+        record.view.revision = events.sequence() == std::numeric_limits<uint64_t>::max() ? events.sequence() : events.sequence() + 1;
+        try { events.publish("task.changed", record.view.ref.id, record.view.owner, task_summary(record.view)); }
+        catch (...) { events.missed(); }
+    }
     void reap() {
         const auto time = now();
         for (auto it = records.begin(); it != records.end();) {
             const auto& record = *it->second;
             if (record.view.finished && time - *record.view.finished >= limits.retention) {
+                try {
+                    Json::Value removed;
+                    removed["task_id"] = record.view.ref.id;
+                    events.publish("task.removed", record.view.ref.id, record.view.owner, removed);
+                } catch (...) { events.missed(); }
                 reserved -= record.reservation;
                 it = records.erase(it);
             } else ++it;
@@ -69,6 +105,7 @@ struct Shared {
         record.view.state = state;
         record.view.cancellable = false;
         record.view.finished = now();
+        changed(record);
     }
 };
 }
@@ -104,7 +141,10 @@ bool TaskControl::cancellation_requested() const {
 bool TaskControl::enter_commit() {
     std::lock_guard lock(shared_->mutex);
     if (record_->view.state != TaskState::running) return false;
-    record_->view.cancellable = false;
+    if (record_->view.cancellable) {
+        record_->view.cancellable = false;
+        shared_->changed(*record_);
+    }
     return true;
 }
 void TaskControl::progress(TaskProgress value) {
@@ -116,17 +156,18 @@ void TaskControl::progress(TaskProgress value) {
     if (previous.phase == value.phase && previous.unit == value.unit && value.completed < previous.completed)
         throw ServiceError(ErrorCode::invalid_argument, "Task progress moved backwards");
     record_->view.progress = std::move(value);
+    shared_->changed(*record_);
 }
 
 struct TaskService::Impl {
     std::shared_ptr<task_detail::Shared> shared;
     std::vector<std::thread> workers;
     std::mutex join_mutex;
-    Impl(TaskLimits limits, Now now) : shared(std::make_shared<task_detail::Shared>(limits, std::move(now))) {
+    Impl(TaskLimits limits, Now now, EventLimits event_limits) : shared(std::make_shared<task_detail::Shared>(limits, std::move(now), event_limits)) {
         if (!limits.workers || limits.workers > 64 || !limits.queued || !limits.records ||
             limits.max_result_bytes < 4 || limits.max_result_bytes > wire::max_payload ||
             limits.retained_bytes < task_detail::metadata_reservation + 4 ||
-            limits.retention < std::chrono::milliseconds::zero() || !shared->now)
+            limits.retention < std::chrono::milliseconds::zero() || !shared->now || event_limits.max_event_bytes < (16u << 10))
             throw ServiceError(ErrorCode::invalid_argument, "Invalid task limits");
         workers.reserve(limits.workers);
         try {
@@ -147,6 +188,7 @@ struct TaskService::Impl {
                 shared->queue.pop_front();
                 job.record->view.state = TaskState::running;
                 job.record->view.cancellable = job.record->operation_cancellable;
+                shared->changed(*job.record);
             }
             TaskControl control(shared, job.record);
             TaskCompletion completion = TaskCompletion::failure(ErrorCode::internal, "Task failed");
@@ -197,6 +239,7 @@ struct TaskService::Impl {
                 if (record->view.state == TaskState::running && record->view.cancellable) {
                     record->view.state = TaskState::cancelling;
                     record->view.cancellable = false;
+                    shared->changed(*record);
                 }
             }
         }
@@ -205,7 +248,7 @@ struct TaskService::Impl {
         for (auto& worker : workers) if (worker.joinable()) worker.join();
     }
 };
-TaskService::TaskService(TaskLimits limits, Now now) : impl_(std::make_unique<Impl>(limits, std::move(now))) {}
+TaskService::TaskService(TaskLimits limits, Now now, EventLimits event_limits) : impl_(std::make_unique<Impl>(limits, std::move(now), event_limits)) {}
 TaskService::~TaskService() { impl_->shutdown(); }
 void TaskService::shutdown() { impl_->shutdown(); }
 const std::string& TaskService::epoch() const { return impl_->shared->epoch; }
@@ -238,6 +281,7 @@ TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work)
     try { shared.queue.push_back({record, std::move(work)}); }
     catch (...) { shared.records.erase(entry); throw; }
     shared.reserved += reservation;
+    shared.changed(*record);
     lock.unlock();
     shared.ready.notify_one();
     return ref;
@@ -265,7 +309,61 @@ TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
         if (!record.view.cancellable) throw ServiceError(ErrorCode::not_cancellable, "Task has entered a non-cancellable operation");
         record.view.state = TaskState::cancelling;
         record.view.cancellable = false;
+        shared.changed(record);
     }
     return view(record);
+}
+SnapshotPage TaskService::snapshot(const CallContext& caller, size_t max_bytes) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    std::vector<std::string> items;
+    size_t bytes = 256 + caller.principal.size();
+    for (const auto& [id, record] : shared.records) {
+        if (!caller.administrator && record->view.owner != caller.principal) continue;
+        auto item = wire::stringify_bounded(task_summary(record->view), shared.events.limits().max_event_bytes);
+        if (item.capacity() + 64 > shared.events.limits().max_snapshot_bytes - bytes)
+            throw ServiceError(ErrorCode::resource_exhausted, "Task snapshot capacity exhausted");
+        bytes += item.capacity() + 64;
+        items.push_back(std::move(item));
+    }
+    std::sort(items.begin(), items.end());
+    const EventScope scope{caller.principal, caller.administrator};
+    auto id = shared.events.snapshot(scope, std::move(items));
+    try { return shared.events.page(scope, id, 0, max_bytes); }
+    catch (...) { shared.events.release_snapshot(scope, id); throw; }
+}
+SnapshotPage TaskService::snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    return shared.events.page({caller.principal, caller.administrator}, id, offset, max_bytes);
+}
+void TaskService::release_snapshot(const CallContext& caller, const std::string& id) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.events.release_snapshot({caller.principal, caller.administrator}, id);
+}
+std::string TaskService::subscribe(const CallContext& caller, const EventCursor& cursor) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    return shared.events.subscribe({caller.principal, caller.administrator}, cursor);
+}
+EventBatch TaskService::poll(const CallContext& caller, const std::string& id, size_t max_events, size_t max_bytes) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    return shared.events.poll({caller.principal, caller.administrator}, id, max_events, max_bytes);
+}
+void TaskService::unsubscribe(const CallContext& caller, const std::string& id) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.events.unsubscribe({caller.principal, caller.administrator}, id);
 }
 }

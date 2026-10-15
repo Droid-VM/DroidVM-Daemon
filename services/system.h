@@ -11,7 +11,7 @@ namespace droidvm {
 struct Caller { std::string client_id; bool authorized = false; };
 class SystemService {
 public:
-    SystemService(std::function<bool()> token_exists, std::function<std::string()> read_token, std::string apk_hash);
+    SystemService(std::function<bool()> token_exists, std::function<std::string()> read_token, std::string apk_hash, std::string epoch);
     Json::Value execute(Caller& caller, const std::string& command, const Json::Value& request) const;
 private:
     std::function<bool()> token_exists_;

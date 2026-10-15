@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "services/tasks.h"
-#include "common/wire.h"
+#include "contracts.h"
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
@@ -8,41 +7,9 @@
 #include <thread>
 
 using namespace droidvm;
+using namespace droidvm::test;
 using namespace std::chrono_literals;
 namespace {
-const CallContext owner{"owner", true, true, false};
-const CallContext other{"other", true, true, false};
-const CallContext admin{"admin", true, true, true};
-void check(bool value, const char* detail) { if (!value) throw std::runtime_error(detail); }
-template<class F> void error(ErrorCode expected, F&& fn) {
-    try { fn(); } catch (const ServiceError& actual) {
-        check(actual.code() == expected, "wrong service error");
-        return;
-    }
-    throw std::runtime_error("expected a service error");
-}
-struct Gate {
-    std::mutex mutex;
-    std::condition_variable ready;
-    bool open = false;
-    void release() { std::lock_guard lock(mutex); open = true; ready.notify_all(); }
-    void wait() {
-        std::unique_lock lock(mutex);
-        check(ready.wait_for(lock, 5s, [&] { return open; }), "gate deadline");
-    }
-};
-TaskView finished(TaskService& service, const TaskRef& ref) {
-    const auto deadline = TaskService::Clock::now() + 5s;
-    do {
-        auto value = service.get(owner, ref);
-        if (task_terminal(value.state)) return value;
-        std::this_thread::sleep_for(1ms);
-    } while (TaskService::Clock::now() < deadline);
-    throw std::runtime_error("task deadline");
-}
-TaskSpec spec(size_t result_bytes = 256) { return {"contract", "vm:one", result_bytes, true}; }
-TaskCompletion ok(TaskControl&) { return TaskCompletion::success(); }
-
 void identity_and_access() {
     TaskService service, restarted;
     check(service.epoch().size() == 36 && service.epoch() != restarted.epoch(), "unique epoch");
@@ -308,25 +275,12 @@ void bounded_workers_and_shutdown() {
 }
 }
 int main() {
-    Json::Value report;
-    auto& checks = report["checks"] = Json::Value(Json::arrayValue);
-    try {
-        for (auto [name, test] : {
+    return run({
             std::pair{"identity_access_epoch", &identity_and_access},
             std::pair{"bounded_queue_cancellation_cleanup", &queue_and_cleanup},
             std::pair{"retention_reserved_capacity", &retention_and_reservation},
             std::pair{"failure_progress", &failure_and_progress},
             std::pair{"independent_call_context", &independent_call_context},
             std::pair{"commit_cancel_128_races", &commit_and_cancel_race},
-            std::pair{"bounded_workers_shutdown", &bounded_workers_and_shutdown}}) {
-            test();
-            checks.append(name);
-        }
-        report["passed"] = true;
-    } catch (const std::exception& e) {
-        report["passed"] = false;
-        report["error"] = e.what();
-    }
-    std::cout << wire::stringify(report, true) << std::endl;
-    return report["passed"].asBool() ? 0 : 1;
+            std::pair{"bounded_workers_shutdown", &bounded_workers_and_shutdown}});
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "context.h"
+#include "events.h"
 #include <json/json.h>
 #include <chrono>
 #include <cstddef>
@@ -24,6 +25,7 @@ struct TaskView {
     TaskRef ref;
     std::string kind, owner, resource;
     TaskState state = TaskState::queued;
+    uint64_t revision = 0;
     bool cancellable = true;
     TaskProgress progress;
     Json::Value result;
@@ -32,6 +34,8 @@ struct TaskView {
     std::chrono::steady_clock::time_point created;
     std::optional<std::chrono::steady_clock::time_point> finished;
 };
+// Public state projection. Large immutable results remain available through get.
+Json::Value task_summary(const TaskView& task);
 struct TaskSpec {
     std::string kind, resource;
     size_t result_bytes = 64u << 10;
@@ -73,7 +77,7 @@ public:
     using Clock = std::chrono::steady_clock;
     using Now = std::function<Clock::time_point()>;
     using Work = std::function<TaskCompletion(TaskControl&)>;
-    explicit TaskService(TaskLimits limits = {}, Now now = [] { return Clock::now(); });
+    explicit TaskService(TaskLimits limits = {}, Now now = [] { return Clock::now(); }, EventLimits event_limits = {});
     ~TaskService();
     TaskService(const TaskService&) = delete;
     TaskService& operator=(const TaskService&) = delete;
@@ -81,6 +85,12 @@ public:
     TaskRef submit(const CallContext& caller, TaskSpec spec, Work work);
     TaskView get(const CallContext& caller, const TaskRef& ref);
     TaskView cancel(const CallContext& caller, const TaskRef& ref);
+    SnapshotPage snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
+    SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
+    void release_snapshot(const CallContext& caller, const std::string& id);
+    std::string subscribe(const CallContext& caller, const EventCursor& cursor);
+    EventBatch poll(const CallContext& caller, const std::string& id, size_t max_events = 64, size_t max_bytes = 256u << 10);
+    void unsubscribe(const CallContext& caller, const std::string& id);
     // Reject new work, cancel queued work, request cooperative cancellation of
     // running work, and join workers. Callbacks must bound waits and clean up.
     // Call from the owning thread, never from one of this pool's callbacks.
