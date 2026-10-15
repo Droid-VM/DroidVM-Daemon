@@ -16,7 +16,7 @@ struct CallContext {
 enum class ErrorCode {
     invalid_argument, unauthenticated, permission_denied, resource_exhausted,
     unavailable, internal, io_error, task_epoch_mismatch, task_not_found, not_cancellable,
-    resync_required, snapshot_expired
+    resync_required, snapshot_expired, not_found, conflict, commit_uncertain
 };
 const char* error_code_name(ErrorCode code);
 class ServiceError : public std::runtime_error {

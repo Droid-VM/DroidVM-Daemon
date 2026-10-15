@@ -11,27 +11,50 @@
 #include <iostream>
 #include <stdexcept>
 #include <memory>
+#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
+#include <atomic>
+#include <thread>
+#endif
 
 int main(int argc, char** argv) {
     try {
         std::string directory, data_directory, apk;
         bool force = false;
+        droidvm::config::JsonFile::Observer observer;
+#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
+        int write_delay_ms = 0;
+#endif
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help") {
                 std::cout << "Usage: droidvmd (--data-dir <app-data-directory> | --run-dir <existing-directory>)\n"
                              "                --apk <installed-apk> [--force]\n"
                              "--data-dir creates run/ and cache/daemon.log owned by the data directory UID.\n"
-                             "Development native daemon; system and task observation APIs only.\n";
+                             "Development native daemon; system, tasks and network configuration APIs.\n";
                 return 0;
             } else if (arg == "--force") force = true;
             else if (arg == "--run-dir" && i + 1 < argc) directory = argv[++i];
             else if (arg == "--data-dir" && i + 1 < argc) data_directory = argv[++i];
             else if (arg == "--apk" && i + 1 < argc) apk = argv[++i];
+#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
+            else if (arg == "--test-write-delay-ms" && i + 1 < argc) {
+                write_delay_ms = std::stoi(argv[++i]);
+                if (write_delay_ms < 0 || write_delay_ms > 40000) throw std::runtime_error("invalid fixture delay");
+            }
+#endif
             else throw std::runtime_error("invalid arguments; use --help");
         }
         if ((directory.empty() == data_directory.empty()) || apk.empty())
             throw std::runtime_error("exactly one of --run-dir/--data-dir and --apk are required");
+#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
+        auto first_write = std::make_shared<std::atomic<bool>>(true);
+        observer = [first_write, write_delay_ms](const char* stage) {
+            if (std::string_view(stage) == "before_write" && first_write->exchange(false)) {
+                std::cerr << "fixture write delay started" << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(write_delay_ms));
+            }
+        };
+#endif
         sigset_t signals;
         sigemptyset(&signals);
         sigaddset(&signals, SIGINT);
@@ -55,10 +78,17 @@ int main(int argc, char** argv) {
         try {
             const auto token = droidvm::random_id(false);
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
+            std::unique_ptr<droidvm::NetworkConfigService> networks;
+            if (layout) {
+                auto files = layout->open_files();
+                networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
+                if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
+                if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
+            }
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks);
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();

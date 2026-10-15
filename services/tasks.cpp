@@ -67,7 +67,7 @@ struct Record {
     size_t result_limit = 0, reservation = 0;
     bool operation_cancellable = true;
 };
-struct Job { std::shared_ptr<Record> record; TaskService::Work work; };
+struct Job { std::shared_ptr<Record> record; TaskService::Work work; std::function<void(bool)> direct; };
 struct Shared {
     std::mutex mutex;
     std::condition_variable ready;
@@ -186,10 +186,13 @@ struct TaskService::Impl {
                 if (shared->queue.empty()) return;
                 job = std::move(shared->queue.front());
                 shared->queue.pop_front();
-                job.record->view.state = TaskState::running;
-                job.record->view.cancellable = job.record->operation_cancellable;
-                shared->changed(*job.record);
+                if (job.record) {
+                    job.record->view.state = TaskState::running;
+                    job.record->view.cancellable = job.record->operation_cancellable;
+                    shared->changed(*job.record);
+                }
             }
+            if (job.direct) { try { job.direct(false); } catch (...) {} continue; }
             TaskControl control(shared, job.record);
             TaskCompletion completion = TaskCompletion::failure(ErrorCode::internal, "Task failed");
             std::string encoded;
@@ -234,7 +237,7 @@ struct TaskService::Impl {
             std::lock_guard lock(shared->mutex);
             shared->stopping = true;
             discarded.swap(shared->queue);
-            for (auto& job : discarded) shared->finish(*job.record, TaskState::cancelled);
+            for (auto& job : discarded) if (job.record) shared->finish(*job.record, TaskState::cancelled);
             for (auto& [id, record] : shared->records) {
                 if (record->view.state == TaskState::running && record->view.cancellable) {
                     record->view.state = TaskState::cancelling;
@@ -244,6 +247,7 @@ struct TaskService::Impl {
             }
         }
         shared->ready.notify_all();
+        for (auto& job : discarded) if (job.direct) { try { job.direct(true); } catch (...) {} }
         discarded.clear();
         for (auto& worker : workers) if (worker.joinable()) worker.join();
     }
@@ -278,13 +282,25 @@ TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work)
     const auto ref = record->view.ref;
     const auto [entry, inserted] = shared.records.emplace(ref.id, record);
     if (!inserted) throw ServiceError(ErrorCode::internal, "Task ID collision");
-    try { shared.queue.push_back({record, std::move(work)}); }
+    try { shared.queue.push_back({record, std::move(work), {}}); }
     catch (...) { shared.records.erase(entry); throw; }
     shared.reserved += reservation;
     shared.changed(*record);
     lock.unlock();
     shared.ready.notify_one();
     return ref;
+}
+void TaskService::post(const CallContext& caller, std::function<void(bool)> work) {
+    require_access(caller);
+    if (!work) throw ServiceError(ErrorCode::invalid_argument, "Missing work callback");
+    auto& shared = *impl_->shared;
+    {
+        std::lock_guard lock(shared.mutex);
+        if (shared.stopping) throw ServiceError(ErrorCode::unavailable, "Task service is stopping");
+        if (shared.queue.size() >= shared.limits.queued) throw ServiceError(ErrorCode::resource_exhausted, "Worker queue is full");
+        shared.queue.push_back({{}, {}, std::move(work)});
+    }
+    shared.ready.notify_one();
 }
 TaskView TaskService::get(const CallContext& caller, const TaskRef& ref) {
     require_access(caller);

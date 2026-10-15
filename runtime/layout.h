@@ -15,6 +15,7 @@ public:
     uid_t owner() const { return owner_; }
     // Call only after taking the instance lock.
     void prepare_cache();
+    Fd open_files();
 private:
     Fd data_, run_, cache_;
     uid_t owner_;

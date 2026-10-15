@@ -83,6 +83,10 @@ public:
     TaskService& operator=(const TaskService&) = delete;
     const std::string& epoch() const;
     TaskRef submit(const CallContext& caller, TaskSpec spec, Work work);
+    // Short synchronous RPC work shares this bounded worker queue without
+    // retaining task records. true means shutdown discarded it before execution.
+    // The caller must separately bound captured input and completion storage.
+    void post(const CallContext& caller, std::function<void(bool)> work);
     TaskView get(const CallContext& caller, const TaskRef& ref);
     TaskView cancel(const CallContext& caller, const TaskRef& ref);
     SnapshotPage snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);

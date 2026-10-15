@@ -5,6 +5,7 @@
 #include "runtime/instance.h"
 #include "runtime/log.h"
 #include "dispatcher.h"
+#include "requests.h"
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -31,6 +32,7 @@ struct Client {
     size_t queued = 0, sent = 0;
     std::deque<std::string> outgoing;
     bool eof = false;
+    size_t pending = 0;
     explicit Client(int socket) : fd(socket) {}
 };
 void watch(int epoll, int operation, int fd, uint64_t id, uint32_t flags) {
@@ -65,11 +67,13 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
         throw std::runtime_error("read listener port failed");
     watch(epoll.get(), EPOLL_CTL_ADD, listener.get(), 1, EPOLLIN);
     watch(epoll.get(), EPOLL_CTL_ADD, signal_fd, 2, EPOLLIN);
+    RequestQueue requests(service);
+    watch(epoll.get(), EPOLL_CTL_ADD, requests.fd(), 3, EPOLLIN);
     instance.publish_discovery(ntohs(address.sin_port), token);
     std::cout << "droidvmd ready pid=" << getpid() << " port=" << ntohs(address.sin_port) << std::endl;
     if (log) log->write("INFO", "ready pid=" + std::to_string(getpid()) + " port=" + std::to_string(ntohs(address.sin_port)));
     std::unordered_map<uint64_t, std::unique_ptr<Client>> clients;
-    uint64_t next_id = 3;
+    uint64_t next_id = 4;
     size_t input_reserved = 0, output_reserved = 0;
     std::array<epoll_event, 32> events{};
     bool subscribed = false;
@@ -108,6 +112,36 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
                 }
                 continue;
             }
+            if (id == 3) {
+                for (auto& completion : requests.drain()) {
+                    auto found = clients.find(completion.client);
+                    if (found == clients.end()) {
+                        std::string().swap(completion.frame);
+                        requests.release(completion);
+                        continue;
+                    }
+                    auto& client = *found->second;
+                    --client.pending;
+                    auto& frame = completion.frame;
+                    if (frame.empty() || frame.size() > per_client_output - client.queued || frame.size() > max_output - output_reserved) {
+                        service.disconnected(client.session);
+                        input_reserved -= client.payload;
+                        output_reserved -= client.queued;
+                        epoll_ctl(epoll.get(), EPOLL_CTL_DEL, client.fd.get(), nullptr);
+                        clients.erase(found);
+                        std::string().swap(frame);
+                        requests.release(completion);
+                        continue;
+                    }
+                    client.queued += frame.size();
+                    output_reserved += frame.size();
+                    client.outgoing.push_back(std::move(frame));
+                    requests.release(completion);
+                    watch(epoll.get(), EPOLL_CTL_MOD, client.fd.get(), completion.client,
+                        (client.eof ? 0u : unsigned(EPOLLIN | EPOLLRDHUP)) | EPOLLOUT);
+                }
+                continue;
+            }
             auto found = clients.find(id);
             if (found == clients.end()) continue;
             auto& client = *found->second;
@@ -136,13 +170,28 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
                         }
                         Json::Value request;
                         try { request = wire::parse(client.incoming); } catch (const std::exception&) { /* Java continues after bad JSON. */ }
+                        const auto input_bytes = client.payload;
                         input_reserved -= client.payload;
                         client.payload = 0;
                         std::string().swap(client.incoming);
                         if (!request.isObject() || request.get("type", Json::Value()) != "request" || !request["command"].isString()) continue;
                         const auto correlation = request_id(request);
                         if (correlation.empty()) continue;
-                        auto response = service.execute(client.session, request["command"].asString(), request);
+                        Json::Value response;
+                        auto command = request["command"].asString();
+                        if (service.background(command)) {
+                            try {
+                                request["request_id"] = correlation;
+                                requests.submit(id, client.session, command, std::move(request), input_bytes);
+                                ++client.pending;
+                                continue;
+                            } catch (const ServiceError& error) {
+                                response["success"] = false;
+                                response["message"] = error.what();
+                                response["error"]["code"] = error_code_name(error.code());
+                                response["error"]["message"] = error.what();
+                            }
+                        } else response = service.execute(client.session, command, request);
                         response["type"] = "response";
                         response["request_id"] = correlation;
                         auto frame = wire::frame(wire::stringify(response), true);
@@ -174,7 +223,7 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
                         }
                     }
                 }
-                if (client.eof && client.outgoing.empty()) alive = false;
+                if (client.eof && client.outgoing.empty() && !client.pending) alive = false;
                 if (alive) watch(epoll.get(), EPOLL_CTL_MOD, client.fd.get(), id,
                     (client.eof ? 0u : unsigned(EPOLLIN | EPOLLRDHUP)) | (client.outgoing.empty() ? 0u : unsigned(EPOLLOUT)));
             } catch (const std::exception&) { alive = false; }

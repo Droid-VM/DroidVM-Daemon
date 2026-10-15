@@ -43,4 +43,14 @@ void RuntimeLayout::prepare_cache() {
         require(fchmod(cache_.get(), 0700) == 0, "protect cache directory");
     }
 }
+Fd RuntimeLayout::open_files() {
+    bool created = false;
+    auto files = child_directory(data_.get(), "files", owner_, created);
+    struct stat info{};
+    require(fstat(files.get(), &info) == 0, "stat files directory");
+    if (created || info.st_uid != owner_)
+        require(fchown(files.get(), owner_, owner_) == 0, "own files directory");
+    if (created) require(fchmod(files.get(), 0700) == 0, "protect files directory");
+    return files;
+}
 }

@@ -9,6 +9,7 @@ namespace droidvm {
 namespace {
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe"};
+constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
 CallContext context(const ClientSession& session) {
     // The existing IPC token grants local administrator rights. Never accept
     // principal/permissions from fields in the request, or use client_id as owner.
@@ -45,6 +46,60 @@ Json::Value snapshot_json(const SnapshotPage& page) {
     for (const auto& row : page.items) items.append(wire::parse(row));
     return value;
 }
+std::string legacy_id(const Json::Value& request) {
+    // JSONObject.optString distinguishes an absent key from JSONObject.NULL
+    // and stringifies other JSON values. DataItem's strict accessor is different.
+    if (!request.isMember("network_id")) return {};
+    const auto& value = request["network_id"];
+    if (value.isString()) return value.asString();
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    builder["emitUTF8"] = true;
+    return Json::writeString(builder, value);
+}
+}
+bool RequestDispatcher::background(const std::string& command) const {
+    return networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end();
+}
+Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    Json::Value result;
+    result["success"] = false;
+    if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
+    if (!networks_) { result["message"] = "internal error"; return result; }
+    try {
+        if (command == "network_create" || command == "network_modify") {
+            if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
+            result["network_id"] = command == "network_create" ? networks_->create(caller, request["config"]) : networks_->update(caller, request["config"]);
+        } else if (command == "network_list") {
+            auto rows = networks_->list(caller);
+            // No activation API is exposed yet: all instances this native
+            // service owns are stopped. Runtime state will come from NetworkService.
+            for (auto& row : rows) row["state"] = "stopped";
+            result["data"] = std::move(rows);
+        } else {
+            auto id = legacy_id(request);
+            if (id.empty()) { result["message"] = "missing network_id"; return result; }
+            if (command == "network_exists") {
+                result["network_id"] = id;
+                result["exists"] = networks_->exists(caller, id);
+            } else {
+                auto row = networks_->get(caller, id);
+                row["state"] = "STOPPED";
+                row["tools"] = Json::Value(Json::arrayValue);
+                result["data"] = std::move(row);
+            }
+        }
+        result["success"] = true;
+        return result;
+    } catch (const ServiceError& error) {
+        if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::io_error || error.code() == ErrorCode::resource_exhausted)
+            return failure(error);
+        if (command == "network_create" && error.code() == ErrorCode::conflict) result["message"] = "failed to create network";
+        else if (command == "network_modify" && error.code() == ErrorCode::not_found) result["message"] = "failed to modify network";
+        else if (command == "network_info" && error.code() == ErrorCode::not_found) result["message"] = "network not found";
+        else result["message"] = "internal error";
+        return result;
+    } catch (...) { result["message"] = "internal error"; return result; }
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end()) {
@@ -53,6 +108,12 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             result["service_api_minor"] = 1;
             for (const auto* name : commands) result["commands"].append(name);
             result["task_events"] = "explicit-subscription-v1";
+            if (networks_) {
+                for (const auto* name : network_commands) result["commands"].append(name);
+                result["network_config_persistence"] = true;
+                result["network_runtime"] = false;
+                result["service_api_minor"] = 2;
+            }
         }
         return result;
     }

@@ -16,6 +16,9 @@ const char* error_code_name(ErrorCode code) {
         case ErrorCode::not_cancellable: return "NOT_CANCELLABLE";
         case ErrorCode::resync_required: return "RESYNC_REQUIRED";
         case ErrorCode::snapshot_expired: return "SNAPSHOT_EXPIRED";
+        case ErrorCode::not_found: return "NOT_FOUND";
+        case ErrorCode::conflict: return "CONFLICT";
+        case ErrorCode::commit_uncertain: return "COMMIT_UNCERTAIN";
     }
     return "INTERNAL";
 }
