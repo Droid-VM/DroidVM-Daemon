@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <memory>
+#include <filesystem>
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
 #include <atomic>
 #include <thread>
@@ -79,16 +80,19 @@ int main(int argc, char** argv) {
             const auto token = droidvm::random_id(false);
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
             std::unique_ptr<droidvm::NetworkConfigService> networks;
+            std::unique_ptr<droidvm::NetworkHostService> host_network;
             if (layout) {
                 auto files = layout->open_files();
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
+                host_network = std::make_unique<droidvm::NetworkHostService>(
+                    (std::filesystem::absolute(data_directory) / "bin/netbox").string());
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();

@@ -59,14 +59,20 @@ std::string legacy_id(const Json::Value& request) {
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end();
+    return (host_network_ && command == "network_list_interfaces") ||
+        (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
     Json::Value result;
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
-    if (!networks_) { result["message"] = "internal error"; return result; }
     try {
+        if (command == "network_list_interfaces" && host_network_) {
+            result["data"] = host_network_->available_interfaces(caller);
+            result["success"] = true;
+            return result;
+        }
+        if (!networks_) { result["message"] = "internal error"; return result; }
         if (command == "network_create" || command == "network_modify") {
             if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
             result["network_id"] = command == "network_create" ? networks_->create(caller, request["config"]) : networks_->update(caller, request["config"]);
@@ -92,6 +98,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         result["success"] = true;
         return result;
     } catch (const ServiceError& error) {
+        if (command == "network_list_interfaces") return failure(error);
         if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::io_error || error.code() == ErrorCode::resource_exhausted)
             return failure(error);
         if (command == "network_create" && error.code() == ErrorCode::conflict) result["message"] = "failed to create network";
@@ -113,6 +120,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["network_config_persistence"] = true;
                 result["network_runtime"] = false;
                 result["service_api_minor"] = 2;
+            }
+            if (host_network_) {
+                result["commands"].append("network_list_interfaces");
+                result["network_host_interfaces"] = true;
+                result["service_api_minor"] = 3;
             }
         }
         return result;

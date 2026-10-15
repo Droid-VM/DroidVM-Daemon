@@ -3,6 +3,7 @@
 #include "services/system.h"
 #include "services/tasks.h"
 #include "services/network_config.h"
+#include "services/network_host.h"
 
 namespace droidvm {
 struct ClientSession {
@@ -14,8 +15,9 @@ struct ClientSession {
 // structured errors and decimal cursors without changing old command results.
 class RequestDispatcher {
 public:
-    RequestDispatcher(SystemService& system, TaskService& tasks, NetworkConfigService* networks = nullptr)
-        : system_(system), tasks_(tasks), networks_(networks) {}
+    RequestDispatcher(SystemService& system, TaskService& tasks, NetworkConfigService* networks = nullptr,
+                      NetworkHostService* host_network = nullptr)
+        : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network) {}
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
     TaskService& workers() { return tasks_; }
@@ -26,5 +28,6 @@ private:
     SystemService& system_;
     TaskService& tasks_;
     NetworkConfigService* networks_;
+    NetworkHostService* host_network_;
 };
 }
