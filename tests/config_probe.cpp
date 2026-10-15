@@ -2,6 +2,7 @@
 #include "store/network_config.h"
 #include "store/json_file.h"
 #include "common/wire.h"
+#include "network/helper_config.h"
 #include <fstream>
 #include <iostream>
 
@@ -18,6 +19,11 @@ int main(int argc, char** argv) {
             row["name"] = test["name"];
             try {
                 auto value = test["config"];
+                if (test["op"].asString() == "gvswitch") {
+                    row["helper"] = droidvm::network::gvswitch_config(value);
+                    row["status"] = "ok";
+                    report.append(row); continue;
+                }
                 if (test["op"].asString() == "default_vlan") value = droidvm::config::default_vlan(test["vlan_id"].asInt());
                 else {
                     if (test["op"].asString() == "migrate") {

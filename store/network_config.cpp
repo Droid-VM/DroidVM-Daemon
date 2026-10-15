@@ -104,7 +104,8 @@ V4 network4(const std::string& cidr) {
     uint32_t mask = prefix ? UINT32_MAX << (32 - prefix) : 0;
     return {address, address & mask, prefix, uint64_t(1) << (32 - prefix)};
 }
-int network6(const std::string& cidr) {
+struct V6 { in6_addr address; int prefix; };
+V6 network6(const std::string& cidr) {
     auto slash = cidr.rfind('/');
     if (slash == std::string::npos) invalid("invalid IPv6 CIDR");
     auto address = cidr.substr(0, slash);
@@ -128,7 +129,7 @@ int network6(const std::string& cidr) {
     if (IN6_IS_ADDR_V4MAPPED(&bytes)) invalid("invalid IPv6 address");
     int prefix = decimal(std::string_view(cidr).substr(slash + 1));
     if (prefix < 0 || prefix > 128) invalid("invalid IPv6 prefix");
-    return prefix;
+    return {bytes, prefix};
 }
 std::string mode(const Json::Value& value) { return string(value, "uplink_mode") == "l2" ? "l2" : "l3"; }
 std::string bridge(const Json::Value& value) { return string(value, "bridge_type") == "gvisor" ? "gvisor" : "linux"; }
@@ -170,7 +171,7 @@ void validate_vlan(Json::Value& vlan, bool gvisor) {
             invalid("VLAN " + label + ": invalid DUID");
     } else if (!cidr6.empty()) {
         int prefix;
-        try { prefix = network6(cidr6); } catch (...) { invalid("VLAN " + label + ": invalid IPv6 CIDR: " + cidr6); }
+        try { prefix = network6(cidr6).prefix; } catch (...) { invalid("VLAN " + label + ": invalid IPv6 CIDR: " + cidr6); }
         if (prefix > 126) invalid("VLAN " + label + ": IPv6 prefix /" + std::to_string(prefix) + " too small");
         if (boolean(member(v6, "slaac"), "enabled") && prefix != 64) invalid("VLAN " + label + ": SLAAC requires a /64 network");
     }
@@ -325,5 +326,52 @@ Json::Value network_view(Json::Value& value) {
     view["auto_up"] = boolean(value, "auto_up");
     view["bridge_mac"] = mode(value) == "l3" ? nullable(string(section(value, "l3"), "mac_address")) : Json::Value();
     return view;
+}
+NetworkPrefix NetworkPrefix::parse(const std::string& cidr, bool ipv6) {
+    NetworkPrefix result;
+    result.ipv6_ = ipv6;
+    if (ipv6) {
+        const auto parsed = network6(cidr);
+        std::copy(std::begin(parsed.address.s6_addr), std::end(parsed.address.s6_addr), result.bytes_.begin());
+        result.prefix_ = parsed.prefix;
+    } else {
+        const auto parsed = network4(cidr);
+        for (int i = 0; i < 4; ++i) result.bytes_[i] = (parsed.address >> (24 - i * 8)) & 255;
+        result.prefix_ = parsed.prefix;
+    }
+    return result;
+}
+std::array<uint8_t, 16> NetworkPrefix::base() const {
+    auto bytes = bytes_;
+    const int size = ipv6_ ? 16 : 4;
+    for (int i = 0; i < size; ++i) {
+        const int bits = std::clamp(prefix_ - i * 8, 0, 8);
+        bytes[i] &= static_cast<uint8_t>(0xffu << (8 - bits));
+    }
+    return bytes;
+}
+std::string NetworkPrefix::format(const std::array<uint8_t, 16>& bytes) const {
+    char text[INET6_ADDRSTRLEN];
+    if (!inet_ntop(ipv6_ ? AF_INET6 : AF_INET, bytes.data(), text, sizeof(text))) invalid("IP formatting failed");
+    return text;
+}
+std::string NetworkPrefix::address() const { return format(bytes_); }
+std::string NetworkPrefix::network() const { return format(base()) + "/" + std::to_string(prefix_); }
+std::string NetworkPrefix::address_at(int64_t offset) const {
+    const auto host_bits = (ipv6_ ? 128 : 32) - prefix_;
+    const auto value = static_cast<uint64_t>(offset);
+    if (offset <= 0 || (host_bits < 64 && value >= (uint64_t(1) << host_bits) - unsigned(!ipv6_))) {
+        std::string error = "Offset " + std::to_string(offset) + " out of range for /" + std::to_string(prefix_) + " network";
+        if (!ipv6_) error += " (1.." + std::to_string((int64_t(1) << host_bits) - 2) + ")";
+        invalid(error);
+    }
+    auto bytes = base();
+    uint64_t carry = value;
+    for (int i = (ipv6_ ? 16 : 4) - 1; i >= 0; --i) {
+        const auto part = unsigned(bytes[i]) + unsigned(carry & 255);
+        bytes[i] = part & 255;
+        carry = (carry >> 8) + (part >> 8);
+    }
+    return format(bytes);
 }
 }
