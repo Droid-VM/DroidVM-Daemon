@@ -48,6 +48,15 @@ uint32_t index_at(int directory) {
         throw std::runtime_error("invalid kernel interface index");
     return value;
 }
+uint32_t group_at(int directory) {
+    const auto text = read_at(directory, "netdev_group", 32);
+    int64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    // Some kernels expose the u32 group through a signed %d sysfs formatter.
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || value < INT32_MIN || value > UINT32_MAX)
+        throw std::runtime_error("invalid kernel interface group");
+    return static_cast<uint32_t>(value);
+}
 void tag_at(int directory, const std::string& tag) {
     Fd fd(openat(directory, "ifalias", O_WRONLY | O_CLOEXEC | O_NOFOLLOW));
     require(fd.get() >= 0, "open network ownership alias");
@@ -81,11 +90,16 @@ OwnedLinks::OwnedLinks(int directory, uid_t uid, const Netbox& netbox, Observer 
             !record["parent"].isString() || !record["kind"].isString())
             throw ServiceError(ErrorCode::io_error, "invalid network resource record");
         owner_id(record["owner"].asString()); Netbox::interface_name(record["name"].asString());
+        if (record["kind"] != "bridge" && record["kind"] != "vlan" && record["kind"] != "tap")
+            throw ServiceError(ErrorCode::io_error, "unknown network resource kind");
         auto tag = record["tag"].asString();
         if (!tag.starts_with("droidvm:") || tag.size() != 40 ||
             tag.substr(8).find_first_not_of("0123456789abcdef") != std::string::npos ||
             !names.insert(record["name"].asString()).second)
             throw ServiceError(ErrorCode::io_error, "invalid network resource identity");
+        if (record.isMember("staging_name") && (!record["staging_name"].isString() ||
+            record["staging_name"].asString() != creation_mark(tag).name))
+            throw ServiceError(ErrorCode::io_error, "invalid staging interface identity");
     }
 }
 void OwnedLinks::save(Json::Value next) {
@@ -103,27 +117,46 @@ Json::ArrayIndex OwnedLinks::find(const std::string& owner, const std::string& n
     }
     throw ServiceError(ErrorCode::not_found, "network link is not owned: " + name);
 }
-bool OwnedLinks::matches(const Json::Value& record, bool allow_pending) const {
+bool OwnedLinks::matches_at(const Json::Value& record, int directory, const std::string& name, bool allow_pending) const {
     if (record["boot"] != boot_ || record["namespace_device"].asUInt64() != namespace_device_ ||
         record["namespace_inode"].asUInt64() != namespace_inode_) return false;
-    auto directory = link_directory(record["name"].asString());
-    if (directory.get() < 0) return false;
     const auto index = record["index"].asUInt();
-    return (index ? index_at(directory.get()) == index : allow_pending) &&
-        read_at(directory.get(), "ifalias", 256) == record["tag"].asString();
+    if (index ? index_at(directory) != index : !allow_pending) return false;
+    const auto alias = read_at(directory, "ifalias", 256);
+    if (alias == record["tag"].asString()) return true;
+    if (index || !alias.empty() || record.get("creation_mark", false) != true || !record["staging_name"].isString()) return false;
+    const auto mark = creation_mark(record["tag"].asString());
+    return name == mark.name && group_at(directory) == mark.group;
+}
+OwnedLinks::Located OwnedLinks::locate(const Json::Value& record, bool allow_pending) const {
+    for (const char* key : {"name", "staging_name"}) {
+        if (!record[key].isString()) continue;
+        const auto name = record[key].asString();
+        auto directory = link_directory(name);
+        if (directory.get() >= 0 && matches_at(record, directory.get(), name, allow_pending))
+            return {std::move(directory), name};
+    }
+    return {Fd(), {}};
+}
+bool OwnedLinks::matches(const Json::Value& record, bool allow_pending) const {
+    return locate(record, allow_pending).directory.get() >= 0;
 }
 void OwnedLinks::require_owned(const std::string& owner, const std::string& name) const {
     std::lock_guard guard(mutex_);
     const auto& record = document_["links"][find(owner, name)];
-    if (!matches(record, false)) throw ServiceError(ErrorCode::conflict, "network link identity changed: " + name);
+    if (record.isMember("staging_name") || !matches(record, false))
+        throw ServiceError(ErrorCode::conflict, "network link identity changed or incomplete: " + name);
 }
 void OwnedLinks::create(const std::string& owner, const std::string& name, const char* kind,
                         const std::string& parent, int vid) {
     std::lock_guard guard(mutex_);
     owner_id(owner); Netbox::interface_name(name);
+    uint32_t parent_index = 0;
     if (!parent.empty()) {
-        if (!matches(document_["links"][find(owner, parent)], false))
+        const auto& parent_record = document_["links"][find(owner, parent)];
+        if (parent_record.isMember("staging_name") || !matches(parent_record, false))
             throw ServiceError(ErrorCode::conflict, "VLAN parent is not an owned link");
+        parent_index = parent_record["index"].asUInt();
     }
     for (const auto& row : document_["links"]) if (row["name"] == name)
         throw ServiceError(ErrorCode::conflict, "network link already reserved: " + name);
@@ -134,24 +167,41 @@ void OwnedLinks::create(const std::string& owner, const std::string& name, const
     record["boot"] = boot_; record["namespace_device"] = Json::UInt64(namespace_device_);
     record["namespace_inode"] = Json::UInt64(namespace_inode_);
     record["index"] = 0u; record["tag"] = "droidvm:" + random_id(false);
+    record["creation_mark"] = std::string_view(kind) != "tap";
+    const auto staging = creation_mark(record["tag"].asString()).name;
+    record["staging_name"] = staging;
     auto next = document_;
     const auto at = next["links"].size();
     next["links"].append(record);
     save(std::move(next)); // intent must be durable before a kernel side effect
     point("intent_saved");
     try {
-        if (std::string_view(kind) == "bridge") netbox_.add_bridge(name);
-        else if (std::string_view(kind) == "tap") netbox_.add_tap(name);
-        else netbox_.add_vlan(parent, name, vid);
+        Fd transient;
+        const bool tap = std::string_view(kind) == "tap";
+        if (std::string_view(kind) == "bridge") create_marked_bridge(staging, record["tag"].asString());
+        else if (tap) transient = open_transient_tap(staging);
+        else create_marked_vlan(staging, record["tag"].asString(), parent_index, static_cast<uint16_t>(vid));
         point("link_created");
-        auto directory = link_directory(name);
+        auto directory = link_directory(staging);
         if (directory.get() < 0) throw ServiceError(ErrorCode::conflict, "created network link disappeared");
+        if (!tap && !matches(record, true)) throw ServiceError(ErrorCode::conflict, "created link marker was not installed");
         record["index"] = index_at(directory.get());
+        // A TAP remains nonpersistent until alias and journal are committed.
+        // The other links retain their atomic creation mark until that point.
         tag_at(directory.get(), record["tag"].asString());
         point("alias_written");
         if (!matches(record, false)) throw ServiceError(ErrorCode::conflict, "created network link changed");
         next = document_; next["links"][at] = record;
         save(std::move(next));
+        point("identity_saved");
+        rename_owned_link(record["index"].asUInt(), name);
+        point("link_renamed");
+        if (!tap) clear_creation_group(record["index"].asUInt());
+        record.removeMember("staging_name"); record.removeMember("creation_mark");
+        next = document_; next["links"][at] = record;
+        save(std::move(next));
+        point("name_saved");
+        if (tap) { persist_tap(transient.get()); point("tap_persistent"); }
         point("link_owned");
     } catch (const std::exception& error) {
         const std::string detail = error.what();
@@ -170,23 +220,29 @@ void OwnedLinks::vlan(const std::string& owner, const std::string& parent, const
 }
 void OwnedLinks::remove_at(Json::ArrayIndex index) {
     const auto record = document_["links"][index];
-    const auto name = record["name"].asString();
+    const auto configured_name = record["name"].asString();
     // A reboot destroys these kernel links. A different live namespace does not.
     if (record["boot"] == boot_) {
         if (record["namespace_device"].asUInt64() != namespace_device_ || record["namespace_inode"].asUInt64() != namespace_inode_)
             throw ServiceError(ErrorCode::conflict, "network resource belongs to another namespace");
-        if (link_directory(name).get() >= 0) {
+        auto owned = locate(record, true);
+        if (owned.directory.get() < 0) {
+            if (link_directory(configured_name).get() >= 0 ||
+                (record["staging_name"].isString() && link_directory(record["staging_name"].asString()).get() >= 0))
+                throw ServiceError(ErrorCode::conflict, "refusing to delete unverified network link: " + configured_name);
+        } else {
+            const auto& name = owned.name;
             point("before_delete");
             if (!matches(record, true)) throw ServiceError(ErrorCode::conflict, "refusing to delete unverified network link: " + name);
             // Deleting a parent implicitly deletes VLAN children; do not bypass
             // a child's failed identity check. Likewise refuse foreign ports.
-            for (const auto& row : document_["links"]) if (row["parent"] == name)
+            for (const auto& row : document_["links"]) if (row["parent"] == configured_name)
                 throw ServiceError(ErrorCode::conflict, "network link still has a recorded child: " + name);
             if (record["kind"] == "bridge" && !netbox_.links(name).empty())
                 throw ServiceError(ErrorCode::conflict, "network bridge still has attached ports: " + name);
             // The kernel also deletes unrecorded VLAN children on parent
             // deletion. Reject those even when their names are unrelated.
-            auto directory = link_directory(name);
+            auto directory = std::move(owned.directory);
             int scan_fd = openat(directory.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             require(scan_fd >= 0, "open network dependency scan");
             DIR* raw = fdopendir(scan_fd);
@@ -206,7 +262,13 @@ void OwnedLinks::remove_at(Json::ArrayIndex index) {
                     owned_master = true;
                 if (!owned_master) throw ServiceError(ErrorCode::conflict, "network link has an unowned upper dependency: " + name);
             }
-            netbox_.delete_link(name);
+            // Capture identity again from the open sysfs directory. Deletion
+            // addresses this index, never a replacement that reused the name.
+            const auto actual_index = index_at(directory.get());
+            if (!matches_at(record, directory.get(), name, true))
+                throw ServiceError(ErrorCode::conflict, "network link identity changed before deletion: " + name);
+            point("delete_identity_checked");
+            delete_link_index(actual_index);
             point("link_deleted");
             if (link_directory(name).get() >= 0) throw ServiceError(ErrorCode::conflict, "network link remains after delete: " + name);
         }

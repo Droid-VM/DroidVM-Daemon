@@ -3,6 +3,7 @@
 #include "network/links.h"
 #include "common/identity.h"
 #include "services/network_host.h"
+#include "runtime/managed_process.h"
 #include <linux/rtnetlink.h>
 #include <linux/if_link.h>
 #include <net/if.h>
@@ -10,6 +11,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <signal.h>
+#include <poll.h>
 #include <sys/stat.h>
 
 using namespace droidvm;
@@ -122,7 +124,10 @@ void real_datapath() {
     links.bridge("test", test.name);
     links.bridge("test", per);
     links.vlan("test", test.name, leg, 123);
+    check(row(test.netbox, leg)["address"] == row(test.netbox, test.name)["address"], "VLAN restores inherited parent MAC");
+    check(kernel_text(test.name, "netdev_group") == "0" && kernel_text(leg, "netdev_group") == "0", "temporary creation groups cleared");
     links.tap("test", tap);
+    error(ErrorCode::conflict, [&] { open_transient_tap(tap); });
     test.netbox.mac(test.name, "02:de:ad:12:34:56");
     test.netbox.stp(test.name, true);
     const auto stp = kernel_text(test.name, "bridge/stp_state");
@@ -132,6 +137,7 @@ void real_datapath() {
     test.netbox.master(leg, per);
     test.netbox.master(tap, per);
     for (const auto& name : {test.name, per, leg, tap}) test.netbox.state(name, true);
+    check(row(test.netbox, leg)["address"] == "02:de:ad:12:34:56", "VLAN synchronizes parent MAC on activation");
     test.netbox.isolated(tap, true);
     check(kernel_text(tap, "brport/isolated") == "1", "kernel port isolation enabled");
     test.netbox.isolated(tap, false);
@@ -230,23 +236,90 @@ void failures_and_journal() {
     test.finish();
 }
 void crash_recovery() {
-    for (const char* stage : {"intent_saved", "link_created", "alias_written", "link_owned", "link_deleted"}) {
+    for (const char* kind : {"bridge", "vlan", "tap"})
+    for (const char* stage : {"intent_saved", "link_created", "alias_written", "identity_saved", "link_renamed", "name_saved", "tap_persistent", "link_owned", "link_deleted"}) {
+        if (std::string_view(stage) == "tap_persistent" && std::string_view(kind) != "tap") continue;
         Case test;
         ChildOptions options;
-        options.argv = {"/proc/self/exe", "--crash", executable, test.path, test.name, stage};
+        options.argv = {"/proc/self/exe", "--crash", executable, test.path, test.name, stage, kind};
         auto result = Child(options).communicate({}, 10s);
-        check(result.exit_code == 73, "child reached abrupt-exit boundary");
+        check(result.exit_code == -SIGKILL, "child reached SIGKILL boundary");
+        bool remains = std::string_view(stage) != "intent_saved" && std::string_view(stage) != "link_deleted";
+        if (std::string_view(kind) == "tap") remains = std::string_view(stage) == "tap_persistent" || std::string_view(stage) == "link_owned";
         OwnedLinks restart(test.directory.get(), getuid(), test.netbox);
+        std::string staging;
+        const auto inventory = restart.inventory();
+        for (const auto& record : inventory["links"]) if (record["name"] == test.name)
+            staging = record.get("staging_name", "").asString();
+        check((exists(test.name) || (!staging.empty() && exists(staging))) == remains, "persistent vs transient link at crash boundary");
         auto failures = restart.cleanup("test");
-        if (std::string_view(stage) == "link_created") {
-            check(failures.size() == 1 && exists(test.name), "untagged ambiguous creation not deleted");
-            // Fixture provenance proves this exact isolated name was created
-            // by our child; the production service deliberately cannot infer it.
-            test.netbox.delete_link(test.name);
-            check(restart.cleanup("test").empty(), "manual resolution clears ambiguous intent");
-        } else check(failures.empty() && !exists(test.name), "durable identity cleanup across crash");
+        check(failures.empty() && !exists(test.name) && (staging.empty() || !exists(staging)), "automatic durable identity cleanup across crash");
         test.finish();
     }
+}
+void lifecycle_races() {
+    Case test;
+    bool replace = false;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox, [&](const char* stage) {
+        if (replace && std::string_view(stage) == "delete_identity_checked") {
+            replace = false;
+            test.netbox.delete_link(test.name);
+            test.netbox.add_bridge(test.name);
+        }
+    });
+    links.bridge("test", test.name);
+    const auto old_index = if_nametoindex(test.name.c_str());
+    replace = true;
+    check(links.cleanup("test").size() == 1, "replacement after identity check reported");
+    check(exists(test.name) && if_nametoindex(test.name.c_str()) != old_index, "index-based deletion preserves new same-name interface");
+    test.netbox.delete_link(test.name);
+    check(links.cleanup("test").empty(), "stale deletion record clears after replacement resolved");
+    bool collide = true;
+    OwnedLinks collision(test.directory.get(), getuid(), test.netbox, [&](const char* stage) {
+        if (collide && std::string_view(stage) == "intent_saved") {
+            collide = false;
+            test.netbox.add_bridge(test.name);
+        }
+    });
+    error(ErrorCode::conflict, [&] { collision.bridge("test", test.name); });
+    check(exists(test.name) && collision.inventory()["links"].empty(), "rename conflict preserves destination and rolls back staging link");
+    test.netbox.delete_link(test.name);
+    check(collision.cleanup("test").empty(), "collision intent retained until identity resolved");
+    test.finish();
+}
+void real_address_monitor() {
+    Case test;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.tap("test", test.name);
+    test.netbox.state(test.name, true);
+    ManagedProcess monitor;
+    monitor.start(test.netbox.monitor({test.name}));
+    auto observe = [&](bool present) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto output = monitor.take_output();
+            check(output.status.running && !output.resync_required, "real monitor healthy with complete events");
+            for (const auto& line : output.lines) {
+                if (line.stream != ProcessStream::output || line.text.empty() || line.text.front() != '{') continue;
+                auto snapshot = wire::parse(line.text);
+                if (!snapshot["v4"].isArray()) continue;
+                bool found = false;
+                for (const auto& address : snapshot["v4"]) if (address == "198.18.124.1") found = true;
+                if (found == present) return;
+            }
+            pollfd fd{monitor.event_fd(), POLLIN, 0}; poll(&fd, 1, 100);
+        }
+        throw std::runtime_error("real address monitor deadline");
+    };
+    observe(false);
+    test.netbox.address(test.name, "198.18.124.1/30", true);
+    observe(true);
+    test.netbox.address(test.name, "198.18.124.1/30", false);
+    observe(false);
+    monitor.stop(500ms);
+    check(!monitor.status().running && !monitor.status().unexpected_exit && monitor.status().error.empty(), "real address monitor stopped and reaped");
+    check(links.cleanup("test").empty(), "monitor test TAP reclaimed");
+    test.finish();
 }
 int fake(int argc, char** argv) {
     const std::string mode = getenv("DROIDVM_NETBOX_TEST");
@@ -279,13 +352,19 @@ int main(int argc, char** argv) {
         std::cout << wire::stringify(errors) << std::endl;
         return errors.empty() ? 0 : 1;
     }
-    if (argc == 6 && std::string_view(argv[1]) == "--crash") {
+    if (argc == 7 && std::string_view(argv[1]) == "--crash") {
         Netbox netbox(argv[2]);
         Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        bool target = false;
         OwnedLinks links(directory.get(), getuid(), netbox, [&](const char* stage) {
-            if (std::string_view(stage) == argv[5]) _exit(73);
+            if (target && std::string_view(stage) == argv[5]) { kill(getpid(), SIGKILL); _exit(73); }
         });
-        links.bridge("test", argv[4]);
+        const std::string parent = std::string(argv[4]) + "p";
+        if (std::string_view(argv[6]) == "vlan") links.bridge("test", parent);
+        target = true;
+        if (std::string_view(argv[6]) == "vlan") links.vlan("test", parent, argv[4], 321);
+        else if (std::string_view(argv[6]) == "tap") links.tap("test", argv[4]);
+        else links.bridge("test", argv[4]);
         links.remove("test", argv[4]);
         return 74;
     }
@@ -293,5 +372,6 @@ int main(int argc, char** argv) {
     executable = argv[1]; work = argv[2];
     return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
         {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
-        {"setup_failure_and_journal_retry", failures_and_journal}, {"five_abrupt_exit_boundaries", crash_recovery}});
+        {"setup_failure_and_journal_retry", failures_and_journal}, {"twenty_five_sigkill_boundaries", crash_recovery},
+        {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor}});
 }

@@ -38,6 +38,9 @@ private:
     void create(const std::string& owner, const std::string& name, const char* kind,
                 const std::string& parent = {}, int vid = 0);
     Json::ArrayIndex find(const std::string& owner, const std::string& name) const;
+    struct Located { Fd directory; std::string name; };
+    Located locate(const Json::Value& record, bool allow_pending) const;
+    bool matches_at(const Json::Value& record, int directory, const std::string& name, bool allow_pending) const;
     bool matches(const Json::Value& record, bool allow_pending) const;
     void remove_at(Json::ArrayIndex index);
     void point(const char* stage) { if (observer_) observer_(stage); }

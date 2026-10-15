@@ -42,6 +42,10 @@ public:
     int stderr_fd() const { return error_.get(); }
     std::optional<int> poll_exit();
     bool signal(int number);
+    void close_stdin();
+    // Nonblocking first phase of shutdown, so streaming owners can keep
+    // draining output during the grace period. stop() still owns final reaping.
+    void request_stop();
     int stop(std::chrono::milliseconds grace = std::chrono::seconds(3));
     ChildOutput communicate(std::string_view input = {}, std::chrono::milliseconds timeout = std::chrono::seconds(30),
         size_t capture_bytes = 256u << 10, std::function<bool()> cancelled = {});

@@ -100,6 +100,8 @@ bool Child::signal(int number) {
     fail("signal child pidfd");
     return false;
 }
+void Child::close_stdin() { input_ = Fd(); }
+void Child::request_stop() { signal_owned(SIGTERM); }
 void Child::signal_owned(int number) {
     if (reaped_) return;
     if (group_) kill(-pid_, number); // leader remains unreaped until group cleanup
