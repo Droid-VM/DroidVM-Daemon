@@ -60,8 +60,10 @@ int Instance::lock_owner() const {
     require(fcntl(lock_.get(), F_GETLK, &region) == 0, "query lock owner");
     return region.l_type == F_UNLCK ? -1 : region.l_pid;
 }
-Instance::Instance(const std::string& directory, bool force) {
-    directory_ = Fd(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+Instance::Instance(const std::string& directory, bool force)
+    : Instance(Fd(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)), force) {}
+Instance::Instance(Fd directory, bool force, std::optional<uid_t> owner)
+    : directory_(std::move(directory)), owner_(owner) {
     require(directory_.get() >= 0, "open run directory");
     lock_ = Fd(openat(directory_.get(), "droidvmd.lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600));
     struct stat info{};
@@ -96,6 +98,12 @@ Instance::Instance(const std::string& directory, bool force) {
         }
     }
     owns_ = true;
+    if (owner_) {
+        require(fchown(directory_.get(), *owner_, *owner_) == 0 && fchmod(directory_.get(), 0700) == 0,
+                "protect run directory");
+        require(fchown(lock_.get(), *owner_, *owner_) == 0 && fchmod(lock_.get(), 0600) == 0,
+                "protect daemon lock");
+    }
     require(ftruncate(lock_.get(), 0) == 0, "truncate lock owner");
     write_all(lock_.get(), std::to_string(getpid()));
     require(fsync(lock_.get()) == 0, "sync lock owner");
@@ -114,6 +122,8 @@ void Instance::publish(std::string_view name, std::string_view value) {
     Fd file(openat(directory_.get(), temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
     require(file.get() >= 0, "create runtime file");
     try {
+        if (owner_) require(fchown(file.get(), *owner_, *owner_) == 0, "own runtime file");
+        require(fchmod(file.get(), 0600) == 0, "protect runtime file");
         write_all(file.get(), value);
         require(fsync(file.get()) == 0, "sync runtime file");
         require(renameat(directory_.get(), temporary.c_str(), directory_.get(), target.c_str()) == 0, "publish runtime file");

@@ -3,6 +3,7 @@
 #include "common/fd.h"
 #include "common/wire.h"
 #include "runtime/instance.h"
+#include "runtime/log.h"
 #include "dispatcher.h"
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -50,7 +51,7 @@ std::string request_id(const Json::Value& request) {
     return id;
 }
 }
-int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd) {
+int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd, RuntimeLog* log) {
     Fd epoll(epoll_create1(EPOLL_CLOEXEC));
     Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (epoll.get() < 0 || listener.get() < 0) throw std::runtime_error("create listener failed");
@@ -66,6 +67,7 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
     watch(epoll.get(), EPOLL_CTL_ADD, signal_fd, 2, EPOLLIN);
     instance.publish_discovery(ntohs(address.sin_port), token);
     std::cout << "droidvmd ready pid=" << getpid() << " port=" << ntohs(address.sin_port) << std::endl;
+    if (log) log->write("INFO", "ready pid=" + std::to_string(getpid()) + " port=" + std::to_string(ntohs(address.sin_port)));
     std::unordered_map<uint64_t, std::unique_ptr<Client>> clients;
     uint64_t next_id = 3;
     size_t input_reserved = 0, output_reserved = 0;

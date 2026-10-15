@@ -3,5 +3,6 @@
 namespace droidvm {
 class Instance;
 class RequestDispatcher;
-int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd);
+class RuntimeLog;
+int serve(Instance& instance, RequestDispatcher& service, const char* token, int signal_fd, RuntimeLog* log = nullptr);
 }
