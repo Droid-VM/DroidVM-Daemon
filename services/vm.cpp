@@ -147,7 +147,8 @@ std::string VmService::modify(const CallContext& caller, Json::Value value) {
     auto at = entries_.begin();
     while (at != entries_.end() && at->id != id) ++at;
     if (at == entries_.end()) throw ServiceError(ErrorCode::not_found, "VM " + id + " not found");
-    if (at->vm->state() != VmState::stopped) throw ServiceError(ErrorCode::conflict, "VM " + id + " is not stopped, cannot modify");
+    auto edit = at->vm->try_edit();
+    if (!edit) throw ServiceError(ErrorCode::conflict, "VM " + id + " is not stopped, cannot modify");
     config["id"] = id;
     // removeById + add re-appends a rebuilt instance. Unlike the legacy store,
     // a rejected duplicate name restores the previous entry in place.
@@ -156,6 +157,7 @@ std::string VmService::modify(const CallContext& caller, Json::Value value) {
     entries_.erase(at);
     try { add(id, std::move(config)); }
     catch (...) { entries_.insert(entries_.begin() + index, std::move(previous)); throw; }
+    edit.retire();
     return id;
 }
 bool VmService::remove(const CallContext& caller, const std::string& id) {
@@ -175,6 +177,16 @@ bool VmService::remove(const CallContext& caller, const std::string& id) {
         if (target->state() != VmState::stopped) throw ServiceError(ErrorCode::unavailable, "Failed to stop VM: " + id);
     }
     std::lock_guard lock(mutex_);
+    // A start may have acquired a reference before removal, or raced the stop
+    // above. Never remove an instance whose lifecycle cannot be frozen now.
+    auto edit = target->try_edit();
+    if (!edit) {
+        // Another remover/modify may already have retired precisely this object.
+        for (const auto& entry : entries_) if (entry.vm == target)
+            throw ServiceError(ErrorCode::conflict, "VM changed while being deleted: " + id);
+        return true;
+    }
+    edit.retire();
     std::erase_if(entries_, [&](const Entry& entry) { return entry.vm == target; });
     return true;
 }

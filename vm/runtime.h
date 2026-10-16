@@ -47,6 +47,22 @@ struct RuntimeContext {
 // watched on a worker thread that publishes every transition as an event.
 class VmRuntime : public std::enable_shared_from_this<VmRuntime> {
 public:
+    // Nonblocking admission prevents inventory -> lifecycle -> network ->
+    // inventory lock inversion. A valid lease pins a fully stopped instance
+    // and excludes starts until configuration publication succeeds or aborts.
+    class StoppedLease {
+    public:
+        StoppedLease(StoppedLease&&) = default;
+        StoppedLease& operator=(StoppedLease&&) = delete;
+        explicit operator bool() const { return lock_.owns_lock(); }
+        void retire(); // commit: stale references can never start this instance
+    private:
+        friend class VmRuntime;
+        explicit StoppedLease(std::shared_ptr<VmRuntime> target);
+        std::shared_ptr<VmRuntime> target_; // outlives lock_, including on moves
+        std::unique_lock<std::mutex> lock_;
+    };
+    StoppedLease try_edit();
     struct StreamInfo { std::string type; bool readable = false, writable = false; int read_fd = -1, write_fd = -1; bool fd_pipe = false, ready = false; };
     VmRuntime(std::string id, Json::Value config, const RuntimeContext& context);
     ~VmRuntime();
@@ -54,7 +70,6 @@ public:
     State state() const;
     int64_t pid() const;
     Json::Value config() const;
-    void replace(Json::Value config); // stopped only (vm_modify)
     // DeleteHandler edits the live item in place; streams are kept.
     void set_networks(Json::Value networks) { std::lock_guard lock(state_mutex_); config_["networks"] = std::move(networks); }
     bool start(std::optional<std::string> boot_entry = {});
@@ -79,6 +94,7 @@ private:
     const std::string id_;
     RuntimeContext context_;
     mutable std::mutex lock_; // VMInstance.startLock
+    bool retired_ = false; // protected by lock_; removed/replaced inventory entry
     mutable std::mutex state_mutex_;
     std::condition_variable idle_;
     Json::Value config_;

@@ -151,12 +151,17 @@ void VmRuntime::create_streams() {
 State VmRuntime::state() const { std::lock_guard lock(state_mutex_); return state_; }
 int64_t VmRuntime::pid() const { return pid_.load(); }
 Json::Value VmRuntime::config() const { std::lock_guard lock(state_mutex_); return config_; }
-void VmRuntime::replace(Json::Value config) {
-    std::lock_guard lock(state_mutex_);
-    config_ = std::move(config);
-    // The legacy instance is rebuilt on modify: streams follow the new config.
-    logs_.clear(); order_.clear(); create_streams();
+VmRuntime::StoppedLease::StoppedLease(std::shared_ptr<VmRuntime> target)
+    : target_(std::move(target)), lock_(target_->lock_, std::try_to_lock) {
+    if (!lock_.owns_lock()) return;
+    std::lock_guard state(target_->state_mutex_);
+    if (target_->retired_ || target_->state_ != State::stopped || target_->worker_) lock_.unlock();
 }
+void VmRuntime::StoppedLease::retire() {
+    if (!lock_.owns_lock()) throw std::logic_error("Stopped VM lease required");
+    target_->retired_ = true;
+}
+VmRuntime::StoppedLease VmRuntime::try_edit() { return StoppedLease(shared_from_this()); }
 std::vector<std::string> VmRuntime::streams() const { std::lock_guard lock(state_mutex_); return order_; }
 ConsoleLog* VmRuntime::log(const std::string& stream) const {
     std::lock_guard lock(state_mutex_);
@@ -195,6 +200,7 @@ void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
 }
 bool VmRuntime::start(std::optional<std::string> boot_entry) {
     std::unique_lock lock(lock_);
+    if (retired_) return false;
     {
         std::lock_guard state(state_mutex_);
         if (state_ != State::stopped) return false;
@@ -203,7 +209,7 @@ bool VmRuntime::start(std::optional<std::string> boot_entry) {
     return start_locked(false);
 }
 bool VmRuntime::start_locked(bool relaunch) {
-    if (context_.shutting_down()) return false;
+    if (retired_ || context_.shutting_down()) return false;
     {
         std::unique_lock state(state_mutex_);
         if (state_ != State::stopped && state_ != State::rebooting) return false;
