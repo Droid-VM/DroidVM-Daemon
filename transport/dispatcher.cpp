@@ -175,7 +175,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             auto snapshot = vm_config_->snapshot(caller);
             if (!vms_) throw ServiceError(ErrorCode::unavailable, "VM runtime unavailable");
             for (const auto& key : request.getMemberNames())
-                if (key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry" && key != "clear_logs_before_start")
+                if (key != "type" && key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry" && key != "clear_logs_before_start")
                     throw ServiceError(ErrorCode::invalid_argument, "Unexpected configured start field");
             const auto revision = string_field(request, "revision");
             const auto id = string_field(request, "vm_id");
