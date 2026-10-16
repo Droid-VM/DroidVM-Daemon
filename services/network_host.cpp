@@ -2,10 +2,23 @@
 #include "network_host.h"
 
 namespace droidvm {
-Json::Value NetworkHostService::available_interfaces(const CallContext& caller) const {
+namespace {
+void access(const CallContext& caller) {
     if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
     if (!caller.administrator || caller.principal.empty())
         throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+}
+}
+Json::Value NetworkHostService::uplinks(const CallContext& caller) const {
+    access(caller); return network::UplinkSnapshot::scan().picker();
+}
+Json::Value NetworkHostService::addresses(const CallContext& caller) const {
+    access(caller);
+    const auto links = netbox_.links();
+    return network::host_addresses(links, netbox_.addresses());
+}
+Json::Value NetworkHostService::available_interfaces(const CallContext& caller) const {
+    access(caller);
     Json::Value result(Json::arrayValue);
     // Preserve LinuxNetwork.listAvailableInterfaces' legacy fields/filtering.
     // A failed discovery is an error, not a successful empty interface list.

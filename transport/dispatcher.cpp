@@ -10,6 +10,10 @@ namespace {
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
+constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
+bool host_command(const std::string& command) {
+    return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
+}
 constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log"};
 bool runtime_command(const std::string& command) {
     return std::find(runtime_commands.begin(), runtime_commands.end(), command) != runtime_commands.end();
@@ -78,7 +82,7 @@ std::string legacy_id(const Json::Value& request) {
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (host_network_ && command == "network_list_interfaces") ||
+    return (host_network_ && host_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
@@ -87,8 +91,9 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
     try {
-        if (command == "network_list_interfaces" && host_network_) {
-            result["data"] = host_network_->available_interfaces(caller);
+        if (host_command(command) && host_network_) {
+            result["data"] = command == "network_list_uplinks" ? host_network_->uplinks(caller) :
+                command == "network_list_host_addresses" ? host_network_->addresses(caller) : host_network_->available_interfaces(caller);
             result["success"] = true;
             return result;
         }
@@ -137,7 +142,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     } catch (const ServiceError& error) {
         if (runtime_command(command)) return failure(error);
         if (runtime_ && command == "network_modify" && error.code() == ErrorCode::conflict) return failure(error);
-        if (command == "network_list_interfaces") return failure(error);
+        if (host_command(command)) return failure(error);
         if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::io_error || error.code() == ErrorCode::resource_exhausted)
             return failure(error);
         if (command == "network_create" && error.code() == ErrorCode::conflict) result["message"] = "failed to create network";
@@ -161,8 +166,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["service_api_minor"] = 2;
             }
             if (host_network_) {
-                result["commands"].append("network_list_interfaces");
+                for (const auto* name : host_commands) result["commands"].append(name);
                 result["network_host_interfaces"] = true;
+                result["network_uplinks"] = true;
+                result["network_host_addresses"] = true;
                 result["service_api_minor"] = 3;
             }
             if (runtime_) {
@@ -174,6 +181,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["network_live_details"] = false;
                 result["service_api_minor"] = 4;
             }
+            if (host_network_) result["service_api_minor"] = 5;
         }
         return result;
     }

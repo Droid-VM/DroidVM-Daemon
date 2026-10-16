@@ -97,6 +97,11 @@ void adapter_failures() {
     error(ErrorCode::unauthenticated, [&] { absent.available_interfaces({}); });
     error(ErrorCode::permission_denied, [&] { absent.available_interfaces(owner); });
     error(ErrorCode::io_error, [&] { absent.available_interfaces(admin); });
+    error(ErrorCode::unauthenticated, [&] { absent.uplinks({}); });
+    error(ErrorCode::permission_denied, [&] { absent.uplinks(owner); });
+    error(ErrorCode::unauthenticated, [&] { absent.addresses({}); });
+    error(ErrorCode::permission_denied, [&] { absent.addresses(owner); });
+    error(ErrorCode::io_error, [&] { absent.addresses(admin); });
     Netbox fake("/proc/self/exe", 80ms, 1024);
     setenv("DROIDVM_NETBOX_TEST", "failure", 1);
     error(ErrorCode::io_error, [&] { fake.links(); });
@@ -119,6 +124,100 @@ void adapter_failures() {
     error(ErrorCode::invalid_argument, [&] { fake.add_tap(std::string("bad\0name", 8)); });
     check(OwnedLinks::vlan_code(1) == "AB" && OwnedLinks::vlan_code(4094) == "_-", "Java VLAN base64 naming");
     check(OwnedLinks::vlan_device("dtbridge", 0) == "dtbridge", "untagged VLAN stays on main bridge");
+}
+void host_address_filtering() {
+    const auto links = wire::parse(R"([{"ifname":"wlanbridge","kind":"bridge"},{"ifname":"eth0","kind":"ether"}])");
+    auto rows = wire::parse(R"([
+        {"local":"192.0.2.1","ifname":"wlan0","family":4,"scope":"global","prefixlen":24},
+        {"local":"192.0.2.2","ifname":"wlan0","family":4,"scope":"global","prefixlen":24,"metric":4243672773},
+        {"local":"192.0.2.3","ifname":"wlan0","family":4,"scope":"global","prefixlen":32,"noprefixroute":true},
+        {"local":"192.0.2.4","ifname":"rmnet_data0","family":4,"scope":"global","prefixlen":32},
+        {"local":"192.0.2.5","ifname":"eth0","family":4,"scope":"global","prefixlen":24,"noprefixroute":true},
+        {"local":"192.0.2.6","ifname":"wlanbridge","family":4,"scope":"global","prefixlen":24},
+        {"local":"192.0.2.7","ifname":"ccmni0","family":4,"scope":"global","prefixlen":24},
+        {"local":"fe80::1","ifname":"wlan0","family":6,"scope":"link","prefixlen":64},
+        {"local":"2001:db8::1","ifname":"wlan0","family":6,"scope":"global","prefixlen":64,"temporary":true},
+        {"local":"2001:db8::2","ifname":"wlan0","family":6,"scope":"global","prefixlen":64},
+        {"local":"2001:db8::3","ifname":"wlan0","family":6,"scope":"global","prefixlen":128,"noprefixroute":true},
+        {"local":"192.0.2.8","ifname":"tun0","family":4,"scope":"global","prefixlen":32,"temporary":false},
+        {"local":"192.0.2.9","ifname":"wlan0","family":4,"scope":"global","prefixlen":24,"temporary":false,"secondary":true},
+        {"local":"192.0.2.10","ifname":"wlan0","family":99,"scope":"global","prefixlen":24}
+    ])");
+    const auto filtered = host_addresses(links, rows);
+    check(filtered.size() == 6, "host address exclusions retain exact expected set");
+    Json::ArrayIndex at = 0;
+    for (const auto* address : {"192.0.2.1", "192.0.2.4", "192.0.2.5", "2001:db8::2", "192.0.2.8", "192.0.2.9"}) {
+        check(filtered[at]["addr"] == address && filtered[at].size() == 3, "legacy host address order and fields preserved"); ++at;
+    }
+    error(ErrorCode::io_error, [&] { host_addresses(Json::Value(), rows); });
+    for (const auto& prefix : host_interface_prefixes()) {
+        auto row = rows[0]; row["ifname"] = prefix + "123";
+        Json::Value input(Json::arrayValue); input.append(row);
+        check(host_addresses(Json::Value(Json::arrayValue), input).size() == 1, "shared host prefix set accepted");
+    }
+}
+void uplink_snapshot_policy() {
+    Case test;
+    const auto root = test.path + "/sys";
+    check(mkdir(root.c_str(), 0700) == 0, "create sysfs fixture root");
+    std::vector<std::string> files, directories;
+    auto write_property = [&](const std::string& name, const std::string& value) {
+        std::ofstream stream(root + "/" + name); stream << value << '\n'; check(stream.good(), "write sysfs property fixture");
+    };
+    auto device = [&](const std::string& name, int index, int parent, int type, const std::string& state,
+                      std::initializer_list<const char*> markers, const std::string& devtype = "") {
+        check(mkdir((root + "/" + name).c_str(), 0700) == 0, "create interface fixture"); directories.push_back(name);
+        for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{
+            {"ifindex", std::to_string(index)}, {"iflink", std::to_string(parent)}, {"type", std::to_string(type)},
+            {"operstate", state}, {"uevent", "INTERFACE=" + name + (devtype.empty() ? "" : "\nDEVTYPE=" + devtype)}}) {
+            write_property(name + "/" + key, value); files.push_back(name + "/" + key);
+        }
+        for (const auto* marker : markers) {
+            check(mkdir((root + "/" + name + "/" + marker).c_str(), 0700) == 0, "create interface marker");
+            directories.push_back(name + "/" + marker);
+        }
+    };
+    device("wlan0", 1, 1, 1, "down", {"wireless", "device"});
+    device("wlan1", 2, 2, 1, "up", {"phy80211", "device"});
+    device("ap0", 3, 3, 1, "up", {"wireless"});
+    device("eth0", 4, 4, 1, "down", {"device"});
+    device("eth1", 5, 5, 1, "up", {"device"});
+    device("eth2", 6, 5, 1, "up", {}, "vlan");
+    device("eth3", 0, 0, 1, "up", {}); // missing/invalid identity must not imply leaf
+    device("eth4", 7, 7, 1, "up", {}, "vxlan");
+    device("tun0", 8, 8, 65534, "up", {"tun_flags"});
+    device("wlanbridge", 9, 9, 1, "up", {"bridge"});
+    device("lo", 10, 10, 772, "up", {});
+    const auto first = UplinkSnapshot::scan(root);
+    check(first.resolve("wIfI") == "wlan1" && first.resolve("Ethernet") == "eth1" && first.resolve("Tethering") == "ap0", "logical identifiers prefer live matching interfaces");
+    check(first.resolve("tun0") == "tun0" && first.resolve("lo") == "lo" && !first.resolve("absent"), "literal interface pinned regardless of picker category");
+    check(first.assume_dont_bridge("wlan1") && first.assume_dont_bridge("tun0") && !first.assume_dont_bridge("eth1"), "WiFi and raw IP require pseudo bridging");
+    error(ErrorCode::invalid_argument, [&] { first.resolve("../wlan1"); });
+    error(ErrorCode::not_found, [&] { first.assume_dont_bridge("absent"); });
+    const auto picker = first.picker();
+    std::set<std::string> visible;
+    for (const auto& row : picker["devices"]) visible.insert(row["name"].asString());
+    check(visible == std::set<std::string>{"wlan1", "eth1", "ap0"}, "picker excludes down, stacked, virtual, invalid identity, bridge and tun devices");
+    check(picker["identifiers"].size() == 3 && picker["identifiers"][0]["id"] == "WiFi" && picker["identifiers"][0]["bridgeable"] == false, "legacy logical picker descriptors");
+    write_property("wlan1/operstate", "down"); write_property("wlan0/operstate", "up");
+    check(UplinkSnapshot::scan(root).resolve("WiFi") == "wlan0" && first.resolve("WiFi") == "wlan1", "fresh snapshot re-resolves changed host state");
+    check(unlink((root + "/wlan0/uevent").c_str()) == 0, "simulate unplug during discovery");
+    check(UplinkSnapshot::scan(root).resolve("WiFi") == "wlan1", "down wireless fallback remains when active interface disappears");
+    write_property("eth1/operstate", "down");
+    const auto ethernet = UplinkSnapshot::scan(root).resolve("Ethernet");
+    check(ethernet == "eth0" || ethernet == "eth1", "unplugged physical ethernet remains fallback");
+    error(ErrorCode::io_error, [&] { UplinkSnapshot::scan(root + "/absent"); });
+    for (const auto& file : files) unlink((root + "/" + file).c_str());
+    for (auto at = directories.rbegin(); at != directories.rend(); ++at) check(rmdir((root + "/" + *at).c_str()) == 0, "remove fixture interface directory");
+    check(rmdir(root.c_str()) == 0, "remove sysfs fixture root"); test.finish();
+}
+void real_host_discovery() {
+    NetworkHostService service(executable);
+    const auto picker = service.uplinks(admin), addresses = service.addresses(admin);
+    check(picker["identifiers"].size() == 3 && picker["devices"].isArray() && addresses.isArray(), "real host discovery schema");
+    for (const auto& row : picker["devices"]) check(exists(row["name"].asString()), "real picker only includes present kernel links");
+    const auto snapshot = UplinkSnapshot::scan();
+    check(snapshot.resolve("lo") == "lo" && snapshot.assume_dont_bridge("lo"), "real literal lookup supports non-picker interfaces");
 }
 void real_datapath() {
     Case test;
@@ -532,6 +631,7 @@ int main(int argc, char** argv) {
     if (argc != 4) return 64;
     executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
     return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
+        {"host_address_filtering", host_address_filtering}, {"uplink_snapshot_policy", uplink_snapshot_policy}, {"real_host_discovery", real_host_discovery},
         {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
         {"setup_failure_and_journal_retry", failures_and_journal}, {"twenty_five_sigkill_boundaries", crash_recovery},
         {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor},
