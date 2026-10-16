@@ -3,6 +3,7 @@
 #include "snapshot_document.h"
 #include "common/identity.h"
 #include "services/vm_config.h"
+#include "services/vm_config_upload.h"
 #include "store/vm_config.h"
 #include <atomic>
 #include <dirent.h>
@@ -51,6 +52,14 @@ Json::Value document(Json::Value row) {
     result["vms"].append(std::move(row));
     result["future_root"] = "保留🌏";
     return result;
+}
+std::string stage(VmConfigUploads& uploads, const std::string& revision, const std::string& bytes) {
+    auto id = uploads.begin(admin, revision, bytes.size());
+    for (size_t offset = 0; offset < bytes.size(); offset += VmConfigUploads::chunk_bytes) {
+        auto chunk = std::string_view(bytes).substr(offset, VmConfigUploads::chunk_bytes);
+        check(uploads.append(admin, id, offset, chunk) == offset + chunk.size(), "upload accepts contiguous bounded chunks");
+    }
+    return id;
 }
 void migration_roundtrip_and_revision() {
     Temporary temp;
@@ -310,7 +319,11 @@ void full_capacity_document_snapshot() {
     auto normalized = service.replace(admin, initial->revision, seed);
     seed = normalized->document;
     seed["padding"] = std::string(VmConfigService::max_bytes - normalized->encoded->size(), 'x');
-    auto full = service.replace(admin, normalized->revision, seed);
+    VmConfigUploads uploads(service);
+    const auto encoded = config::encode_json(seed, VmConfigService::max_bytes);
+    auto upload = stage(uploads, normalized->revision, encoded);
+    check(service.snapshot(admin) == normalized, "full capacity staging does not publish configuration");
+    auto full = uploads.commit(admin, upload);
     check(full->encoded->size() == VmConfigService::max_bytes, "exact 16 MiB fixture");
     auto page = tasks.vm_config_snapshot(admin);
     Json::Value header;
@@ -321,6 +334,106 @@ void full_capacity_document_snapshot() {
     tasks.release_snapshot(admin, fresh.id);
     error(ErrorCode::snapshot_expired, [&] { tasks.snapshot_page(admin, fresh.id, 0); });
 }
+void upload_limits_scope_and_offsets() {
+    Temporary temp;
+    VmConfigService service(temp.directory.get(), getuid());
+    auto revision = service.snapshot(admin)->revision;
+    VmConfigUploads::Clock::time_point now{};
+    VmConfigUploads uploads(service, [&] { return now; });
+    error(ErrorCode::unauthenticated, [&] { uploads.begin({}, revision, 1); });
+    error(ErrorCode::permission_denied, [&] { uploads.begin(owner, revision, 1); });
+    error(ErrorCode::invalid_argument, [&] { uploads.begin(admin, revision, 0); });
+    error(ErrorCode::invalid_argument, [&] { uploads.begin(admin, revision, VmConfigService::max_bytes + 1); });
+    auto id = uploads.begin(admin, revision, 6);
+    const CallContext stranger{"stranger", true, true, true};
+    error(ErrorCode::permission_denied, [&] { uploads.append(stranger, id, 0, "abc"); });
+    error(ErrorCode::permission_denied, [&] { uploads.abort(stranger, id); });
+    check(uploads.append(admin, id, 0, "abc") == 3 && uploads.append(admin, id, 0, "abc") == 3, "identical chunk replay is idempotent");
+    error(ErrorCode::conflict, [&] { uploads.append(admin, id, 1, "bad"); });
+    error(ErrorCode::invalid_argument, [&] { uploads.append(admin, id, 4, "x"); });
+    error(ErrorCode::invalid_argument, [&] { uploads.append(admin, id, 3, "toolong"); });
+    error(ErrorCode::invalid_argument, [&] { uploads.commit(admin, id); });
+    uploads.abort(admin, id);
+    error(ErrorCode::not_found, [&] { uploads.commit(admin, id); });
+    auto large = uploads.begin(admin, revision, VmConfigService::max_bytes);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, revision, VmConfigService::max_bytes); });
+    error(ErrorCode::invalid_argument, [&] { uploads.append(admin, large, 0, std::string(VmConfigUploads::chunk_bytes + 1, 'x')); });
+    uploads.abort(admin, large);
+    std::vector<std::string> ids;
+    for (size_t i = 0; i < VmConfigUploads::max_uploads; ++i) ids.push_back(uploads.begin(admin, revision, 1));
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, revision, 1); });
+    now += VmConfigUploads::lifetime;
+    error(ErrorCode::not_found, [&] { uploads.append(admin, ids[0], 0, "x"); });
+    uploads.abort(admin, uploads.begin(admin, revision, VmConfigService::max_bytes));
+    check(!service.snapshot(admin)->persisted, "staging, quota failures and expiry never write config");
+}
+void upload_strict_parse_and_stale_revision() {
+    Temporary temp;
+    VmConfigService service(temp.directory.get(), getuid());
+    VmConfigUploads uploads(service);
+    auto initial = service.snapshot(admin);
+    for (const auto& bytes : {std::string("{\"vms\":[],\"vms\":[]}"), std::string("{/*comment*/\"vms\":[]}"), std::string("[]"),
+            std::string("{\"vms\":[]} trailing"), std::string("{\"vms\":[]}\0", 11), std::string("{}")}) {
+        auto id = stage(uploads, initial->revision, bytes);
+        error(ErrorCode::invalid_argument, [&] { uploads.commit(admin, id); });
+        error(ErrorCode::not_found, [&] { uploads.commit(admin, id); });
+    }
+    auto id = stage(uploads, initial->revision, "{\"vms\":[]}");
+    auto committed = service.replace(admin, initial->revision, document(vm("winner")));
+    error(ErrorCode::conflict, [&] { uploads.commit(admin, id); });
+    error(ErrorCode::not_found, [&] { uploads.commit(admin, id); });
+    error(ErrorCode::conflict, [&] { uploads.begin(admin, initial->revision, 1); });
+    check(service.snapshot(admin) == committed, "stale upload cannot overwrite winning edit");
+}
+void upload_commit_faults_and_inflight_budget() {
+    Temporary temp;
+    std::string failure;
+    Gate saving, proceed;
+    bool block = false;
+    VmConfigService service(temp.directory.get(), getuid(), [&](const char* point) {
+        if (failure == point) throw std::runtime_error("injected failure");
+        if (block && std::string_view(point) == "before_install") { saving.release(); proceed.wait(); }
+    });
+    VmConfigUploads::Clock::time_point now{};
+    VmConfigUploads uploads(service, [&] { return now; });
+    auto initial = service.snapshot(admin);
+    const auto bytes = wire::stringify(document(vm("upload")));
+    auto id = stage(uploads, initial->revision, bytes);
+    failure = "before_install";
+    error(ErrorCode::io_error, [&] { uploads.commit(admin, id); });
+    check(service.snapshot(admin) == initial, "upload pre-install failure preserves snapshot");
+    error(ErrorCode::not_found, [&] { uploads.commit(admin, id); });
+    id = stage(uploads, initial->revision, bytes); failure = "installed";
+    error(ErrorCode::commit_uncertain, [&] { uploads.commit(admin, id); });
+    auto uncertain = service.snapshot(admin);
+    check(uncertain->durability_uncertain, "upload installed failure exposes uncertainty");
+    error(ErrorCode::not_found, [&] { uploads.commit(admin, id); });
+    failure.clear(); block = true;
+    id = stage(uploads, uncertain->revision, bytes);
+    auto commit = std::async(std::launch::async, [&] { return uploads.commit(admin, id); });
+    saving.wait();
+    struct Release { Gate& gate; ~Release() { gate.release(); } } release{proceed};
+    now += VmConfigUploads::lifetime;
+    error(ErrorCode::conflict, [&] { uploads.abort(admin, id); });
+    error(ErrorCode::conflict, [&] { uploads.append(admin, id, 0, "x"); });
+    error(ErrorCode::conflict, [&] { uploads.commit(admin, id); });
+    for (size_t i = 1; i < VmConfigUploads::max_uploads; ++i) uploads.begin(admin, uncertain->revision, 1);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, uncertain->revision, 1); });
+    proceed.release();
+    check(!commit.get()->durability_uncertain, "in-flight expiry cannot interrupt commit or release its reservation");
+}
+void strict_base64_chunks() {
+    check(wire::decode_base64("Zg==", 1) == "f" && wire::decode_base64("Zm8=", 2) == "fo" && wire::decode_base64("Zm9v", 3) == "foo", "canonical base64 padding");
+    check(wire::decode_base64("AP+A", 3) == std::string("\0\xff\x80", 3), "base64 binary bytes");
+    for (auto text : {"Zg", "Zg=", " Zg==", "Zg==\n", "Zh==", "Zm9=", "=m9v", "Zg==Zg==", "Zg=A", "!!!!"}) {
+        bool rejected = false;
+        try { wire::decode_base64(text, 100); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "noncanonical base64 is rejected");
+    }
+    bool bounded = false;
+    try { wire::decode_base64("Zm9v", 2); } catch (const std::length_error&) { bounded = true; }
+    check(bounded, "base64 decoded output respects budget");
+}
 }
 int main() {
     return run({{"migration_roundtrip_revision", migration_roundtrip_and_revision},
@@ -330,5 +443,7 @@ int main() {
         {"recovery_semantic_corruption", recovery_and_corruption},
         {"capacity_before_side_effects", capacity_before_side_effects},
         {"atomic_batches", atomic_batches}, {"batch_validation_permissions", batch_validation_and_permissions},
-        {"snapshots_events_failure", snapshots_events_and_failure}, {"full_capacity_snapshot", full_capacity_document_snapshot}});
+        {"snapshots_events_failure", snapshots_events_and_failure}, {"full_capacity_snapshot", full_capacity_document_snapshot},
+        {"upload_limits_scope_offsets", upload_limits_scope_and_offsets}, {"upload_strict_parse_stale_revision", upload_strict_parse_and_stale_revision},
+        {"upload_commit_faults_inflight_budget", upload_commit_faults_and_inflight_budget}, {"strict_base64_chunks", strict_base64_chunks}});
 }

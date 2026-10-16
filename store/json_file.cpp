@@ -29,6 +29,8 @@ void require(bool result, const char* operation) {
     if (!result) throw std::system_error(errno, std::generic_category(), operation);
 }
 Json::Value parse(std::string_view bytes, JsonSyntax syntax) {
+    if (syntax == JsonSyntax::strict && bytes.find('\0') != std::string_view::npos)
+        throw std::invalid_argument("invalid configuration JSON object");
     Json::CharReaderBuilder builder;
     builder["failIfExtra"] = true;
     builder["stackLimit"] = 64;
@@ -47,6 +49,7 @@ Json::Value parse(std::string_view bytes, JsonSyntax syntax) {
     return result;
 }
 }
+Json::Value parse_json(std::string_view bytes, JsonSyntax syntax) { return parse(bytes, syntax); }
 std::string encode_json(const Json::Value& value, size_t max_bytes) {
     auto normalized = value;
     normalize_numbers(normalized);

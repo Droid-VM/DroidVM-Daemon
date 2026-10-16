@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/types.h>
 
 namespace droidvm::config {
@@ -25,6 +26,8 @@ struct LoadedJson {
     bool recovered = false;
 };
 enum class JsonSyntax { compatible, strict };
+// Shared strict configuration parser for staged uploads and on-disk documents.
+Json::Value parse_json(std::string_view bytes, JsonSyntax syntax = JsonSyntax::strict);
 // One service owns a file under the daemon's already-held Instance lock.
 // Call from a worker: filesystem operations can block. Existing JSON shape and
 // all unknown fields are retained; schema migration belongs to the service.

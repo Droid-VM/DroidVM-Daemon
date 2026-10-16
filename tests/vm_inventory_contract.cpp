@@ -258,7 +258,7 @@ void revisioned_batch_adapter() {
     check(!dispatcher.execute(session, "capabilities", {}).isMember("vm_config_updates"), "unattached dispatcher never advertises configuration ownership");
     dispatcher.set_vm_config(&store);
     auto caps = dispatcher.execute(session, "capabilities", {});
-    check(caps["vm_config_updates"] == "revisioned-batch-v1" && caps["service_api_minor"] == 14 && caps["vm_config_snapshot"] == "base64-json-chunks-v1", "attached dispatcher advertises batch and snapshot APIs");
+    check(caps["vm_config_updates"] == "revisioned-batch-v1" && caps["service_api_minor"] == 15 && caps["vm_config_snapshot"] == "base64-json-chunks-v1" && caps["vm_config_upload"] == "revisioned-chunks-v1", "attached dispatcher advertises batch, snapshot and upload APIs");
     check(dispatcher.background("vm_config_apply") && !dispatcher.background("vm_config_status"), "disk operations use bounded worker dispatch");
     auto status = dispatcher.execute(session, "vm_config_status", {});
     auto snapshot = dispatcher.execute(session, "vm_config_snapshot", {});
@@ -294,6 +294,18 @@ void revisioned_batch_adapter() {
     assert_error(dispatcher.execute_background(admin, "vm_config_apply", request), "COMMIT_UNCERTAIN");
     auto uncertain = dispatcher.execute(session, "vm_config_status", {});
     check(uncertain["durability_uncertain"] == true && uncertain["revision"] != created["revision"] && inventory.get(admin, id)["name"] == "changed", "adapter exposes installed-but-uncertain revision for reread");
+    fail.clear();
+    Json::Value begin; begin["revision"] = uncertain["revision"]; begin["bytes"] = 10;
+    auto started = dispatcher.execute_background(admin, "vm_config_upload_begin", begin);
+    check(started["success"].asBool() && dispatcher.background("vm_config_upload_commit"), "upload is advertised and uses workers");
+    Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0;
+    chunk["data"] = "eyJ2bXMiOltdfQ=="; // {"vms":[]}
+    check(dispatcher.execute_background(admin, "vm_config_upload_append", chunk)["received"].asUInt64() == 10, "strict base64 upload adapter accepts JSON bytes");
+    auto malformed = chunk; malformed["data"] = "Zh==";
+    assert_error(dispatcher.execute_background(admin, "vm_config_upload_append", malformed), "INVALID_ARGUMENT");
+    check(dispatcher.execute_background(admin, "vm_config_upload_commit", chunk)["success"].asBool() && !inventory.exists(admin, id), "uploaded complete document atomically deletes runtime inventory");
+    assert_error(dispatcher.execute_background(admin, "vm_config_upload_commit", chunk), "NOT_FOUND");
+    assert_error(dispatcher.execute_background({}, "vm_config_upload_begin", {}), "UNAUTHENTICATED");
     dispatcher.disconnected(session); dispatcher.disconnected(legacy);
     session.caller.authorized = false;
     assert_error(dispatcher.execute(session, "vm_config_status", {}), "UNAUTHENTICATED");

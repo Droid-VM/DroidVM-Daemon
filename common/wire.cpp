@@ -5,8 +5,37 @@
 #include <ostream>
 #include <streambuf>
 #include <stdexcept>
+#include <algorithm>
 
 namespace droidvm::wire {
+std::string decode_base64(std::string_view text, size_t max_bytes) {
+    if (text.size() % 4) throw std::invalid_argument("Invalid base64 length");
+    if (text.size() / 4 > max_bytes / 3 + 1) throw std::length_error("Base64 exceeds chunk limit");
+    const auto digit = [](char c) -> unsigned {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        throw std::invalid_argument("Invalid base64 alphabet");
+    };
+    std::string result;
+    result.reserve(std::min(text.size() / 4 * 3, max_bytes));
+    for (size_t i = 0; i < text.size(); i += 4) {
+        auto a = digit(text[i]), b = digit(text[i + 1]);
+        const bool pad2 = text[i + 2] == '=', pad3 = text[i + 3] == '=';
+        auto c = pad2 ? 0 : digit(text[i + 2]), d = pad3 ? 0 : digit(text[i + 3]);
+        if ((pad2 && !pad3) || ((pad2 || pad3) && i + 4 != text.size()) ||
+            (pad2 && (b & 15)) || (pad3 && !pad2 && (c & 3)))
+            throw std::invalid_argument("Invalid base64 padding");
+        const size_t count = pad2 ? 1 : pad3 ? 2 : 3;
+        if (count > max_bytes - result.size()) throw std::length_error("Base64 exceeds chunk limit");
+        result += static_cast<char>((a << 2) | (b >> 4));
+        if (!pad2) result += static_cast<char>((b << 4) | (c >> 2));
+        if (!pad3) result += static_cast<char>((c << 6) | d);
+    }
+    return result;
+}
 uint32_t payload_size(const void* header) {
     const auto* p = static_cast<const uint8_t*>(header);
     const uint32_t size = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
