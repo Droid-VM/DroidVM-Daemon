@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -62,6 +63,10 @@ static void child_error(int fd, int stage, int error) {
     _exit(stage == DROIDVM_EXEC_IMAGE || stage == DROIDVM_EXEC_DIRECTORY ? 127 : 126);
 }
 int droidvm_process_spawn(const struct droidvm_process_options* options, struct droidvm_process_result* result) {
+    return droidvm_process_spawn_gated(options, result, NULL, NULL);
+}
+int droidvm_process_spawn_gated(const struct droidvm_process_options* options, struct droidvm_process_result* result,
+    int (*before_exec)(pid_t, void*), void* context) {
     if (!options || !result || !options->argv || !options->argv[0] || !options->argv[0][0] ||
         options->preserve_count > 4096 || options->limit_count > 64 ||
         (options->preserve_count && !options->preserve_fds) || (options->limit_count && !options->limits)) {
@@ -75,8 +80,8 @@ int droidvm_process_spawn(const struct droidvm_process_options* options, struct 
         if (fcntl(options->preserve_fds[i], F_GETFD) < 0) return -1;
     }
     int pairs[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
-    int child_stdio[3] = {-1, -1, -1}, report[2] = {-1, -1};
-    int* keep = malloc((options->preserve_count + 1) * sizeof(int));
+    int child_stdio[3] = {-1, -1, -1}, report[2] = {-1, -1}, gate[2] = {-1, -1};
+    int* keep = malloc((options->preserve_count + 2) * sizeof(int));
     if (!keep) return -1;
     // Read the parent's limit before fork (sysconf is not child-side safe).
     struct rlimit files;
@@ -103,15 +108,22 @@ int droidvm_process_spawn(const struct droidvm_process_options* options, struct 
         }
     }
     if (high_pipe(report)) goto fail;
+    if (before_exec) {
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate)) goto fail;
+        gate[0] = high_fd(gate[0]); gate[1] = high_fd(gate[1]);
+        if (gate[0] < 0 || gate[1] < 0) goto fail;
+    }
     for (size_t i = 0; i < options->preserve_count; ++i) keep[i] = options->preserve_fds[i];
     keep[options->preserve_count] = report[1];
-    qsort(keep, options->preserve_count + 1, sizeof(int), compare_fd);
+    size_t keep_count = options->preserve_count + 1;
+    if (before_exec) keep[keep_count++] = gate[0];
+    qsort(keep, keep_count, sizeof(int), compare_fd);
     const pid_t pid = fork();
     if (pid < 0) goto fail;
     if (pid == 0) {
         // Only async-signal-safe operations below: no JNI, allocation or logging.
         for (int i = 0; i < 3; ++i) if (dup2(child_stdio[i], i) < 0) child_error(report[1], DROIDVM_EXEC_STDIO, errno);
-        close_unwanted(keep, options->preserve_count + 1, max_fd);
+        close_unwanted(keep, keep_count, max_fd);
         for (size_t i = 0; i < options->preserve_count; ++i)
             if (fcntl(options->preserve_fds[i], F_SETFD, 0) < 0) child_error(report[1], DROIDVM_EXEC_STDIO, errno);
         if (options->new_process_group && setpgid(0, 0)) child_error(report[1], DROIDVM_EXEC_GROUP, errno);
@@ -128,6 +140,13 @@ int droidvm_process_spawn(const struct droidvm_process_options* options, struct 
             struct rlimit limit = {options->limits[i].soft, options->limits[i].hard};
             if (setrlimit(options->limits[i].resource, &limit)) child_error(report[1], DROIDVM_EXEC_LIMIT, errno);
         }
+        if (before_exec) {
+            char release = 0;
+            ssize_t received;
+            do { received = read(gate[0], &release, 1); } while (received < 0 && errno == EINTR);
+            close(gate[0]);
+            if (received != 1 || release != 1) _exit(126);
+        }
         execve(options->argv[0], options->argv, options->envp ? options->envp : environ);
         child_error(report[1], DROIDVM_EXEC_IMAGE, errno);
     }
@@ -141,6 +160,25 @@ int droidvm_process_spawn(const struct droidvm_process_options* options, struct 
         }
     }
     free(keep);
+    if (before_exec) {
+        close(gate[0]);
+        int accepted = before_exec(pid, context);
+        const char release = 1;
+        ssize_t sent = -1;
+        if (accepted == 0) do { sent = send(gate[1], &release, 1, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
+        const int gate_error = errno;
+        close(gate[1]);
+        if (sent != 1) {
+            if (options->new_process_group) kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+            close(report[0]);
+            for (int i = 0; i < 3; ++i) if (result->pipes[i] >= 0) close(result->pipes[i]);
+            result->pid = -1;
+            errno = gate_error ? gate_error : EIO;
+            return -1;
+        }
+    }
     struct pollfd ready = {report[0], POLLIN, 0};
     struct timespec start, current;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -177,6 +215,7 @@ fail: {
             for (int j = 0; j < 2; ++j) if (pairs[i][j] >= 0) close(pairs[i][j]);
         }
         for (int i = 0; i < 2; ++i) if (report[i] >= 0) close(report[i]);
+        for (int i = 0; i < 2; ++i) if (gate[i] >= 0) close(gate[i]);
         free(keep);
         errno = error;
         return -1;

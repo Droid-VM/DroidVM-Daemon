@@ -7,6 +7,7 @@
 #include "services/network.h"
 #include "network/gvswitch.h"
 #include "runtime/managed_process.h"
+#include "runtime/helper_identity.h"
 #include "common/identity.h"
 #include <cstring>
 #include <dirent.h>
@@ -15,6 +16,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <signal.h>
 
@@ -496,11 +498,48 @@ void real_network_parallel_and_start_cleanup() {
     for (const char* file : {"networks.json", "networks.json.bak"}) unlinkat(dir.get(), file, 0);
     check(rmdir(path.c_str()) == 0, "parallel lifecycle leaves no resources");
 }
+Json::Value orphan_configuration() {
+    return wire::parse(R"({"schema":2,"id":"aa000000-0000-4000-8000-000000000001","name":"orphan","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
+}
+void real_switch_owner_death() {
+    const auto path = work + "/owner-death";
+    check(mkdir(path.c_str(), 0700) == 0, "create real orphan fixture");
+    Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    ChildOptions options; options.argv = {"/proc/self/exe", "--orphan-switch", binaries, path};
+    const auto result = Child(options).communicate({}, 10s);
+    check(result.exit_code == -SIGKILL, "real switch owner killed after readiness");
+    const auto directory = switch_directory(path);
+    Fd runtime(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const auto record = config::JsonFile(runtime.get(), "helper.json", getuid()).load();
+    check(record.has_value(), "real switch identity persisted before execution");
+    Fd helper(static_cast<int>(syscall(SYS_pidfd_open, record->value["pid"].asInt(), 0)));
+    pollfd death{helper.get(), POLLIN, 0};
+    check(helper.get() >= 0 && poll(&death, 1, 0) == 0, "real gvswitch survives daemon SIGKILL");
+    HelperIdentity::recover(runtime.get(), getuid(), 200ms);
+    check(poll(&death, 1, 0) > 0 && (death.revents & POLLIN), "fresh owner recovers real switch via inherited marker and pidfd");
+    HelperIdentity::recover(runtime.get(), getuid(), 200ms);
+    for (const char* name : {"helper.json", "helper.identity", "s", "config.json"})
+        check(unlinkat(runtime.get(), name, 0) == 0 || errno == ENOENT, "remove known orphan fixture file");
+    check(rmdir(directory.c_str()) == 0, "real orphan runtime reclaimed");
+    Gvswitch replacement(binaries + "/gvswitch", dir.get());
+    replacement.start(orphan_configuration());
+    check(replacement.healthy(), "switch restarts after orphan recovery");
+    replacement.stop();
+    check(rmdir(path.c_str()) == 0, "owner-death fixture fully reclaimed");
+}
 }
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--orphan-switch") {
+        Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        Gvswitch backend(std::string(argv[2]) + "/gvswitch", directory.get());
+        backend.start(orphan_configuration());
+        kill(getpid(), SIGKILL);
+        return 99;
+    }
     if (argc == 3) { binaries = argv[1]; work = argv[2]; }
     if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp},
-        {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup}});
+        {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup},
+        {"real_switch_owner_sigkill", real_switch_owner_death}});
     return run({{"framing_and_methods", valid_framing_and_methods}, {"malformed_and_truncated", malformed_and_truncated},
         {"limits_and_injection", limits_and_injection}, {"whole_request_deadline_and_cancel", deadline_and_cancellation},
         {"concurrent_connections_and_fd_cleanup", concurrent_connections_and_fd_cleanup}});

@@ -19,6 +19,9 @@ struct ChildOptions {
     std::vector<droidvm_process_limit> limits;
     std::array<int, 3> stdio{-1, -1, -1};
     bool new_process_group = true;
+    // Runs in the parent after fork, with exec gated until it returns. A
+    // thrown persistence error aborts/reaps the child and is propagated intact.
+    std::function<void(pid_t)> before_exec;
 };
 struct ChildOutput {
     int exit_code = -1; // same negative-signal convention as the existing JNI

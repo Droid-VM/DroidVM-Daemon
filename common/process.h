@@ -29,6 +29,11 @@ struct droidvm_process_result {
 // Success means fork succeeded. exec_stage/errno distinguish child setup/exec
 // failure from a program legitimately exiting 126/127. Caller MUST reap pid.
 int droidvm_process_spawn(const struct droidvm_process_options* options, struct droidvm_process_result* result);
+// Optional parent-side transaction after fork, before exec. Returning -1
+// aborts/reaps the child; parent death closes the gate and prevents execution.
+// The callback must not throw across this C boundary.
+int droidvm_process_spawn_gated(const struct droidvm_process_options* options, struct droidvm_process_result* result,
+    int (*before_exec)(pid_t, void*), void* context);
 // 1 reaped, 0 still running, -1 error; exit_code keeps JNI's -signal convention.
 int droidvm_process_wait(pid_t pid, int block, int* exit_code);
 #ifdef __cplusplus

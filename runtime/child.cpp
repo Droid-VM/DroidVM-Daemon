@@ -60,7 +60,16 @@ Child::Child(const ChildOptions& options) : group_(options.new_process_group) {
         options.directory.empty() ? nullptr : options.directory.c_str(), options.preserve_fds.data(), options.preserve_fds.size(),
         options.limits.data(), options.limits.size(), {options.stdio[0], options.stdio[1], options.stdio[2]}, group_};
     droidvm_process_result result{};
-    if (droidvm_process_spawn(&spawn, &result)) fail("spawn child");
+    struct Gate { const ChildOptions& options; std::exception_ptr error; } gate{options, {}};
+    auto before_exec = [](pid_t pid, void* context) -> int {
+        auto& gate = *static_cast<Gate*>(context);
+        try { gate.options.before_exec(pid); return 0; }
+        catch (...) { gate.error = std::current_exception(); errno = EIO; return -1; }
+    };
+    if (droidvm_process_spawn_gated(&spawn, &result, options.before_exec ? +before_exec : nullptr, &gate)) {
+        if (gate.error) std::rethrow_exception(gate.error);
+        fail("spawn child");
+    }
     pid_ = result.pid;
     input_ = Fd(result.pipes[0]); output_ = Fd(result.pipes[1]); error_ = Fd(result.pipes[2]);
     try {

@@ -5,6 +5,7 @@
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
+#include "runtime/helper_identity.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <system_error>
@@ -22,7 +23,7 @@ Gvswitch::Gvswitch(std::string executable, int directory)
 Gvswitch::~Gvswitch() { try { stop(); } catch (...) {} }
 bool Gvswitch::healthy() const { return ready_ && process_.status().running; }
 void Gvswitch::start(const Json::Value& config) {
-    if (directory_.get() >= 0 || process_.status().running) throw std::logic_error("gvswitch requires cleanup before start");
+    if (!directory_name_.empty() || directory_.get() >= 0 || process_.status().running) throw std::logic_error("gvswitch requires cleanup before start");
     if (config::string(config, "bridge_type") != "gvisor") throw std::invalid_argument("gvswitch requires a gvisor network");
     const auto generated = gvswitch_config(config);
     struct stat parent{};
@@ -38,6 +39,7 @@ void Gvswitch::start(const Json::Value& config) {
     }
     require(fchown(directory_.get(), parent.st_uid, parent.st_gid) == 0, "own private switch directory");
     require(fchmod(directory_.get(), 0700) == 0, "protect private switch directory");
+    require(fsync(parent_.get()) == 0, "sync switch directory entry");
     config::JsonFile file(directory_.get(), "config.json", parent.st_uid);
     file.save(generated);
     // Both processes resolve the daemon's pinned FD, not a replaceable or
@@ -48,6 +50,8 @@ void Gvswitch::start(const Json::Value& config) {
     ChildOptions options;
     options.argv = {executable_, "-listen", path + "/s", "-auth-token", token, "-config", path + "/config.json"};
     if (config::boolean(config, "stp")) options.argv.push_back("-stp");
+    HelperIdentity identity(directory_.get(), parent.st_uid);
+    identity.arm(options);
     process_.start(options);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -82,7 +86,8 @@ void Gvswitch::remove_directory() {
     require(fstatat(parent_.get(), directory_name_.c_str(), &named, AT_SYMLINK_NOFOLLOW) == 0, "locate switch directory");
     if (held.st_dev != named.st_dev || held.st_ino != named.st_ino || !S_ISDIR(named.st_mode))
         throw std::runtime_error("switch runtime directory identity changed");
-    for (const char* file : {"s", "config.json", "config.json.bak", "config.json.corrupt"})
+    for (const char* file : {"s", "config.json", "config.json.bak", "config.json.corrupt",
+                            "helper.json", "helper.json.bak", "helper.json.corrupt", "helper.identity"})
         require(unlinkat(directory_.get(), file, 0) == 0 || errno == ENOENT, "remove switch runtime file");
     // Never recursively remove unknown files. Keep the held identity on error
     // so the service remains FAILED and a later stop can retry cleanup.

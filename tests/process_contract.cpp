@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
 #include "runtime/child.h"
+#include "runtime/helper_identity.h"
+#include "common/identity.h"
 #include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <signal.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <system_error>
 
@@ -38,8 +43,33 @@ ChildOptions helper(const std::string& mode) {
     options.argv = {"/proc/self/exe", "--child", mode};
     return options;
 }
+void ready(Child& child);
 int child_main(int argc, char** argv) {
     const std::string mode = argv[2];
+    if (mode == "marker") {
+        { Fd marker(open(argv[3], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+          check(marker.get() >= 0, "create execution evidence"); }
+        signal(SIGTERM, SIG_IGN);
+        write_all(1, "ready");
+        for (;;) pause();
+    }
+    if (mode == "journal_owner") {
+        const std::string path = argv[3], phase = argv[4];
+        Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        auto options = helper("marker"); options.argv.push_back(path + "/executed");
+        HelperIdentity identity(dir.get(), getuid()); identity.arm(options);
+        auto persist = options.before_exec;
+        options.before_exec = [&](pid_t pid) {
+            { Fd evidence(open((path + "/child.pid").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+              check(evidence.get() >= 0, "record fixture child"); write_all(evidence.get(), std::to_string(pid)); }
+            if (phase == "before_save") kill(getpid(), SIGKILL);
+            persist(pid);
+            if (phase == "after_save") kill(getpid(), SIGKILL);
+        };
+        Child child(options); ready(child);
+        kill(getpid(), SIGKILL);
+        return 99;
+    }
     if (mode == "exit") return argc > 3 ? atoi(argv[3]) : 17;
     if (mode == "inspect") {
         Json::Value value;
@@ -207,6 +237,109 @@ void threaded_spawns() {
     for (auto& thread : threads) thread.join();
     check(passed && descriptors().size() == before, "parallel spawn, IO and cleanup isolation");
 }
+struct IdentityCase {
+    std::string path = "/data/local/tmp/droidvm-identity-" + random_id(false);
+    Fd dir;
+    IdentityCase() {
+        check(mkdir(path.c_str(), 0700) == 0, "create identity fixture");
+        dir = Fd(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    }
+    ~IdentityCase() {
+        try { HelperIdentity::recover(dir.get(), getuid(), 10ms); } catch (...) { return; }
+        for (const char* name : {"helper.identity", "helper.json", "helper.json.bak", "child.pid", "executed", "original.identity"})
+            unlinkat(dir.get(), name, 0);
+        rmdir(path.c_str());
+    }
+};
+void gated_spawn_failure() {
+    IdentityCase test;
+    const auto before = descriptors().size();
+    for (int mode = 0; mode < 2; ++mode) {
+        auto options = helper("marker"); options.argv.push_back(test.path + "/executed");
+        options.before_exec = [&](pid_t pid) {
+            check(access((test.path + "/executed").c_str(), F_OK) < 0 && errno == ENOENT, "exec waits for parent transaction");
+            if (mode == 0) throw std::runtime_error("injected persistence failure");
+            check(kill(pid, SIGKILL) == 0, "kill still-owned gated child");
+            // Hold its zombie so the shared spawn code remains the sole reaper.
+            siginfo_t exited{};
+            check(waitid(P_PID, pid, &exited, WEXITED | WNOWAIT) == 0, "observe gated child death");
+        };
+        bool failed = false;
+        try { Child child(options); }
+        catch (const std::runtime_error& error) {
+            failed = mode == 1 || std::string(error.what()) == "injected persistence failure";
+        }
+        check(failed && access((test.path + "/executed").c_str(), F_OK) < 0, "failed gate never executes and preserves original exception");
+    }
+    check(descriptors().size() == before, "gated failure closes all pipes and sockets");
+    siginfo_t info{};
+    check(waitid(P_ALL, 0, &info, WEXITED | WNOHANG | WNOWAIT) < 0 && errno == ECHILD, "gated failures reaped");
+}
+void persistent_helper_crashes() {
+    for (const char* phase : {"before_save", "after_save", "after_exec"}) {
+        IdentityCase test;
+        auto options = helper("journal_owner"); options.argv.insert(options.argv.end(), {test.path, phase});
+        const auto result = Child(options).communicate({}, 5s);
+        if (result.exit_code != -SIGKILL) {
+            std::cerr << "owner phase=" << phase << " exit=" << result.exit_code << " stderr=" << result.error << std::endl;
+            throw std::runtime_error("owner killed at launch boundary");
+        }
+        std::ifstream evidence(test.path + "/child.pid"); pid_t pid = -1; evidence >> pid;
+        check(pid > 1, "fixture child identity recorded");
+        Fd process(static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
+        if (std::string_view(phase) == "after_exec") {
+            pollfd fd{process.get(), POLLIN, 0};
+            check(process.get() >= 0 && poll(&fd, 1, 0) == 0 && access((test.path + "/executed").c_str(), F_OK) == 0,
+                "helper is alive after owner death");
+        }
+        HelperIdentity::recover(test.dir.get(), getuid(), 20ms);
+        if (process.get() >= 0) {
+            pollfd fd{process.get(), POLLIN, 0};
+            check(poll(&fd, 1, 2000) > 0 && (fd.revents & POLLIN), "gate EOF or identity recovery stops orphan");
+        }
+        if (std::string_view(phase) != "after_exec")
+            check(access((test.path + "/executed").c_str(), F_OK) < 0, "owner death before release prevents exec");
+        HelperIdentity::recover(test.dir.get(), getuid(), 20ms); // idempotent after death/reap
+    }
+}
+void persistent_identity_mismatch() {
+    IdentityCase test;
+    auto options = helper("sleep");
+    HelperIdentity identity(test.dir.get(), getuid()); identity.arm(options);
+    Child child(options); ready(child);
+    config::JsonFile journal(test.dir.get(), "helper.json", getuid());
+    const auto original = journal.load()->value;
+    auto changed = original; changed["birth"] = Json::UInt64(original["birth"].asUInt64() + 1);
+    journal.save(changed);
+    HelperIdentity::recover(test.dir.get(), getuid(), 10ms);
+    check(!child.poll_exit(), "stale birth record cannot signal live process");
+    changed = original; changed["boot"] = "previous-boot"; journal.save(changed);
+    HelperIdentity::recover(test.dir.get(), getuid(), 10ms);
+    check(!child.poll_exit(), "previous boot record cannot signal live process");
+    journal.save(original);
+    check(renameat(test.dir.get(), "helper.identity", test.dir.get(), "original.identity") == 0, "retain real marker fixture");
+    { Fd replacement(openat(test.dir.get(), "helper.identity", O_CREAT | O_EXCL | O_RDONLY | O_CLOEXEC, 0400));
+      check(replacement.get() >= 0, "create same-name replacement marker"); }
+    bool refused = false;
+    try { HelperIdentity::recover(test.dir.get(), getuid(), 10ms); } catch (const std::runtime_error&) { refused = true; }
+    check(refused && !child.poll_exit(), "same-name marker replacement never authorizes signal");
+    check(unlinkat(test.dir.get(), "helper.identity", 0) == 0 &&
+        renameat(test.dir.get(), "original.identity", test.dir.get(), "helper.identity") == 0, "restore marker fixture");
+    // Point at a separate live process with its actual birth but no marker FD.
+    Child unrelated(helper("sleep")); ready(unrelated);
+    auto unrelated_options = helper("sleep"); // use its gated birth record from a second isolated identity
+    IdentityCase other_case;
+    HelperIdentity other_identity(other_case.dir.get(), getuid()); other_identity.arm(unrelated_options);
+    Child other_child(unrelated_options); ready(other_child);
+    const auto other_record = config::JsonFile(other_case.dir.get(), "helper.json", getuid()).load()->value;
+    changed = original; changed["pid"] = other_record["pid"]; changed["birth"] = other_record["birth"];
+    journal.save(changed); refused = false;
+    try { HelperIdentity::recover(test.dir.get(), getuid(), 10ms); } catch (const std::runtime_error&) { refused = true; }
+    check(refused && !other_child.poll_exit() && !unrelated.poll_exit(), "journal PID text cannot target unrelated live processes");
+    journal.save(original);
+    HelperIdentity::recover(test.dir.get(), getuid(), 10ms);
+    check(child.communicate({}, 1s).exit_code == -SIGTERM, "restored marker permits exact process recovery");
+}
 }
 int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "--child") return child_main(argc, argv);
@@ -215,5 +348,8 @@ int main(int argc, char** argv) {
         {"signals_deadlines_cancellation", signals_timeout_and_cancellation},
         {"bounded_concurrent_io_sigpipe", bounded_io_and_sigpipe},
         {"owned_group_orphan_raii", owned_group_and_raii},
-        {"six_threads_sixty_spawns", threaded_spawns}});
+        {"six_threads_sixty_spawns", threaded_spawns},
+        {"gated_failures_never_exec", gated_spawn_failure},
+        {"persistent_helper_owner_sigkill", persistent_helper_crashes},
+        {"persistent_identity_mismatch", persistent_identity_mismatch}});
 }
