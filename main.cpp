@@ -17,6 +17,10 @@
 #include "services/vm.h"
 #include "services/legacy_events.h"
 #include "input/keyboard_grab.h"
+#ifdef DROIDVM_PLATFORM_SERVICES
+#include "audio_table.h"
+#endif
+#include <fcntl.h>
 #include "vm/command_common.h"
 #include "vm/hugepage.h"
 #include "vm/nic.h"
@@ -161,6 +165,9 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::input::KeyboardGrab> keyboard;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
+#ifdef DROIDVM_PLATFORM_SERVICES
+            droidvm::platform::AudioTable audio_table;
+#endif
             droidvm::vm::HugepagePool hugepages;
             // The kernel keeps a reserve target after an owner dies; only a target this
             // daemon recorded in its run directory is ours to drop on startup.
@@ -270,6 +277,14 @@ int main(int argc, char** argv) {
                     for (const auto& address : addresses) text += (text.empty() ? "" : ",") + address;
                     if (log) log->write("INFO", "host IPv4 set [" + text + "]");
                 });
+#ifdef DROIDVM_PLATFORM_SERVICES
+                {
+                    // HostAudioTable.start: crosvm re-reads <run>/audio_devices per stream.
+                    droidvm::Fd run(open((std::filesystem::absolute(data_directory) / "run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+                    if (run.get() < 0 || !audio_table.start(run.get(), [&](const std::string& text) { if (log) log->write("WARN", text); }))
+                        if (log) log->write("WARN", "host audio table unavailable");
+                }
+#endif
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
@@ -283,6 +298,9 @@ int main(int argc, char** argv) {
             // VMs leave before USB/networks: their taps and devices go with them.
             if (vms) vms->stop_all();
             if (host_ipv4) host_ipv4->stop();
+#ifdef DROIDVM_PLATFORM_SERVICES
+            audio_table.stop();
+#endif
             if (network_runtime) {
                 const auto failures = network_runtime->shutdown();
                 if (!failures.empty()) throw std::runtime_error("Network shutdown incomplete: " + droidvm::wire::stringify(failures));

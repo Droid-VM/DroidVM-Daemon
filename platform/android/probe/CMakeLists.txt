@@ -84,3 +84,11 @@ target_compile_options(droidvm_platform_probe PRIVATE -Wall -Wextra -Werror)
 target_include_directories(droidvm_platform_probe SYSTEM PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/android_audio/include")
 target_link_libraries(droidvm_platform_probe PRIVATE droidvm_probe_aidl droidvm_daemon_json dl aaudio)
+
+# Daemon-side platform services built from the validated P1 probe code.
+add_library(droidvm_platform_services STATIC audio_table.cpp audio_probe.cpp service_manager.cpp)
+target_include_directories(droidvm_platform_services PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" PRIVATE "${GENERATED_DIR}")
+target_include_directories(droidvm_platform_services SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/android_audio/include")
+target_compile_options(droidvm_platform_services PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(droidvm_platform_services PUBLIC droidvm_probe_aidl droidvm_daemon_json dl aaudio)

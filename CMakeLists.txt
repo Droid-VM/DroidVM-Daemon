@@ -106,6 +106,11 @@ target_compile_options(droidvm_input PRIVATE -Wall -Wextra -Werror)
 add_executable(droidvmd main.cpp runtime/instance.cpp services/system.cpp transport/dispatcher.cpp transport/requests.cpp transport/server.cpp)
 target_include_directories(droidvmd PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(droidvmd PRIVATE droidvm_network_backend droidvm_runtime droidvm_input)
+if(TARGET droidvm_platform_services)
+    # APK builds enable this once Gradle passes the AIDL tool (P7).
+    target_compile_definitions(droidvmd PRIVATE DROIDVM_PLATFORM_SERVICES)
+    target_link_libraries(droidvmd PRIVATE droidvm_platform_services)
+endif()
 target_compile_options(droidvmd PRIVATE -Wall -Wextra -Werror)
 
 option(DROIDVM_BUILD_SERVICE_TESTS "Build standalone service contract tests" OFF)
