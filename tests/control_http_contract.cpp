@@ -25,7 +25,7 @@ using namespace droidvm::network;
 using namespace droidvm::test;
 namespace {
 const std::string token = "contract-secret-token";
-std::string work = "/data/local/tmp", binaries;
+std::string work = "/data/local/tmp", binaries, daemon_executable;
 template<class F> void failure(ControlFailure expected, F&& fn) {
     try { fn(); } catch (const ControlError& e) {
         check(e.reason == expected, e.what());
@@ -372,6 +372,7 @@ void real_network_lifecycle() {
     const auto path = work + "/lifecycle";
     check(mkdir(path.c_str(), 0700) == 0, "create lifecycle case directory");
     Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    SwitchRuntime runtimes(dir.get(), getuid());
     NetworkConfigService configs(dir.get(), getuid());
     auto configuration = wire::parse(R"({"schema":2,"name":"lifecycle","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
     configuration["id"] = random_id(true);
@@ -380,7 +381,7 @@ void real_network_lifecycle() {
     bool missing = false, unready = false;
     auto now = NetworkService::Clock::now();
     NetworkService service(configs, [&](const Json::Value&) {
-        auto result = std::make_unique<Gvswitch>(unready ? path + "/unready" : binaries + (missing ? "/absent-helper" : "/gvswitch"), dir.get());
+        auto result = std::make_unique<Gvswitch>(unready ? path + "/unready" : binaries + (missing ? "/absent-helper" : "/gvswitch"), runtimes);
         backend = result.get(); return result;
     }, [&] { return now; });
     error(ErrorCode::permission_denied, [&] { service.start(owner, id); });
@@ -438,13 +439,15 @@ void real_network_lifecycle() {
     check(service.shutdown().empty() && service.get(admin, id).state == NetworkState::stopped, "shutdown cleanup can be retried");
     error(ErrorCode::unavailable, [&] { service.start(admin, second); });
     configs.update(admin, configuration); // all leases released after successful cleanup
-    for (const char* file : {"networks.json", "networks.json.bak", "unready"}) unlinkat(dir.get(), file, 0);
+    check(runtimes.inventory()["switches"].empty(), "all lifecycle inventory entries retired");
+    for (const char* file : {"networks.json", "networks.json.bak", "unready", "network-runtime.json", "network-runtime.json.bak"}) unlinkat(dir.get(), file, 0);
     check(rmdir(path.c_str()) == 0, "lifecycle leaves no runtime directories");
 }
 void real_network_parallel_and_start_cleanup() {
     const auto path = work + "/parallel";
     check(mkdir(path.c_str(), 0700) == 0, "create parallel lifecycle directory");
     Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    SwitchRuntime runtimes(dir.get(), getuid());
     NetworkConfigService configs(dir.get(), getuid());
     auto configuration = wire::parse(R"({"schema":2,"name":"gated","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
     configuration["id"] = random_id(true);
@@ -459,8 +462,8 @@ void real_network_parallel_and_start_cleanup() {
         Gate& proceed;
         const bool& fail;
         std::string path;
-        ObservedBackend(const std::string& executable, int directory, Gate& entered, Gate& proceed, const bool& fail, std::string path)
-            : real(executable, directory), entered(entered), proceed(proceed), fail(fail), path(std::move(path)) {}
+        ObservedBackend(const std::string& executable, SwitchRuntime& runtime, Gate& entered, Gate& proceed, const bool& fail, std::string path)
+            : real(executable, runtime), entered(entered), proceed(proceed), fail(fail), path(std::move(path)) {}
         void start(const Json::Value& config) override {
             entered.release(); proceed.wait(); real.start(config);
             if (fail) {
@@ -473,8 +476,8 @@ void real_network_parallel_and_start_cleanup() {
         void stop() override { real.stop(); }
     };
     NetworkService service(configs, [&](const Json::Value& config) -> std::unique_ptr<Backend> {
-        if (config["name"] == "gated") return std::make_unique<ObservedBackend>(binaries + "/gvswitch", dir.get(), entered, proceed, fail_after_ready, path);
-        return std::make_unique<Gvswitch>(binaries + "/gvswitch", dir.get());
+        if (config["name"] == "gated") return std::make_unique<ObservedBackend>(binaries + "/gvswitch", runtimes, entered, proceed, fail_after_ready, path);
+        return std::make_unique<Gvswitch>(binaries + "/gvswitch", runtimes);
     });
     auto startup = std::async(std::launch::async, [&] { return service.start(admin, first); });
     entered.wait();
@@ -495,7 +498,8 @@ void real_network_parallel_and_start_cleanup() {
     check(unlink((directory + "/retained").c_str()) == 0, "resolve failed-start obstruction");
     check(service.stop(admin, first).state == NetworkState::stopped, "explicit stop retries failed-start cleanup");
     check(service.shutdown().empty(), "parallel lifecycle shutdown complete");
-    for (const char* file : {"networks.json", "networks.json.bak"}) unlinkat(dir.get(), file, 0);
+    check(runtimes.inventory()["switches"].empty(), "parallel inventory updates preserve independent entries");
+    for (const char* file : {"networks.json", "networks.json.bak", "network-runtime.json", "network-runtime.json.bak"}) unlinkat(dir.get(), file, 0);
     check(rmdir(path.c_str()) == 0, "parallel lifecycle leaves no resources");
 }
 Json::Value orphan_configuration() {
@@ -515,31 +519,130 @@ void real_switch_owner_death() {
     Fd helper(static_cast<int>(syscall(SYS_pidfd_open, record->value["pid"].asInt(), 0)));
     pollfd death{helper.get(), POLLIN, 0};
     check(helper.get() >= 0 && poll(&death, 1, 0) == 0, "real gvswitch survives daemon SIGKILL");
-    HelperIdentity::recover(runtime.get(), getuid(), 200ms);
+    SwitchRuntime restart(dir.get(), getuid());
+    check(restart.recover_all().empty() && restart.inventory()["switches"].empty(), "fresh inventory discovers and recovers orphan switch");
     check(poll(&death, 1, 0) > 0 && (death.revents & POLLIN), "fresh owner recovers real switch via inherited marker and pidfd");
-    HelperIdentity::recover(runtime.get(), getuid(), 200ms);
-    for (const char* name : {"helper.json", "helper.identity", "s", "config.json"})
-        check(unlinkat(runtime.get(), name, 0) == 0 || errno == ENOENT, "remove known orphan fixture file");
-    check(rmdir(directory.c_str()) == 0, "real orphan runtime reclaimed");
-    Gvswitch replacement(binaries + "/gvswitch", dir.get());
+    check(access(directory.c_str(), F_OK) < 0 && errno == ENOENT, "inventory reclaimed real orphan directory without test cleanup");
+    Gvswitch replacement(binaries + "/gvswitch", restart);
     replacement.start(orphan_configuration());
     check(replacement.healthy(), "switch restarts after orphan recovery");
     replacement.stop();
+    for (const char* name : {"network-runtime.json", "network-runtime.json.bak"}) unlinkat(dir.get(), name, 0);
     check(rmdir(path.c_str()) == 0, "owner-death fixture fully reclaimed");
+}
+void switch_inventory_crash_boundaries() {
+    for (const char* stage : {"switch_reserved", "switch_created", "switch_owned", "ready", "switch_process_stopped",
+                              "switch_files_removed", "switch_directory_removed", "switch_forgotten"}) {
+        const auto path = work + "/inventory-" + stage;
+        check(mkdir(path.c_str(), 0700) == 0, "create inventory crash fixture");
+        Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        ChildOptions options; options.argv = {"/proc/self/exe", "--orphan-switch", binaries, path, stage};
+        const auto result = Child(options).communicate({}, 10s);
+        if (result.exit_code != -SIGKILL) { std::cerr << stage << ": " << result.error << std::endl; throw std::runtime_error("missed switch crash boundary"); }
+        SwitchRuntime restarted(directory.get(), getuid());
+        check(restarted.recover_all().empty() && restarted.inventory()["switches"].empty(), "inventory crash recovery finishes all resources");
+        check(restarted.recover_all().empty(), "repeated inventory recovery is idempotent");
+        for (const char* file : {"network-runtime.json", "network-runtime.json.bak"}) unlinkat(directory.get(), file, 0);
+        check(rmdir(path.c_str()) == 0, "crash recovery removed all reserved/owned directories");
+    }
+}
+void switch_inventory_identity_and_failure() {
+    const auto path = work + "/inventory-errors";
+    check(mkdir(path.c_str(), 0700) == 0, "create inventory error fixture");
+    Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    bool fail_save = false;
+    SwitchRuntime runtime(directory.get(), getuid(), {}, [&](const char* stage) {
+        if (fail_save && std::string_view(stage) == "installed") throw std::runtime_error("injected post-rename sync failure");
+    });
+    SwitchRuntime::Allocation first, second;
+    runtime.allocate("first", first); runtime.allocate("second", second);
+    check(renameat(directory.get(), first.name.c_str(), directory.get(), "moved") == 0 &&
+        mkdirat(directory.get(), first.name.c_str(), 0700) == 0, "replace registered directory");
+    auto failures = runtime.recover_all();
+    check(failures.size() == 1 && failures[0]["owner"] == "first" && runtime.inventory()["switches"].size() == 1,
+        "replacement directory refused while independent recovery continues");
+    check(unlinkat(directory.get(), first.name.c_str(), AT_REMOVEDIR) == 0 &&
+        renameat(directory.get(), "moved", directory.get(), first.name.c_str()) == 0, "restore test-owned original directory");
+    write_file(path + "/" + first.name + "/unknown", "preserve unknown runtime contents");
+    check(runtime.recover_all().size() == 1 && runtime.inventory()["switches"][0]["phase"] == "stopped",
+        "unknown files remain and stopped identity is durable");
+    check(unlinkat(first.directory.get(), "unknown", 0) == 0, "remove test-owned obstruction");
+    fail_save = true;
+    bool failed = false;
+    try { runtime.cleanup(first.name); } catch (const config::CommitError&) { failed = true; }
+    check(failed, "post-rename inventory failure reported");
+    fail_save = false;
+    SwitchRuntime restarted(directory.get(), getuid());
+    check(restarted.recover_all().empty() && restarted.inventory()["switches"].empty(), "uncertain inventory erase reconciles on reopen");
+    // Backups are intentionally insufficient authority for a resource ledger.
+    check(unlinkat(directory.get(), "network-runtime.json", 0) == 0, "replace test-owned primary with damaged bytes");
+    write_file(path + "/network-runtime.json", "{broken");
+    bool corrupt_refused = false;
+    try { SwitchRuntime corrupt(directory.get(), getuid()); } catch (const std::runtime_error&) { corrupt_refused = true; }
+    check(corrupt_refused, "stale backup cannot silently omit a live helper from recovery");
+    for (const char* file : {"network-runtime.json", "network-runtime.json.bak"}) unlinkat(directory.get(), file, 0);
+    check(rmdir(path.c_str()) == 0, "inventory error fixture reclaimed");
+}
+void real_daemon_startup_recovery() {
+    check(!daemon_executable.empty(), "control suite requires native daemon executable argument");
+    for (bool obstruct : {false, true}) {
+        const auto path = work + (obstruct ? "/daemon-retry" : "/daemon-recovery");
+        check(mkdir(path.c_str(), 0700) == 0, "create daemon startup recovery fixture");
+        Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        ChildOptions fixture; fixture.argv = {"/proc/self/exe", "--orphan-switch", binaries, path};
+        check(Child(fixture).communicate({}, 10s).exit_code == -SIGKILL, "leave actual orphan for daemon startup");
+        const auto switch_path = switch_directory(path);
+        Fd switch_dir(open(switch_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        const auto record = config::JsonFile(switch_dir.get(), "helper.json", getuid()).load()->value;
+        Fd process(static_cast<int>(syscall(SYS_pidfd_open, record["pid"].asInt(), 0)));
+        pollfd death{process.get(), POLLIN, 0};
+        check(process.get() >= 0 && poll(&death, 1, 0) == 0, "orphan alive before actual daemon starts");
+        write_file(path + "/fixture.apk", "isolated hash input");
+        ChildOptions launch; launch.argv = {daemon_executable, "--run-dir", path, "--apk", path + "/fixture.apk"};
+        if (obstruct) {
+            write_file(switch_path + "/unknown", "retain on startup cleanup failure");
+            const auto rejected = Child(launch).communicate({}, 10s);
+            check(rejected.exit_code == 1 && rejected.error.find("Network runtime recovery incomplete") != std::string::npos &&
+                access((path + "/droidvmd-port.txt").c_str(), F_OK) < 0, "daemon reports recovery failure before publishing readiness");
+            check(poll(&death, 1, 0) > 0, "failed file cleanup still stops orphan process");
+            check(unlinkat(switch_dir.get(), "unknown", 0) == 0, "resolve test-owned startup cleanup obstruction");
+        }
+        Child daemon(launch);
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (access((path + "/droidvmd-port.txt").c_str(), F_OK) < 0 && !daemon.poll_exit() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(10ms);
+        if (daemon.poll_exit() || access((path + "/droidvmd-port.txt").c_str(), F_OK) < 0) {
+            std::cerr << daemon.communicate({}, 1s).error << std::endl;
+            throw std::runtime_error("native daemon did not publish readiness after recovery");
+        }
+        check(poll(&death, 1, 0) > 0 && access(switch_path.c_str(), F_OK) < 0,
+            "native daemon startup automatically stopped helper and removed its directory");
+        check(config::JsonFile(directory.get(), "network-runtime.json", getuid()).load()->value["switches"].empty(),
+            "native daemon persisted empty recovered inventory");
+        check(daemon.signal(SIGTERM) && daemon.communicate({}, 3s).exit_code == 128 + SIGTERM, "recovered daemon stops with existing signal exit convention");
+        for (const char* file : {"network-runtime.json", "network-runtime.json.bak", "droidvmd.lock", "fixture.apk"}) unlinkat(directory.get(), file, 0);
+        check(rmdir(path.c_str()) == 0, "daemon recovery fixture reclaimed");
+    }
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 4 && std::string_view(argv[1]) == "--orphan-switch") {
+    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--orphan-switch") {
         Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        Gvswitch backend(std::string(argv[2]) + "/gvswitch", directory.get());
+        const std::string phase = argc == 5 ? argv[4] : "ready";
+        SwitchRuntime runtime(directory.get(), getuid(), [&](const char* stage) { if (phase == stage) kill(getpid(), SIGKILL); });
+        Gvswitch backend(std::string(argv[2]) + "/gvswitch", runtime);
         backend.start(orphan_configuration());
+        if (phase != "ready") { backend.stop(); return 98; }
         kill(getpid(), SIGKILL);
         return 99;
     }
-    if (argc == 3) { binaries = argv[1]; work = argv[2]; }
+    if (argc == 3 || argc == 4) { binaries = argv[1]; work = argv[2]; if (argc == 4) daemon_executable = argv[3]; }
     if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp},
         {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup},
-        {"real_switch_owner_sigkill", real_switch_owner_death}});
+        {"real_switch_owner_sigkill", real_switch_owner_death},
+        {"switch_inventory_sigkill_boundaries", switch_inventory_crash_boundaries},
+        {"switch_inventory_identity_and_failure", switch_inventory_identity_and_failure},
+        {"real_daemon_startup_recovery", real_daemon_startup_recovery}});
     return run({{"framing_and_methods", valid_framing_and_methods}, {"malformed_and_truncated", malformed_and_truncated},
         {"limits_and_injection", limits_and_injection}, {"whole_request_deadline_and_cancel", deadline_and_cancellation},
         {"concurrent_connections_and_fd_cleanup", concurrent_connections_and_fd_cleanup}});

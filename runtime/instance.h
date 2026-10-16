@@ -18,6 +18,7 @@ public:
     void publish_discovery(unsigned port, const std::string& token);
     bool token_exists() const;
     std::string read_token() const;
+    int directory_fd() const { return directory_.get(); } // valid while instance lock is held
     Instance(const Instance&) = delete;
     Instance& operator=(const Instance&) = delete;
 private:

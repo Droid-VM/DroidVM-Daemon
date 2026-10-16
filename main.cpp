@@ -3,6 +3,8 @@
 #include "runtime/layout.h"
 #include "runtime/log.h"
 #include "services/system.h"
+#include "network/switch_runtime.h"
+#include "common/wire.h"
 #include "transport/server.h"
 #include "transport/dispatcher.h"
 #include <sys/prctl.h>
@@ -77,6 +79,10 @@ int main(int argc, char** argv) {
             log->write("INFO", "starting pid=" + std::to_string(getpid()));
         }
         try {
+            droidvm::network::SwitchRuntime switch_runtime(instance->directory_fd(), layout ? layout->owner() : getuid());
+            const auto recovery_failures = switch_runtime.recover_all();
+            if (!recovery_failures.empty())
+                throw std::runtime_error("Network runtime recovery incomplete: " + droidvm::wire::stringify(recovery_failures));
             const auto token = droidvm::random_id(false);
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
             std::unique_ptr<droidvm::NetworkConfigService> networks;
