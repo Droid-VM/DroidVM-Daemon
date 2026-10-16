@@ -64,6 +64,74 @@ void replacement_and_failure() {
     check(!service.exists(admin, id) && !replacement->start() && fixture.starts == 2, "removed reference cannot restart");
     check(!service.remove(admin, id), "unknown deletion retains legacy false result");
 }
+void session_overrides_and_failed_admission() {
+    Fixture fixture;
+    auto value = config("session");
+    value["protected_vm"] = "protected_protected";
+    Json::Value disk;
+    disk["path"] = "/never-opened.img"; disk["readonly"] = false;
+    value["disks"] = Json::Value(Json::arrayValue); value["disks"].append(disk);
+    std::shared_ptr<vm::VmRuntime> target;
+    Json::Value observed;
+    bool throw_on_admission = false;
+    fixture.context.shutting_down = [&] {
+        observed = target->config();
+        if (throw_on_admission) throw std::runtime_error("injected admission failure");
+        return true;
+    };
+    target = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
+    const auto baseline = target->config();
+    Json::Value overrides;
+    overrides["readonly_disks"] = Json::Value(Json::arrayValue); overrides["readonly_disks"].append(0);
+    overrides["pseudo_unprotected"] = true;
+    check(!target->start({}, overrides), "shutdown refuses session start without side effects");
+    check(observed["protected_vm"] == "pseudo_unprotected" && observed["disks"][0]["readonly"].asBool(), "start admission sees requested session settings");
+    check(target->config() == baseline, "failed admission restores original configuration");
+    check(!target->start() && observed == baseline, "later ordinary start does not inherit overrides");
+    throw_on_admission = true;
+    bool threw = false;
+    try { target->start({}, overrides); } catch (const std::runtime_error&) { threw = true; }
+    check(threw && target->config() == baseline, "admission exception restores original configuration");
+    { auto edit = target->try_edit(); check(bool(edit), "failed session remains editable"); edit.retire(); }
+    check(!target->start({}, overrides) && target->config() == baseline, "retired reference cannot install session overrides");
+}
+void invalid_session_overrides() {
+    Fixture fixture;
+    auto value = config("invalid-session");
+    Json::Value disk; disk["path"] = "/never-opened.img"; disk["readonly"] = false;
+    value["disks"] = Json::Value(Json::arrayValue); value["disks"].append(disk);
+    auto target = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
+    const auto baseline = target->config();
+    const std::vector<std::string> invalid{
+        R"([])", R"({"memory_mb":1024})", R"({"pseudo_unprotected":false})",
+        R"({"readonly_disks":[-1]})", R"({"readonly_disks":[1]})", R"({"readonly_disks":[0,0]})",
+        R"({"readonly_disks":[0.0]})", R"({"readonly_disks":["0"]})",
+        R"({"readonly_disks":[0],"unknown":true})"};
+    for (const auto& text : invalid) {
+        bool rejected = false;
+        try { target->start({}, wire::parse(text)); } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected && target->config() == baseline && fixture.starts == 0, "invalid session is atomic and rejected before start admission");
+    }
+}
+void session_overrides_worker_abort() {
+    Fixture fixture;
+    auto value = config("worker-abort");
+    value["backend"] = "qemu"; value["hypervisor"] = "kvm";
+    value["protected_vm"] = "protected_normal";
+    std::atomic<int> admissions{0};
+    // Admit lifecycle setup, then abort on the worker before launching a backend.
+    fixture.context.shutting_down = [&] { return ++admissions > 1; };
+    auto target = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
+    const auto baseline = target->config();
+    Json::Value overrides; overrides["pseudo_unprotected"] = true;
+    check(target->start({}, overrides), "session reaches asynchronous worker");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (target->state() != vm::State::stopped && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    check(target->state() == vm::State::stopped && target->pid() == -1 && admissions >= 2, "worker aborts before VMM launch");
+    check(target->config() == baseline, "STOPPED publication restores complete baseline after worker abort");
+    check(bool(target->try_edit()), "completed session releases lifecycle admission");
+}
 void lease_abort_and_lifetime() {
     Fixture fixture;
     auto target = std::make_shared<vm::VmRuntime>(random_id(true), config("lease"), fixture.context);
@@ -313,6 +381,9 @@ void revisioned_batch_adapter() {
 }
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
+        {"session_overrides_failed_admission", session_overrides_and_failed_admission},
+        {"invalid_session_overrides", invalid_session_overrides},
+        {"session_overrides_worker_abort", session_overrides_worker_abort},
         {"lease_abort_move_lifetime", lease_abort_and_lifetime},
         {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
         {"persistent_inventory_commit", persistent_inventory_commit},

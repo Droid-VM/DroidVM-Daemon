@@ -72,7 +72,9 @@ public:
     Json::Value config() const;
     // DeleteHandler edits the live item in place; streams are kept.
     void set_networks(Json::Value networks) { std::lock_guard lock(state_mutex_); config_["networks"] = std::move(networks); }
-    bool start(std::optional<std::string> boot_entry = {});
+    // Internal session overrides: readonly_disks (slot indices), pseudo_unprotected (true).
+    // Kept across guest reboots, restored after final stop or failed admission.
+    bool start(std::optional<std::string> boot_entry = {}, const Json::Value& overrides = Json::Value());
     bool stop();
     bool reboot();
     bool suspend();
@@ -98,6 +100,7 @@ private:
     mutable std::mutex state_mutex_;
     std::condition_variable idle_;
     Json::Value config_;
+    std::optional<Json::Value> session_base_; // state_mutex_; never persisted
     State state_ = State::stopped;
     std::map<std::string, std::unique_ptr<ConsoleLog>> logs_;
     std::vector<std::string> order_;

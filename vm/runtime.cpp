@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <random>
+#include <set>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -172,7 +173,14 @@ void VmRuntime::clear_logs() { std::lock_guard lock(state_mutex_); for (auto& [n
 void VmRuntime::set_state(State next) {
     // Release before publishing STOPPED so a new start keeps its reservation.
     if (next == State::stopped && context_.pool) context_.pool->release(id_);
-    { std::lock_guard lock(state_mutex_); state_ = next; }
+    {
+        std::lock_guard lock(state_mutex_);
+        if (next == State::stopped && session_base_) {
+            config_.swap(*session_base_);
+            session_base_.reset();
+        }
+        state_ = next;
+    }
     fire("state");
     if (context_.state_changed) {
         // Guarded: a state change never fails because of the keyboard.
@@ -198,15 +206,49 @@ void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
     if (extra.isObject()) for (const auto& key : extra.getMemberNames()) data[key] = extra[key];
     context_.events->publish(data);
 }
-bool VmRuntime::start(std::optional<std::string> boot_entry) {
+bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& overrides) {
     std::unique_lock lock(lock_);
     if (retired_) return false;
     {
         std::lock_guard state(state_mutex_);
-        if (state_ != State::stopped) return false;
+        if (state_ != State::stopped || worker_) return false;
+        if (!overrides.isNull()) {
+            if (!overrides.isObject()) throw std::invalid_argument("Invalid VM start overrides");
+            auto session = config_;
+            for (const auto& key : overrides.getMemberNames()) {
+                if (key == "pseudo_unprotected") {
+                    if (!overrides[key].isBool() || !overrides[key].asBool())
+                        throw std::invalid_argument("Invalid protection override");
+                    session["protected_vm"] = "pseudo_unprotected";
+                } else if (key == "readonly_disks") {
+                    if (!overrides[key].isArray()) throw std::invalid_argument("Invalid read-only disk overrides");
+                    std::set<Json::ArrayIndex> seen;
+                    for (const auto& slot : overrides[key]) {
+                        if (!slot.isUInt() || (slot.type() != Json::intValue && slot.type() != Json::uintValue))
+                            throw std::invalid_argument("Invalid read-only disk slot");
+                        const auto index = slot.asUInt();
+                        if (!session["disks"].isArray() || index >= session["disks"].size() ||
+                            !session["disks"][index].isObject() || !seen.insert(index).second)
+                            throw std::invalid_argument("Invalid or repeated read-only disk slot");
+                        session["disks"][index]["readonly"] = true;
+                    }
+                } else throw std::invalid_argument("Unknown VM start override");
+            }
+            session_base_ = config_;
+            config_.swap(session);
+        }
         boot_entry_ = std::move(boot_entry);
     }
-    return start_locked(false);
+    try {
+        if (start_locked(false)) return true;
+    } catch (...) {
+        std::lock_guard state(state_mutex_);
+        if (session_base_) { config_.swap(*session_base_); session_base_.reset(); }
+        throw;
+    }
+    std::lock_guard state(state_mutex_);
+    if (session_base_) { config_.swap(*session_base_); session_base_.reset(); }
+    return false;
 }
 bool VmRuntime::start_locked(bool relaunch) {
     if (retired_ || context_.shutting_down()) return false;
