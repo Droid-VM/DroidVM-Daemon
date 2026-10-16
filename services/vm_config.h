@@ -2,6 +2,7 @@
 #pragma once
 #include "context.h"
 #include "config_gate.h"
+#include "config_commit.h"
 #include "store/json_file.h"
 #include <memory>
 #include <functional>
@@ -30,10 +31,7 @@ class VmConfigService {
 public:
     // Prepared participants retain their locks until after snapshot publication.
     // All allocation/validation happens in prepare; commit cannot fail after rename.
-    struct Commit {
-        virtual ~Commit() = default;
-        virtual void commit() noexcept = 0;
-    };
+    using Commit = ConfigurationCommit;
     using Prepare = std::function<std::unique_ptr<Commit>(const Json::Value&)>;
     using Snapshot = std::shared_ptr<const VmConfigSnapshot>;
     static constexpr size_t max_bytes = 16u << 20;
