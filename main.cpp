@@ -5,6 +5,7 @@
 #include "services/system.h"
 #include "network/switch_runtime.h"
 #include "network/gvswitch.h"
+#include "network/links.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -85,6 +86,15 @@ int main(int argc, char** argv) {
             const auto recovery_failures = switch_runtime.recover_all();
             if (!recovery_failures.empty())
                 throw std::runtime_error("Network runtime recovery incomplete: " + droidvm::wire::stringify(recovery_failures));
+            std::unique_ptr<droidvm::network::Netbox> netbox;
+            std::unique_ptr<droidvm::network::OwnedLinks> owned_links;
+            if (layout) {
+                netbox = std::make_unique<droidvm::network::Netbox>(
+                    (std::filesystem::absolute(data_directory) / "bin/netbox").string());
+                owned_links = std::make_unique<droidvm::network::OwnedLinks>(instance->directory_fd(), layout->owner(), *netbox);
+                const auto failures = owned_links->recover_all();
+                if (!failures.empty()) throw std::runtime_error("Network link recovery incomplete: " + droidvm::wire::stringify(failures));
+            }
             const auto token = droidvm::random_id(false);
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
             std::unique_ptr<droidvm::NetworkConfigService> networks;

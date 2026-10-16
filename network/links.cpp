@@ -78,6 +78,8 @@ OwnedLinks::OwnedLinks(int directory, uid_t uid, const Netbox& netbox, Observer 
     require(stat("/proc/self/ns/net", &ns) == 0, "stat network namespace");
     namespace_device_ = ns.st_dev; namespace_inode_ = ns.st_ino;
     auto loaded = file_.load();
+    if (loaded && loaded->recovered)
+        throw ServiceError(ErrorCode::io_error, "network link primary is damaged; recovery requires the latest inventory");
     document_ = loaded ? loaded->value : Json::Value(Json::objectValue);
     if (!loaded) { document_["schema"] = 1; document_["links"] = Json::Value(Json::arrayValue); }
     if (document_["schema"] != 1 || !document_["links"].isArray() || document_["links"].size() > 1024)
@@ -283,10 +285,17 @@ void OwnedLinks::remove(const std::string& owner, const std::string& name) {
 }
 Json::Value OwnedLinks::cleanup(const std::string& owner) {
     std::lock_guard guard(mutex_);
+    return cleanup_locked(&owner);
+}
+Json::Value OwnedLinks::recover_all() {
+    std::lock_guard guard(mutex_);
+    return cleanup_locked(nullptr);
+}
+Json::Value OwnedLinks::cleanup_locked(const std::string* owner) {
     Json::Value errors(Json::arrayValue);
     for (auto i = document_["links"].size(); i > 0; --i) {
         const auto record = document_["links"][i - 1];
-        if (record["owner"] != owner) continue;
+        if (owner && record["owner"] != *owner) continue;
         try { remove_at(i - 1); }
         catch (const std::exception& error) {
             Json::Value failure; failure["name"] = record["name"]; failure["error"] = error.what();

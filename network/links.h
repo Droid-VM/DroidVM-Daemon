@@ -22,6 +22,8 @@ public:
     // Reverse creation order; attempt every independent record even on error.
     // Failures remain in inventory, rather than falsely reporting STOPPED.
     Json::Value cleanup(const std::string& owner);
+    // Startup only, under the instance lock and after dependent helpers stop.
+    Json::Value recover_all();
     Json::Value inventory() const;
     static std::string vlan_code(int vid);
     static std::string vlan_device(const std::string& bridge, int vid);
@@ -43,6 +45,7 @@ private:
     bool matches_at(const Json::Value& record, int directory, const std::string& name, bool allow_pending) const;
     bool matches(const Json::Value& record, bool allow_pending) const;
     void remove_at(Json::ArrayIndex index);
+    Json::Value cleanup_locked(const std::string* owner);
     void point(const char* stage) { if (observer_) observer_(stage); }
 };
 }

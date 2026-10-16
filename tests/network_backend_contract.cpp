@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
 #include "network/links.h"
+#include "network/linux_topology.h"
+#include "store/network_config.h"
 #include "common/identity.h"
 #include "services/network_host.h"
 #include "runtime/managed_process.h"
@@ -12,13 +14,14 @@
 #include <fstream>
 #include <signal.h>
 #include <poll.h>
+#include <set>
 #include <sys/stat.h>
 
 using namespace droidvm;
 using namespace droidvm::network;
 using namespace droidvm::test;
 namespace {
-std::string executable, work;
+std::string executable, work, daemon_executable;
 struct Case {
     std::string name = "dt" + random_id(false).substr(0, 8);
     std::string path = work + "/" + name;
@@ -287,6 +290,154 @@ void lifecycle_races() {
     check(collision.cleanup("test").empty(), "collision intent retained until identity resolved");
     test.finish();
 }
+Json::Value topology_config(const std::string& bridge) {
+    auto value = wire::parse(R"({"schema":2,"name":"topology","bridge_type":"linux","l3":{"vlans":[
+        {"vlan_id":0,"ipv4":{"cidr":"198.18.125.1/28"},"ipv6":{"cidr":"fd91:fe21:12::1/64"},
+         "ipv4_secondary":["198.18.125.1/28","198.18.126.1/28"],"ipv6_secondary":["fd91:fe21:13::1/64"]},
+        {"vlan_id":123,"ipv4":{"cidr":"198.18.127.1/28"}},
+        {"vlan_id":4094,"ipv6":{"source":"dhcp_pd","cidr":"fd91:fe21:14::1/64","pd":{"uplink":"unresolved"}}}
+    ]}})");
+    value["id"] = random_id(true); value["bridge_name"] = bridge;
+    return value;
+}
+void real_linux_topology() {
+    Case test;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    LinuxTopology topology(test.netbox, links);
+    const auto configuration = topology_config(test.name);
+    topology.start(configuration, "02:de:ad:12:34:56");
+    check(topology.devices().size() == 5, "VLAN zero has no separate bridge or leg");
+    check(row(test.netbox, test.name)["address"] == "02:de:ad:12:34:56", "prepared main bridge MAC applied");
+    check(kernel_text(test.name, "bridge/stp_state") == "0", "configured STP disabled");
+    for (const auto& name : topology.devices()) {
+        std::ifstream policy("/proc/sys/net/ipv6/conf/" + name + "/accept_ra");
+        std::string value; check(static_cast<bool>(policy >> value) && value == "0", "all guest-facing links disable RA acceptance");
+        const auto flags = std::stoul(kernel_text(name, "flags"), nullptr, 16);
+        check(flags & IFF_UP, "configured topology links administratively up");
+    }
+    for (const int vid : {123, 4094}) {
+        const auto leg = OwnedLinks::vlan_leg(test.name, vid), per = OwnedLinks::vlan_device(test.name, vid);
+        check(row(test.netbox, leg)["master"] == per, "tagged trunk attached to its per-VLAN bridge");
+        check(row(test.netbox, leg)["address"] == row(test.netbox, test.name)["address"], "trunk leg inherits stable main MAC");
+    }
+    auto addresses = [&](const std::string& device) {
+        std::set<std::string> result;
+        for (const auto& entry : test.netbox.addresses(device)) {
+            const auto local = entry["local"].asString();
+            const auto cidr = local + "/" + std::to_string(entry["prefixlen"].asInt());
+            const auto prefix = config::NetworkPrefix::parse(cidr, local.find(':') != std::string::npos);
+            result.insert(prefix.address() + "/" + std::to_string(prefix.prefix()));
+        }
+        return result;
+    };
+    const auto main = addresses(test.name);
+    for (const auto* cidr : {"198.18.125.1/28", "198.18.126.1/28", "fd91:fe21:12::1/64", "fd91:fe21:13::1/64"}) {
+        const auto prefix = config::NetworkPrefix::parse(cidr, std::string_view(cidr).find(':') != std::string_view::npos);
+        check(main.contains(prefix.address() + "/" + std::to_string(prefix.prefix())), "primary/secondary address installed on VLAN zero");
+    }
+    check(addresses(OwnedLinks::vlan_device(test.name, 123)).contains("198.18.127.1/28"), "tagged VLAN gateway address");
+    const auto pd = config::NetworkPrefix::parse("fd91:fe21:14::1/64", true);
+    check(!addresses(OwnedLinks::vlan_device(test.name, 4094)).contains(pd.address() + "/64"), "PD ignores stale static primary address");
+    topology.verify();
+    error(ErrorCode::conflict, [&] { topology.start(configuration, "02:de:ad:12:34:56"); });
+    topology.stop(); topology.stop();
+    check(links.inventory()["links"].empty() && !exists(test.name), "topology normal cleanup reclaims every link");
+    test.finish();
+}
+void linux_topology_failure_and_recovery() {
+    Case test;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    for (const char* stage : {"main_configured", "vlan_attached", "address_added", "topology_ready"}) {
+        LinuxTopology topology(test.netbox, links, [&](const char* reached) {
+            if (std::string_view(reached) == stage) throw std::runtime_error("topology injection");
+        });
+        try { topology.start(topology_config(test.name), "02:de:ad:12:34:56"); throw std::logic_error("missing injected failure"); }
+        catch (const std::runtime_error& failure) { check(std::string_view(failure.what()) == "topology injection", "injected topology failure retained"); }
+        check(links.inventory()["links"].empty() && !exists(test.name), "partial topology automatically rolled back");
+    }
+    const auto per = OwnedLinks::vlan_device(test.name, 123);
+    test.netbox.add_bridge(per);
+    const auto foreign_index = if_nametoindex(per.c_str());
+    LinuxTopology topology(test.netbox, links);
+    error(ErrorCode::conflict, [&] { topology.start(topology_config(test.name), "02:de:ad:12:34:56"); });
+    check(!exists(test.name) && links.inventory()["links"].empty() && if_nametoindex(per.c_str()) == foreign_index,
+        "per-VLAN collision fails before main bridge creation and preserves foreign interface");
+    test.netbox.delete_link(per);
+    topology.start(topology_config(test.name), "02:de:ad:12:34:56");
+    const auto foreign = test.name + "t";
+    test.netbox.add_tap(foreign); test.netbox.master(foreign, test.name);
+    error(ErrorCode::io_error, [&] { topology.stop(); });
+    check(exists(foreign) && exists(test.name), "failed cleanup keeps bridge with foreign port");
+    links.bridge("independent", test.name + "i");
+    check(links.recover_all().size() == 1 && !exists(test.name + "i") && exists(foreign), "startup recovery continues independent owner after failure");
+    test.netbox.delete_link(foreign);
+    topology.stop();
+    test.finish();
+}
+void linux_topology_crash_recovery() {
+    for (const char* stage : {"main_configured", "vlan_attached", "address_added", "topology_ready"}) {
+        Case test;
+        ChildOptions options;
+        options.argv = {"/proc/self/exe", "--topology-crash", executable, test.path, test.name, stage};
+        check(Child(options).communicate({}, 20s).exit_code == -SIGKILL, "topology child reached real SIGKILL boundary");
+        OwnedLinks restarted(test.directory.get(), getuid(), test.netbox);
+        check(!restarted.inventory()["links"].empty() && exists(test.name), "crash leaves durable kernel link inventory");
+        check(restarted.recover_all().empty() && restarted.inventory()["links"].empty() && !exists(test.name), "restart reclaims complete or partial topology");
+        test.finish();
+    }
+}
+void link_inventory_rejects_stale_backup() {
+    Case test;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name);
+    const auto latest = links.inventory();
+    { std::ofstream backup(test.path + "/network-links.json.bak", std::ios::trunc); backup << R"({"schema":1,"links":[]})"; }
+    { std::ofstream broken(test.path + "/network-links.json", std::ios::trunc); broken << "{broken"; }
+    error(ErrorCode::io_error, [&] { OwnedLinks rejected(test.directory.get(), getuid(), test.netbox); });
+    check(exists(test.name), "damaged primary never treats stale empty backup as complete inventory");
+    config::JsonFile(test.directory.get(), "network-links.json", getuid()).save(latest);
+    check(links.recover_all().empty(), "restore known latest fixture inventory and recover");
+    test.finish();
+}
+void daemon_linux_topology_recovery() {
+    for (const bool obstruct : {false, true}) {
+        Case test;
+        for (const char* name : {"run", "bin"}) check(mkdir((test.path + "/" + name).c_str(), 0700) == 0, "create daemon topology fixture directories");
+        check(symlink(executable.c_str(), (test.path + "/bin/netbox").c_str()) == 0, "reuse existing netbox in isolated daemon data");
+        { std::ofstream apk(test.path + "/fixture.apk"); apk << "isolated topology fixture"; }
+        ChildOptions fixture;
+        fixture.argv = {"/proc/self/exe", "--topology-crash", executable, test.path + "/run", test.name, "topology_ready"};
+        check(Child(fixture).communicate({}, 20s).exit_code == -SIGKILL, "leave topology from killed owner for actual daemon recovery");
+        const auto foreign = test.name + "t";
+        ChildOptions launch;
+        launch.argv = {daemon_executable, "--data-dir", test.path, "--apk", test.path + "/fixture.apk"};
+        if (obstruct) {
+            test.netbox.add_tap(foreign); test.netbox.master(foreign, test.name);
+            const auto rejected = Child(launch).communicate({}, 15s);
+            check(rejected.exit_code == 1 && rejected.error.find("Network link recovery incomplete") != std::string::npos &&
+                access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0,
+                "daemon refuses readiness when owned topology cleanup is incomplete");
+            check(exists(test.name) && exists(foreign), "failed startup preserves foreign dependency");
+            test.netbox.delete_link(foreign);
+        }
+        Child daemon(launch);
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0 && !daemon.poll_exit() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(10ms);
+        if (daemon.poll_exit() || access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0) {
+            std::cerr << daemon.communicate({}, 1s).error << std::endl;
+            throw std::runtime_error("daemon topology recovery did not reach readiness");
+        }
+        Fd run(open((test.path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        check(!exists(test.name) && config::JsonFile(run.get(), "network-links.json", getuid()).load()->value["links"].empty(),
+            "actual daemon reclaims topology before publishing readiness");
+        check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon stops normally");
+        for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
+            unlink((test.path + "/" + name).c_str());
+        for (const char* name : {"run", "bin", "cache", "files"}) check(rmdir((test.path + "/" + name).c_str()) == 0, "remove isolated daemon topology directory");
+        test.finish();
+    }
+}
 void real_address_monitor() {
     Case test;
     OwnedLinks links(test.directory.get(), getuid(), test.netbox);
@@ -335,6 +486,16 @@ int fake(int argc, char** argv) {
 }
 int main(int argc, char** argv) {
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
+    if (argc == 6 && std::string_view(argv[1]) == "--topology-crash") {
+        Netbox netbox(argv[2]);
+        Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        OwnedLinks links(directory.get(), getuid(), netbox);
+        LinuxTopology topology(netbox, links, [&](const char* stage) {
+            if (std::string_view(stage) == argv[5]) { kill(getpid(), SIGKILL); _exit(73); }
+        });
+        topology.start(topology_config(argv[4]), "02:de:ad:12:34:56");
+        topology.stop(); return 74;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--query") {
         const auto start = std::chrono::steady_clock::now();
         Json::Value result;
@@ -368,10 +529,13 @@ int main(int argc, char** argv) {
         links.remove("test", argv[4]);
         return 74;
     }
-    if (argc != 3) return 64;
-    executable = argv[1]; work = argv[2];
+    if (argc != 4) return 64;
+    executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
     return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
         {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
         {"setup_failure_and_journal_retry", failures_and_journal}, {"twenty_five_sigkill_boundaries", crash_recovery},
-        {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor}});
+        {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor},
+        {"real_linux_topology", real_linux_topology}, {"linux_topology_failure_and_recovery", linux_topology_failure_and_recovery},
+        {"linux_topology_sigkill_boundaries", linux_topology_crash_recovery}, {"link_inventory_rejects_stale_backup", link_inventory_rejects_stale_backup},
+        {"actual_daemon_linux_topology_recovery", daemon_linux_topology_recovery}});
 }
