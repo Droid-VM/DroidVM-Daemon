@@ -24,8 +24,9 @@ private:
 int main(int argc, char** argv) {
     try {
         const bool coordinated = argc >= 4 && std::string_view(argv[3]) == "--coordinated";
-        if (!(argc == 3 || (coordinated && (argc == 4 || argc == 6))))
-            throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk> [--coordinated [--fail-once|--crash-once <stage>]]");
+        const bool disk_config = argc == 4 && std::string_view(argv[3]) == "--disk-config";
+        if (!(argc == 3 || disk_config || (coordinated && (argc == 4 || argc == 6))))
+            throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk> [--disk-config | --coordinated [--fail-once|--crash-once <stage>]]");
         std::string fault;
         bool crash = false;
         if (argc == 6) {
@@ -46,13 +47,14 @@ int main(int argc, char** argv) {
         droidvm::vm::RuntimeContext context;
         context.cache_dir = argv[1]; context.owner = getuid();
         context.shutting_down = [] { return true; }; // no VMM/TAP/hugepage side effects
-        auto gate = coordinated ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
+        auto gate = coordinated || disk_config ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
         context.configuration_gate = gate;
         droidvm::VmService inventory(context);
         droidvm::TaskService tasks({}, [] { return droidvm::TaskService::Clock::now(); }, {}, gate);
         std::unique_ptr<droidvm::VmConfigService> configs;
         std::unique_ptr<droidvm::ConfigurationService> configuration;
         std::unique_ptr<droidvm::NetworkService> networks;
+        std::unique_ptr<droidvm::DiskConfigService> disks;
         if (coordinated) {
             configuration = std::make_unique<droidvm::ConfigurationService>(instance.directory_fd(), getuid(), gate, inventory, tasks,
                 [&](const char* stage, size_t) {
@@ -67,12 +69,15 @@ int main(int argc, char** argv) {
             });
         } else {
             configs = std::make_unique<droidvm::VmConfigService>(instance.directory_fd(), getuid(), droidvm::config::JsonFile::Observer{},
-                [&](const Json::Value& value) { return inventory.prepare_config(value); }, &tasks);
+                [&](const Json::Value& value) { return inventory.prepare_config(value); }, &tasks, gate);
         }
+        if (disk_config) disks = std::make_unique<droidvm::DiskConfigService>(instance.directory_fd(), getuid(),
+            droidvm::config::JsonFile::Observer{}, gate, droidvm::DiskConfigService::Prepare{}, &tasks);
         droidvm::SystemService system([&] { return instance.token_exists(); }, [&] { return instance.read_token(); }, hash, tasks.epoch());
         droidvm::RequestDispatcher dispatcher(system, tasks, configuration ? &configuration->networks() : nullptr, nullptr, networks.get(), nullptr, &inventory);
         if (configuration) dispatcher.set_configuration(configuration.get());
         else dispatcher.set_vm_config(configs.get());
+        if (disks) dispatcher.set_disk_config(disks.get());
         const auto token = droidvm::random_id(false);
         try {
             const auto result = droidvm::serve(instance, dispatcher, token.c_str(), signal.get());
