@@ -6,10 +6,36 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 #include <iostream>
+#include <atomic>
+
+namespace {
+// This fixture never creates host networking or helper processes.
+class MemoryBackend final : public droidvm::network::Backend {
+public:
+    void start(const Json::Value&) override { running_ = true; }
+    bool healthy() const override { return running_; }
+    void recover(const Json::Value& value) override { start(value); }
+    void stop() override { running_ = false; }
+private:
+    bool running_ = false;
+};
+}
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 3) throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk>");
+        const bool coordinated = argc >= 4 && std::string_view(argv[3]) == "--coordinated";
+        if (!(argc == 3 || (coordinated && (argc == 4 || argc == 6))))
+            throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk> [--coordinated [--fail-once|--crash-once <stage>]]");
+        std::string fault;
+        bool crash = false;
+        if (argc == 6) {
+            crash = std::string_view(argv[4]) == "--crash-once";
+            if (!crash && std::string_view(argv[4]) != "--fail-once") throw std::runtime_error("Unknown injection mode");
+            fault = argv[5];
+            if (fault != "before_decision" && fault != "participant_synced" && fault != "decision_removed")
+                throw std::runtime_error("Unknown injection stage");
+        }
+        std::atomic<bool> injected{false};
         sigset_t signals;
         sigemptyset(&signals); sigaddset(&signals, SIGINT); sigaddset(&signals, SIGTERM);
         if (sigprocmask(SIG_BLOCK, &signals, nullptr)) throw std::runtime_error("block signals failed");
@@ -20,13 +46,33 @@ int main(int argc, char** argv) {
         droidvm::vm::RuntimeContext context;
         context.cache_dir = argv[1]; context.owner = getuid();
         context.shutting_down = [] { return true; }; // no VMM/TAP/hugepage side effects
+        auto gate = coordinated ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
+        context.configuration_gate = gate;
         droidvm::VmService inventory(context);
-        droidvm::TaskService tasks;
-        droidvm::VmConfigService configs(instance.directory_fd(), getuid(), {},
-            [&](const Json::Value& value) { return inventory.prepare_config(value); }, &tasks);
+        droidvm::TaskService tasks({}, [] { return droidvm::TaskService::Clock::now(); }, {}, gate);
+        std::unique_ptr<droidvm::VmConfigService> configs;
+        std::unique_ptr<droidvm::ConfigurationService> configuration;
+        std::unique_ptr<droidvm::NetworkService> networks;
+        if (coordinated) {
+            configuration = std::make_unique<droidvm::ConfigurationService>(instance.directory_fd(), getuid(), gate, inventory, tasks,
+                [&](const char* stage, size_t) {
+                    if (fault != stage || injected.exchange(true)) return;
+                    if (crash) { ::kill(getpid(), SIGKILL); ::_exit(137); }
+                    throw std::runtime_error("fixture transaction fault: " + fault);
+                });
+            networks = std::make_unique<droidvm::NetworkService>(configuration->networks(), [](const Json::Value& value) {
+                if (droidvm::config::string(value, "bridge_type") != "gvisor" || !droidvm::network::l3_vlans(value).empty())
+                    throw std::runtime_error("fixture only supports gvisor without VLANs");
+                return std::make_unique<MemoryBackend>();
+            });
+        } else {
+            configs = std::make_unique<droidvm::VmConfigService>(instance.directory_fd(), getuid(), droidvm::config::JsonFile::Observer{},
+                [&](const Json::Value& value) { return inventory.prepare_config(value); }, &tasks);
+        }
         droidvm::SystemService system([&] { return instance.token_exists(); }, [&] { return instance.read_token(); }, hash, tasks.epoch());
-        droidvm::RequestDispatcher dispatcher(system, tasks, nullptr, nullptr, nullptr, nullptr, &inventory);
-        dispatcher.set_vm_config(&configs);
+        droidvm::RequestDispatcher dispatcher(system, tasks, configuration ? &configuration->networks() : nullptr, nullptr, networks.get(), nullptr, &inventory);
+        if (configuration) dispatcher.set_configuration(configuration.get());
+        else dispatcher.set_vm_config(configs.get());
         const auto token = droidvm::random_id(false);
         try {
             const auto result = droidvm::serve(instance, dispatcher, token.c_str(), signal.get());
