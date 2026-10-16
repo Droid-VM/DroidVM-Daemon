@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
+#include "snapshot_document.h"
 #include "common/identity.h"
 #include "services/disk_config.h"
 #include "store/vm_ownership.h"
+#include "transport/dispatcher.h"
 #include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
@@ -188,11 +190,93 @@ void full_capacity_and_semantic_corruption() {
     temp.raw("disks.json", "{\"disks\":false}");
     error(ErrorCode::invalid_argument, [&] { DiskConfigService invalid(temp.directory.get(), getuid()); });
 }
+void snapshot_publication_and_recovery() {
+    Temporary temp;
+    auto gate = std::make_shared<ConfigurationGate>();
+    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    std::string fault;
+    DiskConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fault == stage) throw std::runtime_error("injected disk snapshot fault");
+    }, gate, {}, &tasks);
+    auto initial = service.snapshot(admin);
+    auto held = tasks.disk_config_snapshot(admin);
+    auto subscription = tasks.subscribe(admin, held.cursor), hidden = tasks.subscribe(owner, held.cursor);
+    error(ErrorCode::unauthenticated, [&] { tasks.disk_config_snapshot({}); });
+    error(ErrorCode::permission_denied, [&] { tasks.disk_config_snapshot(owner); });
+    auto wanted = document(); wanted["blob"] = "";
+    wanted["blob"] = std::string(DiskConfigService::max_bytes - config::encode_json(wanted).size(), 'x');
+    auto saved = service.replace(admin, initial->revision, wanted);
+    Json::Value metadata;
+    check(wire::parse(read_document(tasks, admin, held, metadata)) == initial->document && metadata["revision"] == initial->revision,
+        "held disk view remains fixed across commit");
+    tasks.release_snapshot(admin, held.id);
+    auto events = tasks.poll(admin, subscription);
+    check(events.events.size() == 1 && wire::parse(events.events[0].encoded)["kind"] == "disk.config.invalidated",
+        "disk commit publishes bounded invalidation");
+    check(tasks.poll(owner, hidden).events.empty(), "disk events are administrator only");
+    auto page = tasks.disk_config_snapshot(admin, 128u << 10);
+    check(read_document(tasks, admin, page, metadata) == *saved->encoded && metadata["revision"] == saved->revision,
+        "full eight MiB document reconstructs with fixed version");
+    tasks.release_snapshot(admin, page.id);
+    wanted.removeMember("blob"); wanted["changed"] = true;
+    fault = "before_install";
+    error(ErrorCode::io_error, [&] { service.replace(admin, saved->revision, wanted); });
+    check(tasks.poll(admin, subscription).events.empty(), "rejected disk write emits no invalidation");
+    fault = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.replace(admin, saved->revision, wanted); });
+    check(tasks.poll(admin, subscription).events.size() == 1, "installed disk failure invalidates readers");
+    page = tasks.disk_config_snapshot(admin);
+    check(wire::parse(read_document(tasks, admin, page, metadata)) == wanted && metadata["durability_uncertain"] == true,
+        "uncertain metadata and document publish together");
+    { auto exclusive = gate->transaction(); exclusive.require_recovery(); }
+    error(ErrorCode::unavailable, [&] { tasks.disk_config_snapshot(admin); });
+    check(tasks.snapshot_page(admin, page.id, 0).id == page.id, "old fixed disk view survives recovery fault");
+    tasks.release_snapshot(admin, page.id);
+    { auto exclusive = gate->transaction(); exclusive.recovered(); }
+    fault.clear();
+    saved = service.replace(admin, service.snapshot(admin)->revision, wanted);
+    tasks.poll(admin, subscription);
+    service.replace(admin, saved->revision, wanted);
+    check(tasks.poll(admin, subscription).events.empty(), "durable disk noop does not invalidate");
+}
+void disk_read_adapter_and_binding() {
+    Temporary temp;
+    TaskService tasks;
+    auto gate = std::make_shared<ConfigurationGate>();
+    bool refused = false;
+    try { DiskConfigService mismatch(temp.directory.get(), getuid(), {}, gate, {}, &tasks); }
+    catch (const std::invalid_argument&) { refused = true; }
+    check(refused && faccessat(temp.directory.get(), "disks.config-owner", F_OK, 0) != 0, "gate mismatch rejected before claim");
+    DiskConfigService service(temp.directory.get(), getuid(), {}, {}, {}, &tasks);
+    SystemService system([] { return true; }, [] { return "test"; }, "test", tasks.epoch());
+    RequestDispatcher dispatcher(system, tasks);
+    ClientSession session; session.caller.authorized = true;
+    check(!dispatcher.execute(session, "capabilities", {}).isMember("disk_config_snapshot"), "unbound daemon advertises no disk API");
+    dispatcher.set_disk_config(&service);
+    auto caps = dispatcher.execute(session, "capabilities", {});
+    check(caps["service_api_minor"] == 22 && caps["disk_config_snapshot"] == "base64-json-chunks-v1"
+        && !caps.isMember("disk_config_upload"), "disk adapter advertises reads without claiming write support");
+    ClientSession unauthenticated;
+    check(dispatcher.execute(unauthenticated, "disk_config_snapshot", {})["error"]["code"] == "UNAUTHENTICATED", "disk read requires authentication");
+    auto status = dispatcher.execute(session, "disk_config_status", {});
+    check(status["count"] == 0 && status["revision"] == service.snapshot(admin)->revision, "status describes disk registry version");
+    auto page = dispatcher.execute(session, "disk_config_snapshot", {});
+    check(page["success"] == true && page["items"][0]["revision"] == status["revision"], "adapter uses versioned fixed document");
+    Json::Value release; release["snapshot_id"] = page["snapshot_id"];
+    check(dispatcher.execute(session, "resource_snapshot_release", release)["success"] == true, "disk snapshot uses shared release command");
+    TaskService different;
+    RequestDispatcher wrong(system, different);
+    refused = false;
+    try { wrong.set_disk_config(&service); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "adapter rejects events from another service");
+}
 }
 int main() {
     return run({{"disk_registry_roundtrip_restart_ownership", roundtrip_restart_and_ownership},
         {"disk_registry_validation_participants_gate", validation_and_admission},
         {"disk_registry_commit_failure_backup_recovery", commit_failure_and_recovery},
         {"disk_registry_twelve_writers_and_drain", concurrent_writers_and_drain},
-        {"disk_registry_full_capacity_semantic_corruption", full_capacity_and_semantic_corruption}});
+        {"disk_registry_full_capacity_semantic_corruption", full_capacity_and_semantic_corruption},
+        {"disk_registry_snapshot_events_recovery", snapshot_publication_and_recovery},
+        {"disk_registry_read_adapter_binding", disk_read_adapter_and_binding}});
 }

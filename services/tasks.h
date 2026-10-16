@@ -14,6 +14,7 @@
 
 namespace droidvm {
 struct VmConfigSnapshot;
+struct DiskConfigSnapshot;
 enum class TaskState { queued, running, cancelling, succeeded, failed, cancelled };
 bool task_terminal(TaskState state);
 const char* task_state_name(TaskState state);
@@ -108,6 +109,8 @@ public:
     SnapshotPage network_config_document(const CallContext& caller, size_t max_bytes = 256u << 10);
     void publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snapshot) noexcept;
     SnapshotPage vm_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
+    void publish_disk_config(std::shared_ptr<const DiskConfigSnapshot> snapshot) noexcept;
+    SnapshotPage disk_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
     SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
     void release_snapshot(const CallContext& caller, const std::string& id);
     std::string subscribe(const CallContext& caller, const EventCursor& cursor);
@@ -120,6 +123,7 @@ public:
 private:
     struct Impl;
     friend class ConfigurationService;
+    friend class DiskConfigService;
     std::unique_ptr<Impl> impl_;
     std::shared_ptr<ConfigurationGate> config_gate_;
 };

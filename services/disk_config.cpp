@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "disk_config.h"
+#include "tasks.h"
 #include "common/identity.h"
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
@@ -39,9 +40,11 @@ Json::Value DiskConfigService::normalize(Json::Value document) {
     catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "Disk registry storage limit exceeded"); }
 }
 DiskConfigService::DiskConfigService(int directory, uid_t owner, config::JsonFile::Observer observer,
-        std::shared_ptr<ConfigurationGate> gate, Prepare prepare)
+        std::shared_ptr<ConfigurationGate> gate, Prepare prepare, TaskService* events)
     : file_(directory, "disks.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict),
-      gate_(std::move(gate)), prepare_(std::move(prepare)) {
+      gate_(std::move(gate)), prepare_(std::move(prepare)), events_(events) {
+    if (events_ && events_->config_gate_ != gate_)
+        throw std::invalid_argument("Disk registry and events must share one configuration gate");
     config::claim_disk_config(directory, owner);
     auto loaded = file_.load();
     Json::Value empty; empty["disks"] = Json::Value(Json::arrayValue);
@@ -61,6 +64,7 @@ DiskConfigService::Snapshot DiskConfigService::state() const {
 void DiskConfigService::publish(Snapshot next) {
     std::lock_guard lock(state_mutex_);
     state_ = std::move(next);
+    if (events_) events_->publish_disk_config(state_);
 }
 DiskConfigService::Snapshot DiskConfigService::snapshot(const CallContext& caller) const {
     access(caller);

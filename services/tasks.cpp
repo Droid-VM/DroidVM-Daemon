@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tasks.h"
 #include "vm_config.h"
+#include "disk_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
 #include <algorithm>
@@ -79,6 +80,7 @@ struct Shared {
     std::unordered_map<std::string, std::shared_ptr<Record>> records;
     std::shared_ptr<const Json::Value> network_config;
     std::shared_ptr<const VmConfigSnapshot> vm_config;
+    std::shared_ptr<const DiskConfigSnapshot> disk_config;
     std::deque<Job> queue;
     std::deque<Job> background_queue;
     size_t reserved = 0;
@@ -362,6 +364,20 @@ void TaskService::publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snap
     shared.vm_config = std::move(snapshot);
     shared.events.publish("vm.config.invalidated", "vms", "system", Json::Value(), true);
 }
+namespace {
+template<class View>
+SnapshotPage configuration_document(EventJournal& events, const View& view, const CallContext& caller, size_t max_bytes) {
+    Json::Value metadata;
+    metadata["type"] = "metadata"; metadata["encoding"] = "base64-json";
+    metadata["revision"] = view.revision; metadata["bytes"] = Json::UInt64(view.encoded->size());
+    metadata["persisted"] = view.persisted; metadata["recovered"] = view.recovered;
+    metadata["durability_uncertain"] = view.durability_uncertain;
+    const EventScope scope{caller.principal, caller.administrator};
+    auto id = events.snapshot_document(scope, view.encoded, wire::stringify(metadata));
+    try { return events.page(scope, id, 0, max_bytes); }
+    catch (...) { events.release_snapshot(scope, id); throw; }
+}
+}
 SnapshotPage TaskService::vm_config_snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);
     if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
@@ -370,15 +386,23 @@ SnapshotPage TaskService::vm_config_snapshot(const CallContext& caller, size_t m
     std::lock_guard lock(shared.mutex);
     if (!shared.vm_config) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");
     const auto& view = *shared.vm_config;
-    Json::Value metadata;
-    metadata["type"] = "metadata"; metadata["encoding"] = "base64-json";
-    metadata["revision"] = view.revision; metadata["bytes"] = Json::UInt64(view.encoded->size());
-    metadata["persisted"] = view.persisted; metadata["recovered"] = view.recovered;
-    metadata["durability_uncertain"] = view.durability_uncertain;
-    const EventScope scope{caller.principal, caller.administrator};
-    auto id = shared.events.snapshot_document(scope, view.encoded, wire::stringify(metadata));
-    try { return shared.events.page(scope, id, 0, max_bytes); }
-    catch (...) { shared.events.release_snapshot(scope, id); throw; }
+    return configuration_document(shared.events, view, caller, max_bytes);
+}
+void TaskService::publish_disk_config(std::shared_ptr<const DiskConfigSnapshot> snapshot) noexcept {
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.disk_config = std::move(snapshot);
+    shared.events.publish("disk.config.invalidated", "disks", "system", Json::Value(), true);
+}
+SnapshotPage TaskService::disk_config_snapshot(const CallContext& caller, size_t max_bytes) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto admission = ConfigurationGate::enter(config_gate_);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    if (!shared.disk_config) throw ServiceError(ErrorCode::unavailable, "Disk configuration view unavailable");
+    const auto& view = *shared.disk_config;
+    return configuration_document(shared.events, view, caller, max_bytes);
 }
 void TaskService::publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept {
     auto& shared = *impl_->shared;

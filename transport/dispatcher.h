@@ -8,6 +8,7 @@
 #include "services/vm.h"
 #include "services/vm_config_upload.h"
 #include "services/configuration.h"
+#include "services/disk_config.h"
 #include "services/legacy_events.h"
 #include "network/host_watch.h"
 #include "input/keyboard_grab.h"
@@ -45,6 +46,11 @@ public:
     void set_display_attach(std::function<void(const std::string& nonce)> attach) { display_attach_ = std::move(attach); }
     void set_usb(usb::UsbService* service) { usb_ = service; }
     void set_packages(pkg::PkgService* service) { packages_ = service; }
+    void set_disk_config(DiskConfigService* service) {
+        if (!service || service->events() != &tasks_ || (disk_config_ && disk_config_ != service))
+            throw std::invalid_argument("Disk registry adapter participants do not match");
+        disk_config_ = service;
+    }
     // Startup binding only; service outlives dispatcher and in-flight workers.
     void set_vm_config(VmConfigService* service) {
         if (configuration_ && service != &configuration_->vms()) throw std::invalid_argument("Cannot replace coordinated VM configuration");
@@ -83,6 +89,7 @@ private:
     usb::UsbService* usb_ = nullptr;
     pkg::PkgService* packages_ = nullptr;
     VmConfigService* vm_config_ = nullptr;
+    DiskConfigService* disk_config_ = nullptr;
     ConfigurationService* configuration_ = nullptr;
     std::unique_ptr<VmConfigUploads> vm_uploads_;
     bool vms_swept_ = false;

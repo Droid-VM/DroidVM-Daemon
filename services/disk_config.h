@@ -6,6 +6,7 @@
 #include <memory>
 
 namespace droidvm {
+class TaskService;
 struct DiskConfigSnapshot {
     Json::Value document;
     std::shared_ptr<const std::string> encoded;
@@ -25,7 +26,8 @@ public:
     using Prepare = std::function<std::unique_ptr<ConfigurationCommit>(const Json::Value& before, const Json::Value& after)>;
     static constexpr size_t max_bytes = config::JsonFile::max_bytes;
     DiskConfigService(int directory, uid_t owner, config::JsonFile::Observer observer = {},
-        std::shared_ptr<ConfigurationGate> gate = {}, Prepare prepare = {});
+        std::shared_ptr<ConfigurationGate> gate = {}, Prepare prepare = {}, TaskService* events = nullptr);
+    TaskService* events() const { return events_; }
     Snapshot snapshot(const CallContext& caller) const;
     // Complete observed document, including root/row extensions. No implicit
     // merge or retry. Exact revision includes edits to unrelated registry rows.
@@ -35,6 +37,7 @@ private:
     config::JsonFile file_;
     std::shared_ptr<ConfigurationGate> gate_;
     Prepare prepare_;
+    TaskService* events_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     Snapshot state_;

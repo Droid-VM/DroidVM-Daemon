@@ -135,14 +135,15 @@ Json::Value failure(const ServiceError& error) {
     result["error"]["message"] = error.what();
     return result;
 }
-Json::Value config_status(const VmConfigService::Snapshot& snapshot) {
+template<class Snapshot>
+Json::Value config_status(const Snapshot& snapshot, const char* key = "vms") {
     Json::Value result;
     result["success"] = true;
     result["revision"] = snapshot->revision;
     result["persisted"] = snapshot->persisted;
     result["recovered"] = snapshot->recovered;
     result["durability_uncertain"] = snapshot->durability_uncertain;
-    result["count"] = snapshot->document["vms"].size();
+    result["count"] = snapshot->document[key].size();
     return result;
 }
 Json::Value snapshot_json(const SnapshotPage& page) {
@@ -632,7 +633,8 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
-        && !(configuration_ && configuration_command(command))) {
+        && !(configuration_ && configuration_command(command))
+        && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot"))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
             result["service_api_minor"] = 1;
@@ -740,6 +742,14 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["commands"].append("configuration_recover");
                 result["service_api_minor"] = runtime_ ? 21 : 20;
             }
+            if (disk_config_) {
+                result["commands"].append("disk_config_status");
+                result["commands"].append("disk_config_snapshot");
+                result["disk_config_persistence"] = true;
+                result["disk_config_snapshot"] = "base64-json-chunks-v1";
+                result["disk_config_events"] = "invalidation-v1";
+                result["service_api_minor"] = 22;
+            }
         }
         return result;
     }
@@ -750,6 +760,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         result["success"] = true;
         if (configuration_ && configuration_command(command)) {
             return execute_background(caller, command, request);
+        } else if (command == "disk_config_status") {
+            return config_status(disk_config_->snapshot(caller), "disks");
+        } else if (command == "disk_config_snapshot") {
+            return snapshot_json(tasks_.disk_config_snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
         } else if (command == "vm_config_status") {
             return config_status(vm_config_->snapshot(caller));
         } else if (command == "vm_config_snapshot") {
