@@ -35,6 +35,7 @@ void forwarding_contract() { forwarding_namespace_contract(executable, work); }
 void firewall_contract() { firewall_namespace_contract(executable, work, daemon_executable); }
 void linux_firewall_contract() { firewall_namespace_contract(executable, work, daemon_executable, FirewallSuite::plan); }
 void linux_firewall_coordinator_contract() { firewall_namespace_contract(executable, work, daemon_executable, FirewallSuite::coordinator); }
+void linux_firewall_forward_contract() { firewall_namespace_contract(executable, work, daemon_executable, FirewallSuite::forwards); }
 struct Case {
     std::string name = "dt" + random_id(false).substr(0, 8);
     std::string path = work + "/" + name;
@@ -1117,6 +1118,7 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-forwards") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::forwards);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-coordinator") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::coordinator);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::plan);
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-orphan") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::orphan);
@@ -1215,6 +1217,7 @@ int main(int argc, char** argv) {
         {"isolated_firewall_ownership_recovery_and_packets", firewall_contract},
         {"isolated_linux_firewall_policy", linux_firewall_contract},
         {"isolated_linux_firewall_coordinator", linux_firewall_coordinator_contract},
+        {"isolated_linux_port_forwards", linux_firewall_forward_contract},
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
         {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},

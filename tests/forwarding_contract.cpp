@@ -96,6 +96,7 @@ struct Path {
     std::string input_name, output_name;
     Fd input, output;
     std::array<uint8_t, 6> router{};
+    std::vector<uint8_t> sent, received;
     Path(std::string ingress = "fwin", std::string egress = "fwout")
         : input_name(std::move(ingress)), output_name(std::move(egress)),
           input(open_transient_tap(input_name)), output(open_transient_tap(output_name)) {
@@ -122,35 +123,42 @@ struct Path {
             netlink_exchange(message.header);
         }
     }
-    bool packet(bool ipv6, uint8_t sequence, const std::string& expected_source = {}, const std::string& from = {}) {
+    bool packet(bool ipv6, uint8_t sequence, const std::string& expected_source = {}, const std::string& from = {},
+            const std::string& to = {}, const std::string& expected_destination = {},
+            uint16_t port = 45679, uint16_t expected_port = 0, bool tcp = false) {
         const auto source_ip = from.empty() ? std::string(ipv6 ? "fd91:fe21:201::2" : "198.18.201.2") : from;
+        const auto destination_ip = to.empty() ? std::string(ipv6 ? "fd91:fe21:202::2" : "198.18.202.2") : to;
         const size_t ip_size = ipv6 ? 40 : 20, udp = 14 + ip_size;
-        std::vector<uint8_t> packet(udp + 12, 0);
+        const size_t transport = tcp ? 20 : 8, length = transport + 4;
+        std::vector<uint8_t> packet(udp + length, 0);
         auto word = [&](size_t at, uint16_t value) { packet[at] = value >> 8; packet[at + 1] = value & 255; };
         std::copy(router.begin(), router.end(), packet.begin()); packet[6] = 2; packet[11] = 1;
         word(12, ipv6 ? 0x86dd : 0x0800);
         if (ipv6) {
-            packet[14] = 0x60; word(18, 12); packet[20] = 17; packet[21] = 64;
+            packet[14] = 0x60; word(18, length); packet[20] = tcp ? 6 : 17; packet[21] = 64;
             check(inet_pton(AF_INET6, source_ip.c_str(), packet.data() + 22) == 1 &&
-                inet_pton(AF_INET6, "fd91:fe21:202::2", packet.data() + 38) == 1, "encode IPv6 packet");
+                inet_pton(AF_INET6, destination_ip.c_str(), packet.data() + 38) == 1, "encode IPv6 packet");
         } else {
-            packet[14] = 0x45; word(16, ip_size + 12); packet[22] = 64; packet[23] = 17;
+            packet[14] = 0x45; word(16, ip_size + length); packet[22] = 64; packet[23] = tcp ? 6 : 17;
             check(inet_pton(AF_INET, source_ip.c_str(), packet.data() + 26) == 1 &&
-                inet_pton(AF_INET, "198.18.202.2", packet.data() + 30) == 1, "encode IPv4 packet");
+                inet_pton(AF_INET, destination_ip.c_str(), packet.data() + 30) == 1, "encode IPv4 packet");
             word(24, checksum(packet.data() + 14, ip_size));
         }
         // A fresh flow per packet also permits meaningful NAT changes without
         // reusing a previous conntrack translation decision.
-        word(udp, 45000 + sequence); word(udp + 2, 45679); word(udp + 4, 12);
-        packet[udp + 8] = 'D'; packet[udp + 9] = 'V'; packet[udp + 10] = 'M'; packet[udp + 11] = sequence;
-        if (ipv6) {
-            const uint32_t pseudo = static_cast<uint16_t>(~checksum(packet.data() + 22, 32));
-            const auto value = checksum(packet.data() + udp, 12, pseudo + 12 + 17);
-            word(udp + 6, value ? value : 65535);
+        word(udp, 45000 + sequence); word(udp + 2, port);
+        if (tcp) { packet[udp + 12] = 0x50; packet[udp + 13] = 2; word(udp + 14, 4096); }
+        else word(udp + 4, length);
+        packet[udp + transport] = 'D'; packet[udp + transport + 1] = 'V'; packet[udp + transport + 2] = 'M'; packet[udp + transport + 3] = sequence;
+        if (ipv6 || tcp) {
+            const uint32_t pseudo = static_cast<uint16_t>(~checksum(packet.data() + (ipv6 ? 22 : 26), ipv6 ? 32 : 8));
+            const auto value = checksum(packet.data() + udp, length, pseudo + length + (tcp ? 6 : 17));
+            word(udp + (tcp ? 16 : 6), value ? value : 65535);
         }
         std::vector<uint8_t> frame(10, 0); // no checksum/GSO offload requested
         frame.insert(frame.end(), packet.begin(), packet.end());
-        check(write(input.get(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()), "inject real guest UDP packet");
+        check(write(input.get(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()), "inject real guest transport packet");
+        sent = packet; received.clear();
         const auto deadline = std::chrono::steady_clock::now() + 300ms;
         while (std::chrono::steady_clock::now() < deadline) {
             pollfd readable{output.get(), POLLIN, 0};
@@ -158,12 +166,56 @@ struct Path {
             uint8_t buffer[2048]; const auto count = read(output.get(), buffer, sizeof(buffer));
             const auto* bytes = buffer + 10;
             if (count != static_cast<ssize_t>(frame.size()) || bytes[12] != packet[12] || bytes[13] != packet[13] ||
-                !std::equal(packet.begin() + udp, packet.end(), bytes + udp)) continue;
+                !std::equal(packet.begin() + udp + transport, packet.end(), bytes + udp + transport)) continue;
             check(bytes[ipv6 ? 21 : 22] == 63, "kernel routed packet and decremented hop count");
+            check(((uint16_t(bytes[udp + 2]) << 8) | bytes[udp + 3]) == (expected_port ? expected_port : port), "forwarded destination port matches NAT");
+            std::array<uint8_t, 16> destination{};
+            const auto destination_text = expected_destination.empty() ? destination_ip : expected_destination;
+            check(inet_pton(ipv6 ? AF_INET6 : AF_INET, destination_text.c_str(), destination.data()) == 1 &&
+                std::equal(destination.begin(), destination.begin() + (ipv6 ? 16 : 4), bytes + (ipv6 ? 38 : 30)), "forwarded destination address matches NAT");
+            if (ipv6 || tcp) {
+                const uint32_t pseudo = static_cast<uint16_t>(~checksum(bytes + (ipv6 ? 22 : 26), ipv6 ? 32 : 8));
+                check(checksum(bytes + udp, length, pseudo + length + (tcp ? 6 : 17)) == 0, "translated transport checksum remains valid");
+            }
             std::array<uint8_t, 16> source{};
             const auto text = expected_source.empty() ? source_ip.c_str() : expected_source.c_str();
             check(inet_pton(ipv6 ? AF_INET6 : AF_INET, text, source.data()) == 1 &&
                 std::equal(source.begin(), source.begin() + (ipv6 ? 16 : 4), bytes + (ipv6 ? 22 : 26)), "forwarded source address matches expected NAT behavior");
+            received.assign(bytes, bytes + packet.size()); return true;
+        }
+        return false;
+    }
+    bool udp_reply() {
+        check(!received.empty() && sent[23] == 17 && sent[12] == 8 && sent[13] == 0, "IPv4 UDP request precedes reply fixture");
+        // Pin only the synthetic client's return path. For the hairpin case
+        // it shares the guest subnet but lives behind the other fixture TAP.
+        char source[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET, sent.data() + 26, source, sizeof(source));
+        netbox.route(input_name, std::string(source) + "/32", RT_TABLE_MAIN, false);
+        NetlinkMessage<ndmsg> neighbor; neighbor.header.nlmsg_type = RTM_NEWNEIGH;
+        neighbor.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
+        neighbor.payload.ndm_family = AF_INET; neighbor.payload.ndm_ifindex = if_nametoindex(input_name.c_str());
+        neighbor.payload.ndm_state = NUD_PERMANENT;
+        neighbor.attribute(NDA_DST, sent.data() + 26, 4); neighbor.attribute(NDA_LLADDR, sent.data() + 6, 6);
+        netlink_exchange(neighbor.header);
+        auto reply = received;
+        for (size_t i = 0; i < 6; ++i) std::swap(reply[i], reply[6 + i]);
+        for (size_t i = 0; i < 4; ++i) std::swap(reply[26 + i], reply[30 + i]);
+        for (size_t i = 0; i < 2; ++i) std::swap(reply[34 + i], reply[36 + i]);
+        reply[22] = 64; reply[24] = reply[25] = 0; reply[40] = reply[41] = 0;
+        const auto sum = checksum(reply.data() + 14, 20); reply[24] = sum >> 8; reply[25] = sum & 255;
+        std::vector<uint8_t> frame(10, 0); frame.insert(frame.end(), reply.begin(), reply.end());
+        check(write(output.get(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()), "inject guest reply to actual translated tuple");
+        const auto deadline = std::chrono::steady_clock::now() + 300ms;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pollfd readable{input.get(), POLLIN, 0}; if (poll(&readable, 1, 20) <= 0) continue;
+            uint8_t buffer[2048]; const auto count = read(input.get(), buffer, sizeof(buffer)); const auto* bytes = buffer + 10;
+            if (count != static_cast<ssize_t>(frame.size()) || !std::equal(sent.begin() + 42, sent.end(), bytes + 42)) continue;
+            check(bytes[22] == 63 && checksum(bytes + 14, 20) == 0 &&
+                std::equal(sent.begin() + 30, sent.begin() + 34, bytes + 26) &&
+                std::equal(sent.begin() + 26, sent.begin() + 30, bytes + 30) &&
+                std::equal(sent.begin() + 36, sent.begin() + 38, bytes + 34) &&
+                std::equal(sent.begin() + 34, sent.begin() + 36, bytes + 36),
+                "conntrack reply restores original host/client addresses and ports");
             return true;
         }
         return false;
@@ -345,6 +397,83 @@ void linux_firewall_packet_contract(const std::string& netbox, const std::string
     check(owner.cleanup(base.owner).empty(), "planned policy exact cleanup");
     for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
     check(rmdir(place.c_str()) == 0, "planned packet fixture empty");
+}
+void linux_firewall_forward_packets(const std::string& netbox, const std::string& work) {
+    executable = netbox; set_forwarding(0);
+    auto config = configuration("forward packet policy"); config["bridge_name"] = "brport";
+    config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.202.1/24","snat":true,"dhcp":{"enabled":true}}})"));
+    Forwarding forwarding; auto demand = forwarding.acquire(config);
+    const auto place = work + "/forward-packets";
+    check(mkdir(place.c_str(), 0700) == 0, "create forward packet inventory");
+    Fd fd(open(place.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)); Iptables iptables;
+    OwnedFirewall owner(fd.get(), getuid(), iptables);
+    std::string failure;
+    LinuxFirewall coordinator(owner, [&](const char* stage) { if (failure == stage) throw std::runtime_error("injected forward publication failure"); });
+    const auto network = config["id"].asString();
+    LinuxPortForward forward{"tapguest", 0, 2, "any", 40000, 40000, 45679, 45679};
+    coordinator.set(config); coordinator.set_forwards(network, {forward});
+    uint8_t sequence = 40;
+    auto send = [&](Path& path, const std::string& host, uint16_t port = 40000, bool tcp = false,
+                    const std::string& source = "", const std::string& expected_source = "") {
+        return path.packet(false, sequence++, expected_source, source, host, "198.18.202.2", port, 45679, tcp);
+    };
+    {
+        Path path("usb0", "brport");
+        check(!send(path, "198.18.201.1"), "empty host snapshot does not create wildcard DNAT");
+        coordinator.set_host_ipv4({"198.18.201.1"});
+        check(send(path, "198.18.201.1") && path.udp_reply(), "external UDP forward round trip restores host address and port");
+        check(send(path, "198.18.201.1") && send(path, "198.18.201.1", 40000, true), "UDP and TCP DNAT translate address and port through explicit forward accept");
+        check(!send(path, "198.18.201.9") && !send(path, "198.18.201.1", 40001), "DNAT requires exact host and port");
+        const auto unchanged = owner.inventory();
+        coordinator.set_host_ipv4({"198.18.201.1", "198.18.201.1"});
+        check(owner.inventory() == unchanged, "duplicate unchanged host snapshot preserves rule identities");
+        auto invalid = forward; invalid.guest_last = 45680;
+        error(ErrorCode::invalid_argument, [&] { coordinator.set_forwards(network, {invalid}); });
+        check(coordinator.ready() && owner.inventory() == unchanged, "invalid forward intent has no publication side effects");
+        config["stp"] = true; coordinator.set(config);
+        check(send(path, "198.18.201.1"), "network policy refresh retains its VM attachment forwards");
+        failure = "linux_firewall_nat4";
+        bool failed = false;
+        try { coordinator.set_host_ipv4({"198.18.201.9"}); } catch (const std::runtime_error&) { failed = true; }
+        check(failed && !coordinator.ready() && !send(path, "198.18.201.1") && !send(path, "198.18.201.9"), "failed host re-scope protects old and new NAT destinations");
+        failure.clear(); coordinator.refresh();
+        check(coordinator.ready() && !send(path, "198.18.201.1") && send(path, "198.18.201.9"), "host snapshot retry removes stale DNAT and publishes new address");
+        auto second = forward; second.attachment = "tapsecond"; second.protocol = "udp"; second.host_first = second.host_last = 40001;
+        coordinator.set_forwards(network, {forward, second});
+        check(send(path, "198.18.201.9", 40001) && !send(path, "198.18.201.9", 40001, true), "second attachment obeys its protocol");
+        coordinator.set_forwards(network, {second});
+        check(!send(path, "198.18.201.9") && send(path, "198.18.201.9", 40001), "detaching one attachment preserves the other mapping");
+        coordinator.set_forwards(network, {});
+        check(!send(path, "198.18.201.9", 40001), "last detach removes DNAT for new flows");
+        coordinator.set_forwards(network, {forward});
+        coordinator.set_host_ipv4({}); check(!send(path, "198.18.201.9"), "host loss withdraws rather than broadens DNAT");
+        coordinator.set_host_ipv4({"198.18.201.9"});
+    }
+    {
+        Path path("brportA", "brport");
+        check(send(path, "198.18.201.9", 40000, false, "198.18.202.3", "198.18.202.1") && path.udp_reply(),
+            "hairpin UDP reply reverses both DNAT and MASQUERADE back to original client tuple");
+        check(send(path, "198.18.201.9", 40000, false, "198.18.202.3", "198.18.202.1") &&
+            send(path, "198.18.201.9", 40000, true, "198.18.202.3", "198.18.202.1"),
+            "same-subnet UDP and TCP hairpin translates destination and masquerades source to gateway");
+    }
+    {
+        // A route can move the DNAT guest destination away from its bridge.
+        // Verify protection matches translated traffic even on this path.
+        Path path("otherin", "otherout");
+        check(send(path, "198.18.201.9"), "fixture exposes DNAT traffic outside bridge interface protection");
+        failure = "linux_firewall_nat4";
+        auto changed = forward; changed.host_first = changed.host_last = 40002;
+        bool failed = false;
+        try { coordinator.set_forwards(network, {changed}); } catch (const std::runtime_error&) { failed = true; }
+        check(failed && !coordinator.ready() && !send(path, "198.18.201.9", 40002), "translated target guard blocks non-bridge path during partial publication");
+        failure.clear(); coordinator.refresh();
+        check(send(path, "198.18.201.9", 40002), "translated target guard retires after complete retry");
+    }
+    coordinator.remove(network); coordinator.stop();
+    check(owner.inventory()["rules"].empty(), "quiesced forward network leaves no rules");
+    for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
+    check(rmdir(place.c_str()) == 0, "forward packet fixture empty");
 }
 void linux_firewall_coordinator_packets(const std::string& netbox, const std::string& work) {
     std::cerr << "coordinator: guarded packet transitions" << std::endl;

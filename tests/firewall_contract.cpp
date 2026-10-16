@@ -416,6 +416,7 @@ void actual_daemon_recovery() {
 void packets() { firewall_packet_contract(executable, directory); }
 void planned_packets() { linux_firewall_packet_contract(executable, directory); }
 void coordinated_packets() { linux_firewall_coordinator_packets(executable, directory); }
+void forwarded_packets() { linux_firewall_forward_packets(executable, directory); }
 Json::Value coordinator_config(const std::string& bridge) {
     auto config = wire::parse(R"({"schema":2,"name":"coordinator","bridge_type":"linux","uplink_mode":"l3","l3":{"vlans":[]}})");
     config["id"] = random_id(true); config["bridge_name"] = bridge; return config;
@@ -449,21 +450,67 @@ void shared_coordinator_lifecycle() {
     check(owned.inventory()["rules"].size() == 1, "stop retires all coordinator rules only");
     test.finish();
 }
-void coordinator_crash_boundaries() {
+void publication_crash_boundaries(bool forwards) {
     for (const auto* stage : {"linux_firewall_guard4", "linux_firewall_guard6", "linux_firewall_nat4", "linux_firewall_mangle4",
                              "linux_firewall_filter4", "linux_firewall_filter6"}) {
         std::cerr << "coordinator crash boundary: " << stage << std::endl;
+        const auto started = std::chrono::steady_clock::now();
         Case test;
-        ChildOptions options; options.argv = {"/proc/self/exe", "--firewall-crash", test.path, "4", stage};
+        const auto phase = forwards ? "linux_forward_" + std::string(stage).substr(std::string("linux_firewall_").size()) : std::string(stage);
+        ChildOptions options; options.argv = {"/proc/self/exe", "--firewall-crash", test.path, "4", phase};
         const auto output = Child(options).communicate({}, 15s);
         check(output.exit_code == -SIGKILL && !output.timed_out, "kill coordinator between actual table publications");
         OwnedFirewall recovered(test.fd.get(), getuid(), test.iptables); const auto before = recovered.inventory();
         error(ErrorCode::conflict, [&] { LinuxFirewall premature(recovered); });
         check(recovered.recover_all().empty(), "existing recovery handles partial multi-table publications");
-        for (const auto& row : before["rules"]) check(!test.iptables.tagged(FirewallRule::from(row["rule"]), row["tag"].asString()), "no recorded coordinator rule survives recovery");
+        std::map<std::pair<bool, std::string>, std::map<std::string, size_t>> remaining;
+        for (const auto& row : before["rules"]) {
+            const auto rule = FirewallRule::from(row["rule"]);
+            const auto key = std::pair{rule.ipv6, rule.table};
+            if (!remaining.contains(key)) remaining.emplace(key, test.iptables.tags(rule));
+            check(!remaining.at(key).contains(row["tag"].asString()), "no recorded coordinator rule survives recovery");
+        }
         LinuxFirewall clean(recovered); clean.refresh(); check(clean.ready(), "coordinator can be recreated after ownership recovery");
         test.finish();
+        std::cerr << "publication recovery ms: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count() << std::endl;
     }
+}
+void coordinator_crash_boundaries() { publication_crash_boundaries(false); }
+void forward_crash_boundaries() { publication_crash_boundaries(true); }
+void port_forward_plans() {
+    auto config = coordinator_config("brfwd");
+    config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.202.1/24","snat":true,"dhcp":{"enabled":true}}})"));
+    LinuxPortForward forward{"tapone", 0, 2, "any", 20000, 20002, 30000, 30002};
+    const auto plan = linux_firewall_plan(config, {}, {forward}, {"198.18.201.1", "198.18.201.1", "198.18.201.9"});
+    size_t dnat = 0, hairpin = 0, accepts = 0;
+    for (const auto& row : plan.nat4) {
+        if (row.rule.target == "DNAT") {
+            ++dnat;
+            check(row.rule.chain == "PREROUTING" && row.rule.translated_address == "198.18.202.2" &&
+                row.rule.port_first == 20000 && row.rule.port_last == 20002 && row.rule.translated_first == 30000 &&
+                row.rule.translated_last == 30002 && !row.rule.destination.empty(), "DNAT scope and port range preserve legacy rules");
+        } else if (row.key.ends_with("/hairpin")) {
+            ++hairpin; check(row.rule.source == "198.18.202.0/24" && row.rule.destination == "198.18.202.2/32" && row.rule.output.empty(), "hairpin matches legacy source and target without egress restriction");
+        }
+    }
+    bool regular = false;
+    for (const auto& row : plan.filter[0]) {
+        if (row.key.starts_with("forward/")) { ++accepts; check(!regular && row.rule.output_prefix, "forward accept precedes subnet policy"); }
+        else if (!row.rule.established) regular = true;
+    }
+    check(dnat == 4 && hairpin == 2 && accepts == 2, "any expands to two protocols and hosts deduplicate");
+    const auto empty = linux_firewall_plan(config, {}, {forward});
+    for (const auto& row : empty.nat4) check(row.rule.target != "DNAT", "no host snapshot never emits wildcard DNAT");
+    auto bad = forward; bad.host_last = 20003;
+    error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {}, {bad}); });
+    bad = forward; bad.vlan = 7;
+    error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {}, {bad}); });
+    bad = forward; bad.offset = 0;
+    error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {}, {bad}); });
+    for (const auto* host : {"0.0.0.0", "198.18.201.0/24", "::1", "example.invalid", "1.2.3.4 -j ACCEPT"})
+        error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {}, {forward}, {host}); });
+    config["l3"]["vlans"][0]["ipv4"]["snat"] = false;
+    error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {}, {forward}); });
 }
 void prefix_rules_and_old_journal() {
     Case test; OwnedFirewall owned(test.fd.get(), getuid(), test.iptables);
@@ -531,7 +578,7 @@ void linux_policy_plan() {
 }
 }
 void firewall_namespace_contract(const std::string& netbox, const std::string& work, const std::string& daemon, FirewallSuite suite) {
-    const std::string name = suite == FirewallSuite::coordinator ? "linux-firewall-coordinator" : suite == FirewallSuite::plan ? "linux-firewall-namespace" : "firewall-namespace";
+    const std::string name = suite == FirewallSuite::forwards ? "linux-firewall-forwards" : suite == FirewallSuite::coordinator ? "linux-firewall-coordinator" : suite == FirewallSuite::plan ? "linux-firewall-namespace" : "firewall-namespace";
     const auto path = work + "/" + name;
     check(mkdir(path.c_str(), 0700) == 0, "create firewall namespace fixture");
     ChildOptions options; options.argv = {"/proc/self/exe", "--" + name, netbox, path, daemon};
@@ -545,6 +592,8 @@ int firewall_namespace_child(const std::string& netbox, const std::string& work,
     if (unshare(CLONE_NEWNET) != 0 || same_scope(scope, network_scope())) return 70;
     executable = netbox; directory = work; daemon = program;
     if (suite == FirewallSuite::orphan) return run({{"orphan_mutator_inherited_barrier", orphan_mutator_barrier}});
+    if (suite == FirewallSuite::forwards) return run({{"linux_port_forward_plans", port_forward_plans},
+        {"linux_dnat_hairpin_and_host_changes", forwarded_packets}, {"six_forward_publication_sigkill_boundaries", forward_crash_boundaries}});
     if (suite == FirewallSuite::coordinator) return run({{"shared_coordinator_refresh_and_stop", shared_coordinator_lifecycle},
         {"coordinator_guarded_packet_transitions", coordinated_packets}, {"six_coordinator_sigkill_boundaries", coordinator_crash_boundaries}});
     if (suite == FirewallSuite::plan) return run({{"typed_prefix_and_old_journal", prefix_rules_and_old_journal}, {"linux_configuration_policy_plan", linux_policy_plan},
@@ -563,11 +612,22 @@ int firewall_crash_child(const std::string& work, bool ipv6, const std::string& 
     OwnedFirewall owner(fd.get(), getuid(), iptables, [&](const char* stage) {
         if (phase == stage && (!phase.starts_with("firewall_batch_") || armed)) kill(getpid(), SIGKILL);
     });
-    if (phase.starts_with("linux_firewall_")) {
-        LinuxFirewall coordinator(owner, [&](const char* stage) { if (phase == stage) kill(getpid(), SIGKILL); });
+    if (phase.starts_with("linux_firewall_") || phase.starts_with("linux_forward_")) {
+        const bool forwards = phase.starts_with("linux_forward_");
+        bool publish = !forwards;
+        const auto target = forwards ? "linux_firewall_" + phase.substr(std::string("linux_forward_").size()) : phase;
+        LinuxFirewall coordinator(owner, [&](const char* stage) { if (publish && target == stage) kill(getpid(), SIGKILL); });
         auto config = coordinator_config("brcrash");
-        config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":true}})"));
-        coordinator.set(config); return 74;
+        config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":true,"dhcp":{"enabled":true}}})"));
+        coordinator.set(config);
+        if (forwards) {
+            coordinator.set_host_ipv4({"198.18.202.1"});
+            LinuxPortForward forward{"tapcrash", 0, 2, "udp", 20000, 20000, 30000, 30000};
+            coordinator.set_forwards(config["id"].asString(), {forward});
+            forward.offset = 3; publish = true;
+            coordinator.set_forwards(config["id"].asString(), {forward});
+        }
+        return 74;
     }
     if (phase.starts_with("firewall_batch_") || phase == "inflight") {
         owner.put("test", "drop", policy(ipv6, false)[0].rule);

@@ -3,11 +3,78 @@
 #include "store/network_config.h"
 #include "services/context.h"
 #include "common/wire.h"
+#include "netbox.h"
+#include <algorithm>
+#include <arpa/inet.h>
 #include <set>
 
 namespace droidvm::network {
-LinuxFirewallPlan linux_firewall_plan(Json::Value config, const PdAddresses& pd) {
-    const auto plan = linux_plan(std::move(config));
+namespace {
+std::vector<std::string> host_addresses4(const std::vector<std::string>& addresses) {
+    if (addresses.size() > 256) throw ServiceError(ErrorCode::resource_exhausted, "too many firewall host addresses");
+    std::set<std::string> unique;
+    for (const auto& address : addresses) {
+        in_addr value{}; char text[INET_ADDRSTRLEN]{};
+        if (inet_pton(AF_INET, address.c_str(), &value) != 1 || !value.s_addr || address.find('\0') != std::string::npos)
+            throw ServiceError(ErrorCode::invalid_argument, "firewall host address must be a specific numeric IPv4 address");
+        inet_ntop(AF_INET, &value, text, sizeof(text)); unique.insert(text);
+    }
+    return {unique.begin(), unique.end()};
+}
+void append_forwards(LinuxFirewallPlan& result, const Json::Value& config,
+        const std::vector<LinuxPortForward>& forwards, const std::vector<std::string>& hosts) {
+    if (forwards.size() > 256) throw ServiceError(ErrorCode::resource_exhausted, "too many Linux port forwards");
+    std::vector<OwnedFirewall::Rule> accepts;
+    for (size_t i = 0; i < forwards.size(); ++i) {
+        const auto& forward = forwards[i];
+        Netbox::interface_name(forward.attachment);
+        if (!result.l3 || forward.vlan < 0 || forward.vlan > 4094 || forward.offset <= 0 ||
+            !forward.host_first || forward.host_last < forward.host_first || !forward.guest_first ||
+            forward.guest_last < forward.guest_first || forward.host_last - forward.host_first != forward.guest_last - forward.guest_first ||
+            (forward.protocol != "tcp" && forward.protocol != "udp" && forward.protocol != "any"))
+            throw ServiceError(ErrorCode::invalid_argument, "invalid Linux port forward");
+        const Json::Value* vlan = nullptr;
+        for (const auto& row : config::member(config::member(config, "l3"), "vlans"))
+            if (row.isObject() && config::integer(row, "vlan_id") == forward.vlan) { vlan = &row; break; }
+        const auto& ipv4 = config::member(vlan ? *vlan : Json::Value::nullSingleton(), "ipv4");
+        const auto cidr = config::string(ipv4, "cidr");
+        if (cidr.empty() || !config::boolean(ipv4, "snat") || !config::boolean(config::member(ipv4, "dhcp"), "enabled"))
+            throw ServiceError(ErrorCode::invalid_argument, "Linux port forward requires a DHCPv4 and SNAT VLAN");
+        const auto subnet = config::NetworkPrefix::parse(cidr, false);
+        const auto guest = subnet.address_at(forward.offset);
+        for (const std::string protocol : {"tcp", "udp"}) {
+            if (forward.protocol != "any" && forward.protocol != protocol) continue;
+            const auto key = "forward/" + forward.attachment + "/" + std::to_string(i) + "/" + protocol;
+            if (result.nat4.size() + 1 + hosts.size() > 4096)
+                throw ServiceError(ErrorCode::resource_exhausted, "Linux forward plan exceeds rule budget");
+            FirewallRule accept; accept.output = result.bridge; accept.output_prefix = true;
+            accept.destination = guest + "/32"; accept.protocol = protocol;
+            accept.port_first = forward.guest_first; accept.port_last = forward.guest_last;
+            accept.arguments(); accepts.push_back({key + "/accept", accept});
+            FirewallRule hairpin = accept; hairpin.output.clear(); hairpin.output_prefix = false;
+            hairpin.table = "nat"; hairpin.chain = "POSTROUTING"; hairpin.source = subnet.network(); hairpin.target = "MASQUERADE";
+            hairpin.arguments(); result.nat4.push_back({key + "/hairpin", hairpin});
+            for (const auto& host : hosts) {
+                FirewallRule dnat; dnat.table = "nat"; dnat.chain = "PREROUTING";
+                dnat.destination = host + "/32"; dnat.protocol = protocol;
+                dnat.port_first = forward.host_first; dnat.port_last = forward.host_last;
+                dnat.target = "DNAT"; dnat.translated_address = guest;
+                dnat.translated_first = forward.guest_first; dnat.translated_last = forward.guest_last;
+                dnat.arguments(); result.nat4.push_back({key + "/dnat/" + host, dnat});
+            }
+        }
+    }
+    auto& filter = result.filter[0];
+    const auto at = std::find_if(filter.begin(), filter.end(), [](const auto& row) { return !row.rule.established; });
+    filter.insert(at, accepts.begin(), accepts.end());
+    if (result.nat4.size() > 4096 || filter.size() > 4096)
+        throw ServiceError(ErrorCode::resource_exhausted, "Linux forward plan exceeds rule budget");
+}
+}
+LinuxFirewallPlan linux_firewall_plan(Json::Value config, const PdAddresses& pd,
+        const std::vector<LinuxPortForward>& forwards, const std::vector<std::string>& host_ipv4) {
+    const auto plan = linux_plan(config);
+    const auto hosts = host_addresses4(host_ipv4);
     const auto live = linux_live_plan(plan, pd);
     LinuxFirewallPlan result; result.owner = plan.owner; result.bridge = plan.bridge; result.l3 = plan.l3;
     auto append = [&](FirewallRule rule) {
@@ -17,6 +84,7 @@ LinuxFirewallPlan linux_firewall_plan(Json::Value config, const PdAddresses& pd)
         rows.push_back({key, std::move(rule)});
     };
     if (!plan.l3) {
+        if (!forwards.empty()) throw ServiceError(ErrorCode::invalid_argument, "Linux L2 networks do not support port forwards");
         FirewallRule rule; rule.input = rule.output = plan.bridge;
         append(rule); return result; // L2 bridge netfilter: exact IPv4 bridge pair
     }
@@ -82,6 +150,7 @@ LinuxFirewallPlan linux_firewall_plan(Json::Value config, const PdAddresses& pd)
         else { drop.output = plan.bridge; drop.output_prefix = true; }
         append(drop);
     }
+    append_forwards(result, config, forwards, hosts);
     return result;
 }
 LinuxFirewall::LinuxFirewall(OwnedFirewall& firewall, Observer observer)
@@ -124,8 +193,20 @@ void LinuxFirewall::protect(const LinuxFirewallPlan& plan) {
     // Protect its full match domain, including locally generated traffic,
     // before replacing NAT; bridge-interface guards alone are insufficient.
     for (const auto& row : plan.nat4) {
-        auto rule = row.rule; rule.chain = "FORWARD"; add(rule);
-        rule.chain = "OUTPUT"; add(rule);
+        auto rule = row.rule;
+        if (rule.target == "DNAT") {
+            // filter sees the translated address/port when NAT is installed,
+            // and the host address/port when it is absent. Guard both forms,
+            // including local delivery if the target's route changes.
+            rule.translated_address.clear(); rule.translated_first = rule.translated_last = 0;
+            rule.chain = "FORWARD"; add(rule); rule.chain = "INPUT"; add(rule);
+            rule.destination = row.rule.translated_address + "/32";
+            rule.port_first = row.rule.translated_first; rule.port_last = row.rule.translated_last;
+            rule.chain = "FORWARD"; add(rule); rule.chain = "INPUT"; add(rule);
+        } else {
+            rule.chain = "FORWARD"; add(rule);
+            rule.chain = "OUTPUT"; add(rule);
+        }
     }
 }
 bool LinuxFirewall::matches(const LinuxFirewallPlan& plan) const {
@@ -166,17 +247,44 @@ void LinuxFirewall::refresh_locked() {
     } catch (...) { ready_ = false; throw; }
 }
 void LinuxFirewall::set(Json::Value config, const PdAddresses& pd) {
-    auto plan = linux_firewall_plan(std::move(config), pd);
     std::lock_guard lock(mutex_);
     if (stopped_) throw ServiceError(ErrorCode::conflict, "Linux firewall coordinator is stopped");
+    const auto owner = config::uuid(config);
+    const auto at = forwards_.find(owner);
+    auto plan = linux_firewall_plan(config, pd, at == forwards_.end() ? std::vector<LinuxPortForward>{} : at->second, host_ipv4_);
     if (const auto before = desired_.find(plan.owner); before != desired_.end()) protect(before->second);
     protect(plan); ready_ = false;
-    const auto owner = plan.owner; desired_[owner] = std::move(plan); refresh_locked();
+    configurations_[owner] = std::move(config); pd_[owner] = pd;
+    desired_[owner] = std::move(plan); refresh_locked();
+}
+void LinuxFirewall::set_forwards(const std::string& network, std::vector<LinuxPortForward> forwards) {
+    std::lock_guard lock(mutex_);
+    if (stopped_) throw ServiceError(ErrorCode::conflict, "Linux firewall coordinator is stopped");
+    const auto at = configurations_.find(network);
+    if (at == configurations_.end()) throw ServiceError(ErrorCode::not_found, "Linux firewall network is not registered");
+    auto plan = linux_firewall_plan(at->second, pd_.at(network), forwards, host_ipv4_);
+    protect(desired_.at(network)); protect(plan); ready_ = false;
+    forwards_[network] = std::move(forwards); desired_[network] = std::move(plan); refresh_locked();
+}
+void LinuxFirewall::set_host_ipv4(std::vector<std::string> addresses) {
+    addresses = host_addresses4(addresses);
+    std::lock_guard lock(mutex_);
+    if (stopped_) throw ServiceError(ErrorCode::conflict, "Linux firewall coordinator is stopped");
+    auto next = desired_;
+    for (auto& [owner, plan] : next) {
+        const auto at = forwards_.find(owner);
+        plan = linux_firewall_plan(configurations_.at(owner), pd_.at(owner),
+            at == forwards_.end() ? std::vector<LinuxPortForward>{} : at->second, addresses);
+    }
+    for (const auto& [owner, plan] : desired_) protect(plan);
+    for (const auto& [owner, plan] : next) protect(plan);
+    ready_ = false; host_ipv4_ = std::move(addresses); desired_ = std::move(next); refresh_locked();
 }
 void LinuxFirewall::remove(const std::string& network) {
     std::lock_guard lock(mutex_);
     if (stopped_) throw ServiceError(ErrorCode::conflict, "Linux firewall coordinator is stopped");
     if (const auto before = desired_.find(network); before != desired_.end()) { protect(before->second); desired_.erase(before); }
+    configurations_.erase(network); pd_.erase(network); forwards_.erase(network);
     ready_ = false; refresh_locked();
 }
 void LinuxFirewall::refresh() {
@@ -187,6 +295,6 @@ void LinuxFirewall::refresh() {
 void LinuxFirewall::stop() {
     std::lock_guard lock(mutex_); stopped_ = true; ready_ = false;
     for (const auto& [owner, plan] : desired_) protect(plan);
-    desired_.clear(); refresh_locked();
+    desired_.clear(); configurations_.clear(); pd_.clear(); forwards_.clear(); refresh_locked();
 }
 }
