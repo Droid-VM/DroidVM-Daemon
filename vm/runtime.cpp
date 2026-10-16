@@ -172,7 +172,7 @@ void VmRuntime::set_state(State next) {
     if (context_.state_changed) {
         // Guarded: a state change never fails because of the keyboard.
         try { context_.state_changed(id_, config::string(config(), "name"), next); }
-        catch (const std::exception& error) { context_.warn(std::string("keyboard: state hook failed: ") + error.what()); }
+        catch (const std::exception& error) { context_.warn(std::string("state hook failed: ") + error.what()); }
     }
     if (next == State::stopped) idle_.notify_all();
 }

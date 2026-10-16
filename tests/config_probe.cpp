@@ -9,6 +9,7 @@
 #include "vm/crosvm_command.h"
 #include "vm/host_facts.h"
 #include "vm/qemu_command.h"
+#include "usb_oracle_ops.h"
 #include <sys/stat.h>
 #include <fstream>
 #include <iostream>
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
             row["name"] = test["name"];
             try {
                 auto value = test["config"];
+                if (droidvm::usb::oracle::evaluate(test, row)) { report.append(row); continue; }
                 if (test["op"].asString() == "nic") {
                     std::vector<std::string> dropped;
                     auto sane = droidvm::vm::sanitize_nic(test["nic"], test["network"], dropped);

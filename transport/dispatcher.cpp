@@ -69,6 +69,11 @@ constexpr std::array keyboard_commands{"kbd_config", "kbd_grab", "kbd_status"};
 bool keyboard_command(const std::string& command) {
     return std::find(keyboard_commands.begin(), keyboard_commands.end(), command) != keyboard_commands.end();
 }
+constexpr std::array usb_commands{"usb_attach", "usb_detach", "usb_host_list", "usb_rules_get", "usb_rules_set",
+    "usb_rules_test", "usb_set_target", "usb_vm_list"};
+bool usb_command(const std::string& command) {
+    return std::find(usb_commands.begin(), usb_commands.end(), command) != usb_commands.end();
+}
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
@@ -142,7 +147,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (display_attach_ && command == "display_attach") ||
+    return (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
@@ -153,6 +158,19 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
     if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
     if (keyboard_ && keyboard_command(command)) return execute_keyboard(caller, command, request);
+    if (usb_ && usb_command(command)) {
+        // RequestException texts reach the client; anything else is "internal error".
+        try {
+            Json::Value response = command == "usb_attach" ? usb_->usb_attach(request) : command == "usb_detach" ? usb_->usb_detach(request) :
+                command == "usb_host_list" ? usb_->usb_host_list(request) : command == "usb_rules_get" ? usb_->usb_rules_get(request) :
+                command == "usb_rules_set" ? usb_->usb_rules_set(request) : command == "usb_rules_test" ? usb_->usb_rules_test(request) :
+                command == "usb_set_target" ? usb_->usb_set_target(request) : usb_->usb_vm_list(request);
+            for (const auto& key : response.getMemberNames()) result[key] = response[key];
+            result["success"] = true;
+        } catch (const usb::RequestError& error) { result["message"] = error.what(); }
+        catch (...) { result["message"] = "internal error"; }
+        return result;
+    }
     if (display_attach_ && command == "display_attach") {
         const auto nonce = legacy_id(request, "nonce");
         if (nonce.empty()) { result["message"] = "missing nonce"; return result; }
@@ -488,6 +506,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : keyboard_commands) result["commands"].append(name);
                 result["keyboard_grab"] = true;
                 result["service_api_minor"] = 9;
+            }
+            if (usb_) {
+                for (const auto* name : usb_commands) result["commands"].append(name);
+                result["usb_passthrough"] = true;
             }
             if (display_attach_) {
                 result["commands"].append("display_attach");

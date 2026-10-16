@@ -17,6 +17,9 @@
 #include "services/vm.h"
 #include "services/legacy_events.h"
 #include "input/keyboard_grab.h"
+#include "usb/service.h"
+#include "usb/watch.h"
+#include "vm/host_facts.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
 #include "display_broker.h"
@@ -44,6 +47,45 @@
 #include <thread>
 #endif
 
+namespace {
+// The VM store as UsbPassthroughManager reads it: fresh state on every call.
+class UsbVmStore final : public droidvm::usb::UsbVms {
+public:
+    explicit UsbVmStore(std::unique_ptr<droidvm::VmService>& vms) : vms_(vms) {}
+    std::optional<droidvm::usb::UsbVm> find(const std::string& id) const override {
+        if (!vms_) return std::nullopt;
+        try { return row(vms_->runtime(caller_, id)); } catch (const std::exception&) { return std::nullopt; }
+    }
+    std::vector<droidvm::usb::UsbVm> list() const override {
+        std::vector<droidvm::usb::UsbVm> rows;
+        if (!vms_) return rows;
+        for (const auto& item : vms_->list(caller_))
+            if (auto vm = find(droidvm::config::string(item, "id"))) rows.push_back(std::move(*vm));
+        return rows;
+    }
+    std::optional<uint64_t> stderr_mark(const std::string& id) const override {
+        try { if (auto* log = vms_->runtime(caller_, id)->log("stderr")) return log->mark(); } catch (const std::exception&) {}
+        return std::nullopt;
+    }
+    std::string stderr_since(const std::string& id, uint64_t mark) const override {
+        try { if (auto* log = vms_->runtime(caller_, id)->log("stderr")) return log->since(mark); } catch (const std::exception&) {}
+        return {};
+    }
+private:
+    std::unique_ptr<droidvm::VmService>& vms_;
+    droidvm::CallContext caller_{"usb", true, true, true};
+    static droidvm::usb::UsbVm row(const std::shared_ptr<droidvm::vm::VmRuntime>& vm) {
+        droidvm::usb::UsbVm result;
+        result.id = vm->id();
+        result.config = vm->config();
+        result.name = droidvm::config::string(result.config, "name");
+        result.state = static_cast<droidvm::usb::VmState>(vm->state());
+        result.control_socket = vm->crosvm_control_socket();
+        return result;
+    }
+};
+}
+
 int main(int argc, char** argv) {
     try {
         std::string directory, data_directory, apk;
@@ -53,6 +95,7 @@ int main(int argc, char** argv) {
         int write_delay_ms = 0;
 #endif
         std::string display_package = DROIDVM_PACKAGE_NAME;
+        std::string usb_sys; // a fixture's fake sysfs root
 #ifdef DROIDVM_KEYBOARD_FIXTURE
         std::string keyboard_name; // the only keyboard this test daemon may see
 #endif
@@ -71,6 +114,7 @@ int main(int argc, char** argv) {
 #ifdef DROIDVM_KEYBOARD_FIXTURE
             else if (arg == "--test-keyboard-name" && i + 1 < argc) keyboard_name = argv[++i];
             else if (arg == "--test-display-package" && i + 1 < argc) display_package = argv[++i];
+            else if (arg == "--test-usb-sys" && i + 1 < argc) usb_sys = argv[++i];
 #endif
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
             else if (arg == "--test-write-delay-ms" && i + 1 < argc) {
@@ -166,6 +210,9 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
             // Outlives vms: their state hooks reach it until the last VM stops.
             std::unique_ptr<droidvm::input::KeyboardGrab> keyboard;
+            std::unique_ptr<droidvm::usb::UsbService> usb;
+            std::unique_ptr<droidvm::usb::CrosvmCli> usb_control;
+            std::unique_ptr<UsbVmStore> usb_vms;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
 #ifdef DROIDVM_PLATFORM_SERVICES
@@ -226,7 +273,11 @@ int main(int argc, char** argv) {
                 };
                 context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
                 context.state_changed = [&](const std::string& id, const std::string& name, droidvm::VmState state) {
-                    if (keyboard) keyboard->on_vm_state(id, name, droidvm::vm::command::lower(droidvm::vm_state_name(state)));
+                    // VMInstance.setState: USB first, then the keyboard; each guarded.
+                    if (usb) try { usb->on_vm_state(id, static_cast<droidvm::usb::VmState>(state)); }
+                        catch (const std::exception& error) { if (log) log->write("WARN", std::string("usb: state hook failed: ") + error.what()); }
+                    if (keyboard) try { keyboard->on_vm_state(id, name, droidvm::vm::command::lower(droidvm::vm_state_name(state))); }
+                        catch (const std::exception& error) { if (log) log->write("WARN", std::string("keyboard: state hook failed: ") + error.what()); }
                 };
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);
@@ -257,6 +308,21 @@ int main(int argc, char** argv) {
                 };
 #endif
                 keyboard = std::make_unique<droidvm::input::KeyboardGrab>(files.get(), std::move(keys));
+                // Host USB state (drivers_autoprobe, bindings) is global: only the
+                // app's own data directory, or a fixture's fake sysfs, may own it.
+                if (same || !usb_sys.empty()) {
+                    usb_vms = std::make_unique<UsbVmStore>(vms);
+                    usb_control = std::make_unique<droidvm::usb::CrosvmCli>(data.string(), droidvm::vm::system_property("ro.build.version.release"));
+                    droidvm::usb::UsbOptions options;
+                    if (!usb_sys.empty()) { options.sys_root = usb_sys; options.dev_root = usb_sys + "/dev/bus/usb"; }
+                    else options.watch = std::make_unique<droidvm::usb::HostUsbWatch>(options.dev_root, [&](const std::string& text) { if (log) log->write("WARN", text); });
+                    options.files_dir = (data / "files").string();
+                    options.vms = usb_vms.get();
+                    options.control = usb_control.get();
+                    options.publish = [&](const Json::Value& event) { legacy_events.publish(event); };
+                    options.log = [&](const char* level, const std::string& text) { if (log) log->write(level, "UsbPassthrough: " + text); };
+                    usb = std::make_unique<droidvm::usb::UsbService>(std::move(options));
+                }
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
@@ -295,6 +361,11 @@ int main(int argc, char** argv) {
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
+            if (usb) {
+                dispatcher.set_usb(usb.get());
+                // Daemon.main starts the USB manager after the VM sweep is queued; its pass recovers leftovers.
+                try { usb->start(); } catch (const std::exception& error) { if (log) log->write("WARN", std::string("USB start failed: ") + error.what()); }
+            }
 #ifdef DROIDVM_PLATFORM_SERVICES
             std::unique_ptr<droidvm::platform::DisplayBroker> display;
             if (vms) {
@@ -321,6 +392,7 @@ int main(int argc, char** argv) {
             tasks.shutdown();
             // VMs leave before USB/networks: their taps and devices go with them.
             if (vms) vms->stop_all();
+            if (usb) usb->shutdown(); // returns devices and restores drivers_autoprobe
             if (host_ipv4) host_ipv4->stop();
 #ifdef DROIDVM_PLATFORM_SERVICES
             audio_table.stop();

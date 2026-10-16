@@ -61,6 +61,9 @@ public:
     bool resume();
     bool control(const std::string& command);
     bool write_input(const std::string& screen, int channel, std::string_view data) { return input_.write(screen, channel, data); }
+    // getControlSocketPath(): crosvm's control socket while it has a backend;
+    // nullopt for QEMU, whose socket is QMP.
+    std::optional<std::string> crosvm_control_socket() const { std::lock_guard lock(state_mutex_); return qemu_ ? std::nullopt : control_socket_; }
     void clear_logs();
     std::vector<std::string> streams() const;
     ConsoleLog* log(const std::string& stream) const;
