@@ -734,11 +734,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 }
             }
             if (configuration_) {
-                result["network_config_delete"] = "revisioned-stopped-chunks-v1";
+                result["network_config_delete"] = runtime_ ? "revisioned-stop-chunks-v1" : "revisioned-stopped-chunks-v1";
                 result["configuration_recover"] = "redo-v1";
                 for (const auto* name : delete_upload_commands) result["commands"].append(name);
                 result["commands"].append("configuration_recover");
-                result["service_api_minor"] = 20;
+                result["service_api_minor"] = runtime_ ? 21 : 20;
             }
         }
         return result;

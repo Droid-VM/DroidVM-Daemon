@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "configuration.h"
 #include "vm.h"
+#include "network.h"
 #include "tasks.h"
 #include "common/identity.h"
 #include "store/network_config.h"
@@ -47,8 +48,10 @@ void ConfigurationService::publish_pending() {
     networks_->publish(pending_network_);
 }
 VmConfigService::Snapshot ConfigurationService::remove_network(const CallContext& caller, const std::string& vm_revision,
-        const Json::Value& expected_network) {
+        const Json::Value& expected_network, NetworkService* lifecycle) {
     access(caller);
+    if (lifecycle && &lifecycle->configs_ != networks_.get())
+        throw ServiceError(ErrorCode::invalid_argument, "Network lifecycle configuration does not match");
     if (vm_revision.empty() || vm_revision.size() > 128 || !expected_network.isObject())
         throw ServiceError(ErrorCode::invalid_argument, "Configuration confirmation is required");
     std::string id;
@@ -65,7 +68,7 @@ VmConfigService::Snapshot ConfigurationService::remove_network(const CallContext
     if (found == network_before->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
     if (network_before->document["networks"][found->second] != expected_network)
         throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before deleting");
-    networks_->require_stopped(id);
+    if (!lifecycle) networks_->require_stopped(id);
     auto vm_next = std::make_shared<VmConfigSnapshot>();
     vm_next->document = vm_before->document;
     for (auto& vm : vm_next->document["vms"]) {
@@ -88,6 +91,11 @@ VmConfigService::Snapshot ConfigurationService::remove_network(const CallContext
     auto runtime = vms_->prepare_(vm_next->document);
     const std::vector<config::ConfigTransaction::Update> updates{
         {"vms.json", vm_next->document}, {"networks.json", network_next->document}};
+    // Admission is drained, all target comparisons passed, changed VMs are
+    // frozen and all replacements are prepared. No concurrent network start or
+    // watchdog can run between cleanup and the durable decision.
+    if (lifecycle) lifecycle->stop_for_delete(id);
+    networks_->require_stopped(id);
     exclusive.require_recovery();
     try { journal_->commit(updates); }
     catch (const config::TransactionError& error) {

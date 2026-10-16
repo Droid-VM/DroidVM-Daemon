@@ -58,8 +58,8 @@ public:
             throw std::invalid_argument("Configuration adapter participants do not match");
         set_vm_config(&service->vms());
         vm_uploads_ = std::make_unique<ConfigUploads>(vm_config_, networks_, [] { return ConfigUploads::Clock::now(); },
-            [service](const CallContext& caller, const std::string& revision, const Json::Value& expected) {
-                return service->remove_network(caller, revision, expected);
+            [service, lifecycle = runtime_](const CallContext& caller, const std::string& revision, const Json::Value& expected) {
+                return service->remove_network(caller, revision, expected, lifecycle);
             });
         configuration_ = service;
     }

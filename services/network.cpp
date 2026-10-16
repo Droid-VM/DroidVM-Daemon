@@ -25,16 +25,40 @@ struct NetworkService::Slot {
     Clock::time_point next_recovery{};
     Clock::time_point next_refresh{};
 };
+struct NetworkService::Access {
+    ConfigurationGate::Admission admission;
+    std::shared_ptr<Slot> target;
+    Slot* operator->() const { return target.get(); }
+    Slot& operator*() const { return *target; }
+};
 NetworkService::NetworkService(NetworkConfigService& configs, Factory factory, Now now)
     : configs_(configs), factory_(std::move(factory)), now_(std::move(now)) {
     if (!factory_ || !now_) throw std::invalid_argument("network lifecycle dependencies missing");
 }
 NetworkService::~NetworkService() { try { shutdown(); } catch (...) {} }
-std::shared_ptr<NetworkService::Slot> NetworkService::slot(const CallContext& caller, const std::string& id) {
+NetworkService::Access NetworkService::slot(const CallContext& caller, const std::string& id) {
+    auto admission = ConfigurationGate::enter(configs_.gate_);
     const auto canonical = config::uuid(configs_.get(caller, id)); // authorization + existence
     std::lock_guard lock(mutex_);
     auto& result = slots_[canonical];
     if (!result) { result = std::make_shared<Slot>(); result->view.id = canonical; }
+    return {std::move(admission), result};
+}
+std::shared_ptr<NetworkService::Slot> NetworkService::cleanup_slot(const CallContext& caller, const std::string& id) {
+    if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
+    if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    Json::Value value; value["id"] = id;
+    std::string canonical;
+    try { canonical = config::uuid(value); }
+    catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid network ID"); }
+    // Stop/detach may reduce existing resources even while durable recovery is
+    // pending. They never prepare a configuration lease or create a backend.
+    std::lock_guard lock(mutex_);
+    auto found = slots_.find(canonical);
+    if (found != slots_.end()) return found->second;
+    if (!configs_.state()->ids.contains(canonical)) throw ServiceError(ErrorCode::not_found, "Network not found");
+    auto result = std::make_shared<Slot>(); result->view.id = canonical;
+    slots_.emplace(canonical, result);
     return result;
 }
 NetworkView NetworkService::view(Slot& slot) { std::lock_guard lock(slot.observation); return slot.view; }
@@ -97,18 +121,34 @@ NetworkView NetworkService::start_impl(const CallContext& caller, const std::str
     return view(*target);
 }
 NetworkView NetworkService::stop(const CallContext& caller, const std::string& id) {
-    auto target = slot(caller, id);
+    auto target = cleanup_slot(caller, id);
     if (in_use_) if (const auto vm = in_use_(view(*target).id); !vm.empty())
         throw ServiceError(ErrorCode::conflict, "Network is in use by running VM " + vm);
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
-    state(*target, NetworkState::stopping, false);
-    try { cleanup(*target); state(*target, NetworkState::stopped, false); }
-    catch (const std::exception& error) {
-        state(*target, NetworkState::failed, false, error.what());
-        throw ServiceError(ErrorCode::io_error, view(*target).error);
-    }
+    stop_slot(*target);
     return view(*target);
+}
+void NetworkService::stop_slot(Slot& target) {
+    state(target, NetworkState::stopping, false);
+    try { cleanup(target); state(target, NetworkState::stopped, false); }
+    catch (const std::exception& error) {
+        state(target, NetworkState::failed, false, error.what());
+        throw ServiceError(ErrorCode::io_error, view(target).error);
+    }
+}
+void NetworkService::stop_for_delete(const std::string& id) {
+    std::shared_ptr<Slot> target;
+    {
+        std::lock_guard lock(mutex_);
+        if (shutting_down_) throw ServiceError(ErrorCode::unavailable, "Network service is shutting down");
+        auto found = slots_.find(id);
+        if (found == slots_.end()) return;
+        target = found->second;
+    }
+    std::unique_lock operation(target->operation, std::try_to_lock);
+    if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
+    stop_slot(*target);
 }
 NetworkView NetworkService::reconcile(const CallContext& caller, const std::string& id) {
     auto target = slot(caller, id);
@@ -183,7 +223,7 @@ void NetworkService::attach_nic(const CallContext& caller, const std::string& id
     target->backend->attach(nic, tap);
 }
 void NetworkService::detach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap) {
-    auto target = slot(caller, id);
+    auto target = cleanup_slot(caller, id);
     std::lock_guard operation(target->operation);
     if (target->backend) target->backend->detach(nic, tap);
 }

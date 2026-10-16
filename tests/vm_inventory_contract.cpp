@@ -284,6 +284,117 @@ void replacement_and_failure() {
     check(!service.exists(admin, id) && !replacement->start() && fixture.starts == 2, "removed reference cannot restart");
     check(!service.remove(admin, id), "unknown deletion retains legacy false result");
 }
+struct DeleteBackendState {
+    bool running = false, fail_stop = false;
+    int stops = 0, detaches = 0;
+    std::function<void()> on_stop, on_manual;
+};
+class DeleteBackend final : public network::Backend {
+public:
+    explicit DeleteBackend(DeleteBackendState& state) : state_(state) {}
+    void start(const Json::Value&) override { state_.running = true; }
+    bool healthy() const override { return state_.running; }
+    void recover(const Json::Value& value) override { start(value); }
+    void stop() override {
+        ++state_.stops;
+        if (state_.on_stop) state_.on_stop();
+        if (state_.fail_stop) throw std::runtime_error("cleanup incomplete");
+        state_.running = false;
+    }
+    bool manual_address(const std::string&, bool) override { if (state_.on_manual) state_.on_manual(); return true; }
+    void detach(const Json::Value&, const std::string&) override { ++state_.detaches; }
+private:
+    DeleteBackendState& state_;
+};
+void coordinated_delete_auto_stop() {
+    for (int mode = 0; mode < 3; ++mode) {
+        Fixture fixture;
+        bool fail_commit = mode == 2;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail_commit && std::string_view(stage) == "before_decision") throw std::runtime_error("staging failed");
+        });
+        auto input = seed_deletion(c);
+        input.network["bridge_type"] = "gvisor";
+        c.service.networks().update(admin, input.network);
+        DeleteBackendState state; state.fail_stop = mode == 1;
+        NetworkService runtime(c.service.networks(), [&](const Json::Value&) { return std::make_unique<DeleteBackend>(state); });
+        const auto id = input.network["id"].asString();
+        check(runtime.start(admin, id).state == NetworkState::running, "start isolated deletion backend");
+        input.network = c.service.networks().get(admin, id);
+        state.on_stop = [&] {
+            error(ErrorCode::unavailable, [&] { runtime.start(admin, id); });
+            error(ErrorCode::unavailable, [&] { c.service.networks().get(admin, id); });
+        };
+        error(ErrorCode::conflict, [&] { c.service.remove_network(admin, "stale", input.network, &runtime); });
+        {
+            auto lease = c.inventory.runtime(admin, input.vm_id)->try_edit();
+            error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, input.network, &runtime); });
+        }
+        check(state.stops == 0, "confirmation and VM lease rejection precede backend stop");
+        if (mode) {
+            error(ErrorCode::io_error, [&] { c.service.remove_network(admin, input.baseline->revision, input.network, &runtime); });
+            check(c.service.vms().snapshot(admin)->revision == input.baseline->revision && c.service.networks().get(admin, id) == input.network,
+                "stop/staging failure retains both configurations");
+            if (mode == 1) {
+                check(runtime.get(admin, id).state == NetworkState::failed, "failed cleanup remains observable");
+                error(ErrorCode::conflict, [&] { c.service.networks().update(admin, input.network); });
+            } else check(runtime.get(admin, id).state == NetworkState::stopped, "pre-decision failure may leave network safely stopped");
+            state.fail_stop = false; fail_commit = false;
+        }
+        const auto saved = c.service.remove_network(admin, input.baseline->revision, input.network, &runtime);
+        check(!state.running && saved->document["vms"][0]["networks"].size() == 1 && !c.service.networks().exists(admin, id),
+            "automatic stop precedes atomic network and NIC removal");
+        check(state.stops == (mode == 1 ? 2 : 1), "cleanup is not replayed after successful stop");
+        state.on_stop = {}; // Shutdown does not use transaction callbacks.
+    }
+}
+void coordinated_delete_drains_network_operation() {
+    Fixture fixture;
+    Coordinated c(fixture);
+    auto input = seed_deletion(c); input.network["bridge_type"] = "gvisor";
+    c.service.networks().update(admin, input.network);
+    DeleteBackendState state;
+    NetworkService runtime(c.service.networks(), [&](const Json::Value&) { return std::make_unique<DeleteBackend>(state); });
+    const auto id = input.network["id"].asString(); runtime.start(admin, id);
+    input.network = c.service.networks().get(admin, id);
+    Gate entered, release;
+    state.on_manual = [&] { entered.release(); release.wait(); };
+    auto manual = std::async(std::launch::async, [&] { return runtime.manual(admin, id, true, "test", true); });
+    entered.wait();
+    std::atomic<bool> deleted{false};
+    auto deletion = std::async(std::launch::async, [&] {
+        c.service.remove_network(admin, input.baseline->revision, input.network, &runtime); deleted = true;
+    });
+    bool draining = false;
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (!draining && std::chrono::steady_clock::now() < deadline) {
+        try { auto admitted = ConfigurationGate::enter(c.gate); }
+        catch (const ServiceError& error) { draining = error.code() == ErrorCode::unavailable; }
+        std::this_thread::yield();
+    }
+    const bool premature = deleted.load();
+    release.release();
+    check(manual.get(), "in-flight manual operation finishes");
+    deletion.get();
+    check(draining && !premature && deleted && state.stops == 1, "delete drains entire network operation before cleanup");
+}
+void network_cleanup_during_recovery() {
+    Fixture fixture;
+    Coordinated c(fixture);
+    auto input = seed_deletion(c); input.network["bridge_type"] = "gvisor";
+    c.service.networks().update(admin, input.network);
+    DeleteBackendState state;
+    NetworkService runtime(c.service.networks(), [&](const Json::Value&) { return std::make_unique<DeleteBackend>(state); });
+    const auto id = input.network["id"].asString(); runtime.start(admin, id);
+    { auto exclusive = c.gate->transaction(); exclusive.require_recovery(); }
+    error(ErrorCode::unavailable, [&] { runtime.start(admin, id); });
+    error(ErrorCode::permission_denied, [&] { runtime.stop(owner, id); });
+    runtime.detach_nic(admin, id, {}, "test-tap");
+    check(state.detaches == 1 && runtime.stop(admin, id).state == NetworkState::stopped && state.stops == 1,
+        "pending configuration recovery does not prevent resource cleanup");
+    c.service.recover(admin);
+    check(c.service.networks().exists(admin, id), "cleanup never removes persistent configuration");
+}
 void coordinated_delete_adapter() {
     for (bool inject : {false, true}) {
         Fixture fixture;
@@ -301,7 +412,7 @@ void coordinated_delete_adapter() {
         dispatcher.set_vm_config(&c.service.vms()); // Idempotent binding must retain deletion staging.
         ClientSession session; session.caller.authorized = true;
         auto caps = dispatcher.execute(session, "capabilities", {});
-        check(caps["service_api_minor"] == 20 && caps["network_config_delete"] == "revisioned-stopped-chunks-v1"
+        check(caps["service_api_minor"] == 21 && caps["network_config_delete"] == "revisioned-stop-chunks-v1"
             && caps["configuration_recover"] == "redo-v1" && dispatcher.background("network_config_delete_commit")
             && dispatcher.background("configuration_recover"), "coordinated commands advertised and worker dispatched");
         auto assert_error = [](const Json::Value& result, const char* code) {
@@ -837,6 +948,9 @@ int main() {
         {"network_removal_atomic_inventory", network_removal_is_atomic},
         {"conditional_network_config_adapter", conditional_network_adapter},
         {"coordinated_delete_upload_adapter", coordinated_delete_adapter},
+        {"coordinated_delete_auto_stop", coordinated_delete_auto_stop},
+        {"coordinated_delete_drains_network_operation", coordinated_delete_drains_network_operation},
+        {"network_cleanup_during_recovery", network_cleanup_during_recovery},
         {"sixteen_network_removal_start_races", network_removal_races},
         {"session_overrides_failed_admission", session_overrides_and_failed_admission},
         {"invalid_session_overrides", invalid_session_overrides},

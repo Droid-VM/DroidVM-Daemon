@@ -53,7 +53,9 @@ public:
     void set_in_use(std::function<std::string(const std::string& id)> in_use) { in_use_ = std::move(in_use); }
     Json::Value shutdown(); // attempts every network, reports cleanup failures
 private:
+    friend class ConfigurationService;
     struct Slot;
+    struct Access;
     NetworkConfigService& configs_;
     Factory factory_;
     Now now_;
@@ -67,7 +69,12 @@ private:
     std::deque<std::string> autostart_;
     bool autostart_running_ = false;
     std::function<std::string(const std::string&)> in_use_;
-    std::shared_ptr<Slot> slot(const CallContext& caller, const std::string& id);
+    Access slot(const CallContext& caller, const std::string& id);
+    std::shared_ptr<Slot> cleanup_slot(const CallContext& caller, const std::string& id);
+    // Coordinator holds exclusive configuration gate and affected VM leases.
+    // Bypass public lookup/in_use callbacks, which would re-enter those locks.
+    void stop_for_delete(const std::string& id);
+    static void stop_slot(Slot& slot);
     static NetworkView view(Slot& slot);
     static void state(Slot& slot, NetworkState state, bool desired, std::string error = {});
     static void cleanup(Slot& slot);

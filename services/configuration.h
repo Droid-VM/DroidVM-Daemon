@@ -6,6 +6,7 @@
 
 namespace droidvm {
 class VmService;
+class NetworkService;
 // Construct before serving, under the daemon Instance lock. Inventory must be
 // empty; inventory, events and this service must share the SAME gate. The owner
 // keeps inventory/events alive until this coordinator is destroyed.
@@ -18,11 +19,12 @@ public:
     NetworkConfigService& networks() { return *networks_; }
     VmService& inventory() { return inventory_; }
     TaskService& events() { return events_; }
-    // Internal service primitive: target network must already be stopped and
-    // every affected VM must admit a stopped edit. No runtime stop side effects.
+    // Every affected VM must admit a stopped edit. With a matching lifecycle
+    // service, stop the network after validation/preparation and before commit.
+    // A later IO failure may leave it stopped; configuration is still atomic.
     // One exact VM revision and exact network config protect the confirmation.
     VmConfigService::Snapshot remove_network(const CallContext& caller, const std::string& vm_revision,
-        const Json::Value& expected_network);
+        const Json::Value& expected_network, NetworkService* lifecycle = nullptr);
     // Only an administrator may retry durable redo; this does not resubmit a
     // deletion against a newer baseline. Failure keeps the common gate closed.
     void recover(const CallContext& caller);

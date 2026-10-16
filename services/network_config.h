@@ -59,6 +59,7 @@ public:
     size_t inactive() const;
 private:
     friend class ConfigurationService;
+    friend class NetworkService;
     struct State {
         Json::Value document;
         std::map<std::string, Json::ArrayIndex> ids;
