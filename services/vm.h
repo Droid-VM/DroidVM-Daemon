@@ -41,6 +41,11 @@ public:
     std::unique_ptr<VmConfigService::Commit> prepare_config(const Json::Value& document);
     // The VM's runtime; not_found carries the legacy "VM not found: <id>".
     std::shared_ptr<vm::VmRuntime> runtime(const CallContext& caller, const std::string& id) const;
+    // Internal managed start. expected is a definition from a fixed persistent
+    // snapshot, never a runtime projection. No implicit rebase or file write.
+    bool start_configured(const CallContext& caller, const std::string& id,
+        const Json::Value& expected, const Json::Value& overrides = Json::Value(),
+        std::optional<std::string> boot_entry = {});
     void stop_all(); // stopAll: refuses further starts
     // VMInstanceStore.autoUpAsync: starts auto_up VMs in store order on a thread of its own.
     void auto_up_async();

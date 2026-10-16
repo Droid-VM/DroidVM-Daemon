@@ -190,6 +190,39 @@ void lifecycle_races(bool removing) {
 }
 void modify_races() { lifecycle_races(false); }
 void remove_races() { lifecycle_races(true); }
+void configured_start_binding() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    const auto initial = config("configured-start");
+    const auto id = initial["id"].asString();
+    error(ErrorCode::unauthenticated, [&] { inventory.start_configured({}, id, initial); });
+    error(ErrorCode::permission_denied, [&] { inventory.start_configured({"reader", true, true, false}, id, initial); });
+    error(ErrorCode::unavailable, [&] { inventory.start_configured(admin, id, initial); });
+    VmConfigService store(directory.get(), getuid(), {}, [&](const Json::Value& doc) { return inventory.prepare_config(doc); });
+    auto view = store.snapshot(admin);
+    auto document = view->document;
+    document["vms"].append(initial);
+    view = store.replace(admin, view->revision, document);
+    const auto definition = view->document["vms"][0];
+    Json::Value overrides; overrides["pseudo_unprotected"] = true;
+    check(!inventory.start_configured(admin, id, definition, overrides) && fixture.starts == 1, "matching definition reaches protected start admission");
+    check(store.snapshot(admin) == view && inventory.runtime(admin, id)->config() == definition, "session start failure writes neither persistent view nor runtime baseline");
+    Json::Value invalid; invalid["name"] = "overwrite";
+    error(ErrorCode::invalid_argument, [&] { inventory.start_configured(admin, id, definition, invalid); });
+    auto changed = view->document;
+    changed["vms"][0]["name"] = "edited";
+    view = store.replace(admin, view->revision, changed);
+    error(ErrorCode::conflict, [&] { inventory.start_configured(admin, id, definition, overrides); });
+    check(fixture.starts == 1, "stale definition rejected before runtime admission");
+    const auto updated = view->document["vms"][0];
+    changed = view->document; changed["extension"] = "unrelated";
+    view = store.replace(admin, view->revision, changed);
+    check(!inventory.start_configured(admin, id, updated) && fixture.starts == 2, "unrelated root edit does not change target definition");
+    changed = view->document; changed["vms"].clear();
+    store.replace(admin, view->revision, changed);
+    error(ErrorCode::not_found, [&] { inventory.start_configured(admin, id, updated); });
+}
 void persistent_inventory_commit() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -387,6 +420,7 @@ int main() {
         {"lease_abort_move_lifetime", lease_abort_and_lifetime},
         {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
         {"persistent_inventory_commit", persistent_inventory_commit},
+        {"configured_start_binding", configured_start_binding},
         {"persistent_busy_and_unchanged", persistent_busy_and_unchanged},
         {"persistent_publication_and_writers", persistent_publication_and_writers},
         {"revisioned_batch_adapter", revisioned_batch_adapter}});

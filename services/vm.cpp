@@ -187,6 +187,25 @@ std::shared_ptr<vm::VmRuntime> VmService::runtime(const CallContext& caller, con
     if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
     return entry->vm;
 }
+bool VmService::start_configured(const CallContext& caller, const std::string& id,
+        const Json::Value& expected, const Json::Value& overrides, std::optional<std::string> boot_entry) {
+    access(caller);
+    std::shared_ptr<vm::VmRuntime> target;
+    {
+        std::lock_guard lock(mutex_);
+        if (!config_managed_) throw ServiceError(ErrorCode::unavailable, "Persistent VM configuration is not attached");
+        const auto* entry = find(id);
+        if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
+        if (entry->definition != expected)
+            throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
+        target = entry->vm;
+    }
+    // Never hold inventory across lifecycle/network callbacks. If a writer won
+    // after the comparison, its stopped lease retires target and start refuses.
+    // If start wins, the writer cannot acquire the stopped lease and must fail.
+    try { return target->start(std::move(boot_entry), overrides); }
+    catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::invalid_argument, error.what()); }
+}
 std::string VmService::create(const CallContext& caller, Json::Value value) {
     access(caller);
     auto config = config::migrate_vm(std::move(value));
