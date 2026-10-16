@@ -251,6 +251,14 @@ bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& 
     return false;
 }
 bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
+    // Covers stale runtime references and automatic relaunch as well as the
+    // configured-start adapter. Keep admission through NIC setup and STARTING.
+    std::optional<ConfigurationGate::Admission> admission;
+    try { admission.emplace(ConfigurationGate::enter(context_.configuration_gate)); }
+    catch (const ServiceError& error) {
+        if (error.code() == ErrorCode::unavailable) return false;
+        throw;
+    }
     if (retired_ || context_.shutting_down()) return false;
     {
         std::unique_lock state(state_mutex_);

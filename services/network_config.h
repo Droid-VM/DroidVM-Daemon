@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "context.h"
+#include "config_gate.h"
 #include "store/json_file.h"
 #include <map>
 #include <memory>
@@ -33,7 +34,7 @@ public:
     // Two full-sized documents (observed/replacement) plus operation envelopes.
     static constexpr size_t max_import_bytes = 2 * config::JsonFile::max_bytes + (1u << 20);
     explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {},
-        TaskService* events = nullptr, bool claim_ownership = false);
+        TaskService* events = nullptr, bool claim_ownership = false, std::shared_ptr<ConfigurationGate> gate = {});
     bool has_events() const { return events_ != nullptr; }
     Json::Value list(const CallContext& caller) const;
     Json::Value get(const CallContext& caller, const std::string& id) const;
@@ -67,6 +68,7 @@ private:
     };
     config::JsonFile file_;
     TaskService* events_;
+    std::shared_ptr<ConfigurationGate> gate_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     std::shared_ptr<const State> state_;

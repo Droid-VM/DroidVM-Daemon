@@ -7,6 +7,7 @@
 #include "vm/usb_acm.h"
 #include "network/switch_runtime.h"
 #include "runtime/child.h"
+#include "services/config_gate.h"
 #include <json/json.h>
 #include <atomic>
 #include <condition_variable>
@@ -23,6 +24,7 @@ namespace droidvm::vm {
 enum class State { stopped, starting, running, suspended, stopping, rebooting };
 const char* state_name(State state); // VMState.name()
 struct RuntimeContext {
+    std::shared_ptr<ConfigurationGate> configuration_gate;
     network::SwitchRuntime* identities = nullptr; // recoverable VM process identities
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;

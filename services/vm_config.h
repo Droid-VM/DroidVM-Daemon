@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "context.h"
+#include "config_gate.h"
 #include "store/json_file.h"
 #include <memory>
 #include <functional>
@@ -36,7 +37,8 @@ public:
     using Prepare = std::function<std::unique_ptr<Commit>(const Json::Value&)>;
     using Snapshot = std::shared_ptr<const VmConfigSnapshot>;
     static constexpr size_t max_bytes = 16u << 20;
-    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, Prepare prepare = {}, TaskService* events = nullptr);
+    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, Prepare prepare = {}, TaskService* events = nullptr,
+        std::shared_ptr<ConfigurationGate> gate = {});
     bool has_events() const { return events_ != nullptr; }
     Snapshot snapshot(const CallContext& caller) const;
     // Replace the COMPLETE document obtained from snapshot, preserving opaque
@@ -55,6 +57,7 @@ private:
     Snapshot state_;
     Prepare prepare_;
     TaskService* events_;
+    std::shared_ptr<ConfigurationGate> gate_;
     Snapshot state() const;
     void publish(Snapshot next);
     static Json::Value normalize(Json::Value document);

@@ -107,8 +107,9 @@ std::shared_ptr<NetworkConfigService::State> NetworkConfigService::decode(Json::
     result->recovered = recovered;
     return result;
 }
-NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, TaskService* events, bool claim_ownership)
-    : file_(directory, "networks.json", owner, std::move(observer)), events_(events), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
+NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, TaskService* events, bool claim_ownership,
+        std::shared_ptr<ConfigurationGate> gate)
+    : file_(directory, "networks.json", owner, std::move(observer)), events_(events), gate_(std::move(gate)), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
     // Opt-in until every legacy writer and upgrade path has migrated.
     if (claim_ownership) config::claim_network_config(directory, owner);
     auto loaded = file_.load();
@@ -124,10 +125,11 @@ std::shared_ptr<const NetworkConfigService::State> NetworkConfigService::state()
     std::lock_guard guard(state_mutex_);
     return state_;
 }
-bool NetworkConfigService::recovered() const { return state()->recovered; }
-size_t NetworkConfigService::inactive() const { return state()->inactive; }
+bool NetworkConfigService::recovered() const { auto admission = ConfigurationGate::enter(gate_); return state()->recovered; }
+size_t NetworkConfigService::inactive() const { auto admission = ConfigurationGate::enter(gate_); return state()->inactive; }
 Json::Value NetworkConfigService::list(const CallContext& caller) const {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     auto current = state();
     Json::Value result(Json::arrayValue);
     // Preserve stored order, not map/UUID order.
@@ -138,6 +140,7 @@ Json::Value NetworkConfigService::list(const CallContext& caller) const {
 }
 Json::Value NetworkConfigService::get(const CallContext& caller, const std::string& id) const {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     auto current = state();
     auto found = current->ids.find(identity(id));
     if (found == current->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
@@ -145,6 +148,7 @@ Json::Value NetworkConfigService::get(const CallContext& caller, const std::stri
 }
 bool NetworkConfigService::exists(const CallContext& caller, const std::string& id) const {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     try { return state()->ids.contains(identity(id)); }
     catch (const ServiceError& error) { if (error.code() == ErrorCode::invalid_argument) return false; throw; }
 }
@@ -157,6 +161,7 @@ std::string NetworkConfigService::update_if_matches(const CallContext& caller, c
 }
 bool NetworkConfigService::remove(const CallContext& caller, const std::string& input_id) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     const auto id = identity(input_id);
     std::lock_guard writer(writer_mutex_);
     const auto previous = state();
@@ -172,6 +177,7 @@ bool NetworkConfigService::remove(const CallContext& caller, const std::string& 
 }
 Json::Value NetworkConfigService::merge_if_matches(const CallContext& caller, const Json::Value& operations) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     if (!operations.isArray() || operations.size() > 1024)
         throw ServiceError(ErrorCode::invalid_argument, "Invalid network import operations");
     try { config::encode_json(operations, max_import_bytes); }
@@ -244,6 +250,7 @@ void NetworkConfigService::require_stopped(const std::string& id) const {
 std::unique_ptr<NetworkRuntimeLease> NetworkConfigService::prepare_runtime(const CallContext& caller,
         const std::string& input_id, const std::set<uint32_t>& occupied_tables) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     const auto id = identity(input_id);
     std::lock_guard writer(writer_mutex_);
     require_stopped(id);
@@ -306,6 +313,7 @@ std::unique_ptr<NetworkRuntimeLease> NetworkConfigService::prepare_runtime(const
 }
 std::string NetworkConfigService::change(const CallContext& caller, Json::Value value, bool updating, const Json::Value* expected) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     std::string id;
     try {
         if (!value.isObject() || config::schema(value) != 2) throw std::invalid_argument("Unsupported network config schema (expected 2)");

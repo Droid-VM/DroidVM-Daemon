@@ -265,7 +265,8 @@ struct TaskService::Impl {
         for (auto& worker : workers) if (worker.joinable()) worker.join();
     }
 };
-TaskService::TaskService(TaskLimits limits, Now now, EventLimits event_limits) : impl_(std::make_unique<Impl>(limits, std::move(now), event_limits)) {}
+TaskService::TaskService(TaskLimits limits, Now now, EventLimits event_limits, std::shared_ptr<ConfigurationGate> config_gate)
+    : impl_(std::make_unique<Impl>(limits, std::move(now), event_limits)), config_gate_(std::move(config_gate)) {}
 TaskService::~TaskService() { impl_->shutdown(); }
 void TaskService::shutdown() { impl_->shutdown(); }
 const std::string& TaskService::epoch() const { return impl_->shared->epoch; }
@@ -364,6 +365,7 @@ void TaskService::publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snap
 SnapshotPage TaskService::vm_config_snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);
     if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto admission = ConfigurationGate::enter(config_gate_);
     auto& shared = *impl_->shared;
     std::lock_guard lock(shared.mutex);
     if (!shared.vm_config) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");
@@ -389,6 +391,7 @@ void TaskService::publish_network_config(std::shared_ptr<const Json::Value> rows
 SnapshotPage TaskService::network_config_document(const CallContext& caller, size_t max_bytes) {
     require_access(caller);
     if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto admission = ConfigurationGate::enter(config_gate_);
     auto& shared = *impl_->shared;
     std::lock_guard lock(shared.mutex);
     if (!shared.network_config) throw ServiceError(ErrorCode::unavailable, "Network configuration view unavailable");
@@ -408,6 +411,7 @@ SnapshotPage TaskService::network_config_document(const CallContext& caller, siz
 SnapshotPage TaskService::network_config_snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);
     if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto admission = ConfigurationGate::enter(config_gate_);
     auto& shared = *impl_->shared;
     std::lock_guard lock(shared.mutex);
     if (!shared.network_config) throw ServiceError(ErrorCode::unavailable, "Network configuration view unavailable");

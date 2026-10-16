@@ -50,8 +50,9 @@ Json::Value VmConfigService::normalize(Json::Value document) {
     try { return wire::parse(config::encode_json(document, max_bytes)); }
     catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "VM configuration storage limit exceeded"); }
 }
-VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare, TaskService* events)
-    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)), events_(events) {
+VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare, TaskService* events,
+        std::shared_ptr<ConfigurationGate> gate)
+    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)), events_(events), gate_(std::move(gate)) {
     config::claim_vm_config(directory, owner);
     auto loaded = file_.load();
     auto initial = std::make_shared<VmConfigSnapshot>();
@@ -76,11 +77,13 @@ void VmConfigService::publish(Snapshot next) {
 }
 VmConfigService::Snapshot VmConfigService::snapshot(const CallContext& caller) const {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     return state();
 }
 VmConfigService::Snapshot VmConfigService::apply(const CallContext& caller,
         const std::string& expected_revision, const Json::Value& operations) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     if (expected_revision.empty() || expected_revision.size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Missing or invalid VM configuration revision");
     const auto previous = state();
@@ -138,6 +141,7 @@ VmConfigService::Snapshot VmConfigService::apply(const CallContext& caller,
 VmConfigService::Snapshot VmConfigService::replace(const CallContext& caller,
         const std::string& expected_revision, Json::Value document) {
     access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
     if (expected_revision.empty() || expected_revision.size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Missing or invalid VM configuration revision");
     // Check again after normalization: another writer may have committed while

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "context.h"
+#include "config_gate.h"
 #include "events.h"
 #include <json/json.h>
 #include <chrono>
@@ -83,7 +84,8 @@ public:
     using Now = std::function<Clock::time_point()>;
     using Work = std::function<TaskCompletion(TaskControl&)>;
     using Discarded = std::function<void(const TaskRef&)>;
-    explicit TaskService(TaskLimits limits = {}, Now now = [] { return Clock::now(); }, EventLimits event_limits = {});
+    explicit TaskService(TaskLimits limits = {}, Now now = [] { return Clock::now(); }, EventLimits event_limits = {},
+        std::shared_ptr<ConfigurationGate> config_gate = {});
     ~TaskService();
     TaskService(const TaskService&) = delete;
     TaskService& operator=(const TaskService&) = delete;
@@ -118,5 +120,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::shared_ptr<ConfigurationGate> config_gate_;
 };
 }

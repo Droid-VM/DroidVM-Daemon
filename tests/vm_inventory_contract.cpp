@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
+#include "config_gate_contract.h"
 #include "common/identity.h"
 #include "services/vm.h"
 #include "transport/dispatcher.h"
@@ -37,6 +38,61 @@ Json::Value config(const std::string& name) {
     Json::Value value;
     value["id"] = random_id(true); value["name"] = name;
     return value;
+}
+void configuration_gate_domains_and_recovery() {
+    Fixture fixture;
+    auto gate = std::make_shared<ConfigurationGate>();
+    fixture.context.configuration_gate = gate;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    VmService inventory(fixture.context);
+    VmConfigService vms(directory.get(), getuid(), {},
+        [&](const Json::Value& document) { return inventory.prepare_config(document); }, &tasks, gate);
+    NetworkConfigService networks(directory.get(), getuid(), {}, &tasks, true, gate);
+    auto network = config("network"); network["schema"] = 2; network["bridge_name"] = "brtest";
+    const auto network_id = networks.create(admin, network);
+    auto document = vms.snapshot(admin)->document;
+    auto row = config("vm"); const auto id = row["id"].asString();
+    document["vms"].append(row);
+    const auto saved = vms.replace(admin, vms.snapshot(admin)->revision, document);
+    auto runtime = inventory.runtime(admin, id);
+    runtime->log("stdio")->append("must survive rejected start\n");
+    auto old_view = tasks.vm_config_snapshot(admin);
+    auto refused = [&] {
+        error(ErrorCode::unavailable, [&] { vms.snapshot(admin); });
+        error(ErrorCode::unavailable, [&] { vms.replace(admin, saved->revision, document); });
+        error(ErrorCode::unavailable, [&] { vms.apply(admin, saved->revision, Json::Value(Json::arrayValue)); });
+        error(ErrorCode::unavailable, [&] { networks.list(admin); });
+        error(ErrorCode::unavailable, [&] { networks.get(admin, network_id); });
+        error(ErrorCode::unavailable, [&] { networks.exists(admin, network_id); });
+        error(ErrorCode::unavailable, [&] { networks.create(admin, network); });
+        error(ErrorCode::unavailable, [&] { networks.update(admin, network); });
+        error(ErrorCode::unavailable, [&] { networks.remove(admin, network_id); });
+        error(ErrorCode::unavailable, [&] { networks.merge_if_matches(admin, Json::Value(Json::arrayValue)); });
+        error(ErrorCode::unavailable, [&] { networks.prepare_runtime(admin, network_id); });
+        error(ErrorCode::unavailable, [&] { tasks.vm_config_snapshot(admin); });
+        error(ErrorCode::unavailable, [&] { tasks.network_config_snapshot(admin); });
+        error(ErrorCode::unavailable, [&] { tasks.network_config_document(admin); });
+        check(!runtime->start({}, {}, true) && fixture.starts == 0, "stale runtime cannot bypass configuration gate");
+        check(!runtime->log("stdio")->contents().empty(), "rejected start does not clear logs");
+        check(runtime->state() == VmState::stopped, "runtime inspection remains available for cleanup");
+        check(tasks.snapshot_page(admin, old_view.id, 0).id == old_view.id, "previous fixed view remains readable");
+    };
+    {
+        auto transaction = gate->transaction();
+        refused();
+        transaction.require_recovery();
+    }
+    refused(); // Releasing exclusivity cannot clear a persistent recovery fault.
+    {
+        auto recovery = gate->transaction();
+        recovery.recovered();
+        refused(); // Successful recovery still hides publication until exit.
+    }
+    check(vms.snapshot(admin)->revision == saved->revision && networks.get(admin, network_id) == network,
+        "gate alone never changes configuration");
+    check(!runtime->start() && fixture.starts == 1, "recovered runtime reaches normal admission");
+    tasks.release_snapshot(admin, old_view.id);
 }
 void replacement_and_failure() {
     Fixture fixture;
@@ -546,6 +602,8 @@ void revisioned_batch_adapter() {
 }
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
+        {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
+        {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
         {"network_removal_atomic_inventory", network_removal_is_atomic},
         {"conditional_network_config_adapter", conditional_network_adapter},
         {"sixteen_network_removal_start_races", network_removal_races},
