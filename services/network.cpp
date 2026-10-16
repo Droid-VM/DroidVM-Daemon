@@ -16,7 +16,8 @@ const char* network_state_name(NetworkState state) {
     return "FAILED";
 }
 struct NetworkService::Slot {
-    std::mutex operation, observation;
+    std::timed_mutex operation; // info/PD calls wait briefly behind a refresh
+    std::mutex observation;
     NetworkView view;
     std::unique_ptr<NetworkRuntimeLease> lease;
     std::unique_ptr<network::Forwarding::Lease> forwarding;
@@ -191,6 +192,19 @@ Json::Value NetworkService::forward_failures(const CallContext& caller, const st
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock() || !target->backend) return Json::Value(Json::objectValue);
     return target->backend->forward_failures();
+}
+Json::Value NetworkService::live(const CallContext& caller, const std::string& id) {
+    Json::Value data(Json::objectValue);
+    auto target = slot(caller, id);
+    std::unique_lock operation(target->operation, std::chrono::seconds(2));
+    if (!operation.owns_lock() || !target->backend || view(*target).state != NetworkState::running) return data;
+    target->backend->live_details(data);
+    return data;
+}
+bool NetworkService::pd_action(const CallContext& caller, const std::string& id, int vlan, bool release) {
+    auto target = slot(caller, id);
+    std::unique_lock operation(target->operation, std::chrono::seconds(5));
+    return operation.owns_lock() && target->backend && target->backend->pd_action(vlan, release);
 }
 void NetworkService::schedule_reconcile(TaskService& workers) {
     std::string id;

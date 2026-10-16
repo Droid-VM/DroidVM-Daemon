@@ -47,6 +47,8 @@ public:
     void attach(const Json::Value& nic, const std::string& tap) override;
     void detach(const Json::Value& nic, const std::string& tap) override;
     Json::Value forward_failures() const override;
+    void live_details(Json::Value& data) const override;
+    bool pd_action(int vlan, bool release) override;
 private:
     Resources resources_;
     LinuxTopology topology_;
@@ -62,6 +64,7 @@ private:
     std::string uplink_; // resolved L2 uplink
     std::map<std::string, Json::Value> attached_; // TAP -> sanitized NIC
     std::map<std::string, std::vector<std::string>> failures_; // legacy forward_failures
+    std::map<std::string, bool> mac_security_; // TAP -> locked port active
     bool retain_taps_ = false; // recover keeps VM TAPs (crosvm holds them open)
     std::string tap_owner(const std::string& tap) const { return firewall_owner_ + "/" + tap; }
     void plug(const std::string& tap, const Json::Value& nic);

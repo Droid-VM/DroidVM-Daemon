@@ -49,6 +49,8 @@ public:
     int64_t pid() const;
     Json::Value config() const;
     void replace(Json::Value config); // stopped only (vm_modify)
+    // DeleteHandler edits the live item in place; streams are kept.
+    void set_networks(Json::Value networks) { std::lock_guard lock(state_mutex_); config_["networks"] = std::move(networks); }
     bool start(std::optional<std::string> boot_entry = {});
     bool stop();
     bool reboot();

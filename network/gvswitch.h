@@ -27,6 +27,7 @@ public:
     void attach(const Json::Value& nic, const std::string& tap) override;
     void detach(const Json::Value& nic, const std::string& tap) override;
     Json::Value forward_failures() const override;
+    void live_details(Json::Value& data) const override;
     ProcessStatus status() const { return process_.status(); }
     std::deque<ProcessLine> log() const { return process_.log(); }
     // Administrative lifecycle control uses held pidfd, never a raw PID.
@@ -44,6 +45,7 @@ private:
     std::map<std::string, Json::Value> attached_; // tap -> NIC
     std::map<std::string, std::vector<std::string>> installed_, failures_; // tap -> "vlan/id" refs, failure texts
     bool retain_taps_ = false;
+    std::string socket_; // control socket, as appendInfo gvswitch_socket
     void remove_directory();
     std::string tap_owner(const std::string& tap) const;
     ControlResponse call(HttpMethod method, const std::string& path, const Json::Value* body = nullptr) const;

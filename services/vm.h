@@ -45,6 +45,11 @@ public:
     // BridgeDhcp.buildStatics over every known VM, for each VLAN of the network.
     std::map<int, network::DhcpStatics> statics(const Json::Value& network) const;
     std::string running_vm_using(const std::string& network) const; // empty when none
+    // DeleteHandler: names of VMs not stopped that use the network, in store order.
+    std::vector<std::string> busy_vms_using(const std::string& network) const;
+    void drop_network(const std::string& network); // removes its NICs from every VM
+    // VMInstanceStore.findVMByTap: a running VM with this TAP, as {vm_id, vm_name}.
+    Json::Value vm_by_tap(const std::string& tap) const;
     size_t loaded() const { return loaded_; }
     const std::string& load_error() const { return load_error_; }
 private:

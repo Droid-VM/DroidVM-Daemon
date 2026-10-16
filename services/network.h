@@ -45,6 +45,9 @@ public:
     void attach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap);
     void detach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap);
     Json::Value forward_failures(const CallContext& caller, const std::string& id);
+    // InfoHandler's RUNNING-only lists and appendInfo; empty when busy or not running.
+    Json::Value live(const CallContext& caller, const std::string& id);
+    bool pd_action(const CallContext& caller, const std::string& id, int vlan, bool release);
     // NetworkInstance.findRunningVMUsing: a running VM's name blocks a user stop.
     void set_in_use(std::function<std::string(const std::string& id)> in_use) { in_use_ = std::move(in_use); }
     Json::Value shutdown(); // attempts every network, reports cleanup failures

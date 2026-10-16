@@ -26,6 +26,8 @@ public:
     // take_output consumption. Logs remain available through tool_log().
     PdSnapshot poll_pd(bool force = false);
     void set_statics(int vlan, DhcpStatics statics);
+    bool pd_action(int vlan, bool release); // POST .../pd/renew|release
+    bool serves(int vlan) const { return devices_.contains(vlan); }
     Json::Value tools() const;
     Json::Value tool_log() const;
     ProcessStatus process_status() const { return process_.status(); }

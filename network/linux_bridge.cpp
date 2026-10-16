@@ -6,6 +6,7 @@
 #include "services/context.h"
 #include "common/wire.h"
 #include "vm/nic.h"
+#include <algorithm>
 #include <bit>
 
 namespace droidvm::network {
@@ -166,9 +167,12 @@ void LinuxBridge::plug(const std::string& tap, const Json::Value& nic) {
     // Port flags only warn in the legacy backend.
     if (config::boolean(nic, "isolated")) try { resources_.netbox.isolated(tap, true); } catch (const std::exception&) {}
     const auto mac = config::string(nic, "mac_address");
-    if (config::boolean(nic, "mac_security") && !mac.empty()) {
-        try { resources_.netbox.locked(tap, true); resources_.netbox.fdb(tap, mac); }
-        catch (const std::exception&) { try { resources_.netbox.locked(tap, false); } catch (const std::exception&) {} }
+    if (config::boolean(nic, "mac_security")) {
+        mac_security_[tap] = false;
+        if (!mac.empty()) {
+            try { resources_.netbox.locked(tap, true); resources_.netbox.fdb(tap, mac); mac_security_[tap] = true; }
+            catch (const std::exception&) { try { resources_.netbox.locked(tap, false); } catch (const std::exception&) {} }
+        }
     }
     try { resources_.netbox.state(tap, true); } catch (const std::exception&) {}
 }
@@ -232,9 +236,157 @@ void LinuxBridge::attach(const Json::Value& nic, const std::string& tap) {
 }
 void LinuxBridge::detach(const Json::Value&, const std::string& tap) {
     if (!attached_.erase(tap)) return;
-    failures_.erase(tap);
+    failures_.erase(tap); mac_security_.erase(tap);
     if (l3_ && running_) try { publish_leases(); } catch (const std::exception&) {}
     release_tap(tap);
+}
+namespace {
+// LinuxNetwork.listAddresses: "local/prefixlen" of each row, empty on failure.
+std::vector<std::string> device_addresses(const Netbox& netbox, const std::string& device, std::optional<uint32_t> metric = {}) {
+    std::vector<std::string> result;
+    try {
+        for (const auto& row : netbox.addresses(device, metric)) {
+            if (!row.isObject()) continue;
+            const auto local = config::string(row, "local");
+            if (!local.empty()) result.push_back(local + "/" + std::to_string(config::integer(row, "prefixlen", 0)));
+        }
+    } catch (const std::exception&) {}
+    return result;
+}
+// canonAddr: config and live spellings of one address compare equal.
+std::string canonical_cidr(const std::string& cidr) {
+    try {
+        const auto slash = cidr.find('/');
+        if (slash == std::string::npos) return cidr;
+        const auto prefix = config::NetworkPrefix::parse(cidr, cidr.find(':') != std::string::npos);
+        return prefix.address() + "/" + std::to_string(prefix.prefix());
+    } catch (const std::exception&) { return cidr; }
+}
+std::vector<std::string> configured_cidrs(const Json::Value& vlan) {
+    std::vector<std::string> result;
+    auto strings = [&](const char* key) {
+        const auto& rows = config::member(vlan, key);
+        if (rows.isArray()) for (const auto& row : rows) if (row.isString() && !row.asString().empty()) result.push_back(row.asString());
+    };
+    const auto v4 = config::string(config::member(vlan, "ipv4"), "cidr");
+    if (!v4.empty()) result.push_back(v4);
+    strings("ipv4_secondary");
+    const auto v6 = config::string(config::member(vlan, "ipv6"), "cidr");
+    if (static_ipv6(vlan) && !v6.empty()) result.push_back(v6);
+    strings("ipv6_secondary");
+    return result;
+}
+}
+void LinuxBridge::live_details(Json::Value& data) const {
+    const auto& netbox = resources_.netbox;
+    const auto bridge = config::string(config_, "bridge_name");
+    const auto vlans = l3_vlans(config_);
+    auto device = [&](int vid) { return vid == 0 ? bridge : OwnedLinks::vlan_device(bridge, vid); };
+    auto vid_of = [](const Json::Value& vlan) { return static_cast<int>(config::integer(vlan, "vlan_id")); };
+    auto& addresses = data["live_addresses"] = Json::Value(Json::arrayValue);
+    for (const auto& cidr : device_addresses(netbox, bridge)) addresses.append(cidr);
+    for (const auto* vlan : vlans) if (vid_of(*vlan)) for (const auto& cidr : device_addresses(netbox, device(vid_of(*vlan)))) addresses.append(cidr);
+    // listAddressEntries: VLAN 0, configured VLANs, then on-demand VLAN bridges.
+    std::vector<int> vids{0};
+    std::map<int, std::vector<std::string>> configured;
+    for (const auto* vlan : vlans) {
+        const int vid = vid_of(*vlan);
+        if (!configured.contains(vid)) configured[vid] = configured_cidrs(*vlan);
+        if (std::find(vids.begin(), vids.end(), vid) == vids.end()) vids.push_back(vid);
+    }
+    for (const int vid : topology_.extra_vlans()) if (std::find(vids.begin(), vids.end(), vid) == vids.end()) vids.push_back(vid);
+    auto& entries = data["address_entries"] = Json::Value(Json::arrayValue);
+    for (const int vid : vids) {
+        std::vector<std::pair<std::string, std::string>> live;
+        for (const auto& raw : device_addresses(netbox, device(vid))) {
+            const auto key = canonical_cidr(raw);
+            if (std::find_if(live.begin(), live.end(), [&](const auto& row) { return row.first == key; }) == live.end()) live.emplace_back(key, raw);
+        }
+        auto take = [&](const std::string& cidr) {
+            const auto at = std::find_if(live.begin(), live.end(), [&](const auto& row) { return row.first == canonical_cidr(cidr); });
+            if (at == live.end()) return false;
+            live.erase(at); return true;
+        };
+        for (const auto& cidr : configured[vid]) { const bool bound = take(cidr); entries.append(address_entry(cidr, vid, bound, "configured")); }
+        // The PD host address is listed by its own PD entry.
+        if (const auto pd = pd_.find(vid); pd != pd_.end()) take(pd->second);
+        for (const auto& [key, raw] : live) entries.append(address_entry(raw, vid, true, "auto"));
+    }
+    if (pseudo_ && !uplink_.empty())
+        for (const auto& raw : device_addresses(netbox, uplink_, pbridge_offload_metric)) entries.append(address_entry(raw, 0, true, "pbridge_guest"));
+    // listPdStatus: one row per DHCP-PD VLAN, synthesized without a client.
+    Json::Value status;
+    if (dhcp_needed_ && dhcp_.healthy()) try { status = dhcp_.status(); } catch (const std::exception&) {}
+    std::map<int, Json::Value> clients;
+    Json::Value pd_status(Json::arrayValue);
+    const auto& ifaces = config::member(status, "ifaces");
+    if (ifaces.isArray()) for (const auto& iface : ifaces) {
+        if (!iface.isObject()) continue;
+        const auto state = config::string(iface, "pd_state");
+        if (state.empty()) continue;
+        int tag;
+        try { size_t used = 0; const auto text = config::string(iface, "tag"); tag = std::stoi(text, &used); if (used != text.size()) continue; }
+        catch (const std::exception&) { continue; }
+        Json::Value row;
+        row["vlan"] = tag; row["state"] = state; row["prefix"] = config::string(iface, "pd_prefix"); row["address"] = config::string(iface, "pd_address");
+        clients.emplace(tag, row);
+        Json::Value legacy;
+        legacy["vlan_id"] = tag; legacy["state"] = state;
+        if (!config::string(iface, "pd_prefix").empty()) legacy["prefix"] = config::string(iface, "pd_prefix");
+        pd_status.append(std::move(legacy));
+    }
+    auto& pd = data["pd"] = Json::Value(Json::arrayValue);
+    std::map<int, std::string> resolvable;
+    bool resolved = false;
+    for (const auto* vlan : vlans) {
+        if (static_ipv6(*vlan)) continue;
+        const int vid = vid_of(*vlan);
+        if (const auto at = clients.find(vid); at != clients.end()) { pd.append(at->second); continue; }
+        if (!resolved) { try { resolvable = resolve(config_); } catch (const std::exception&) {} resolved = true; }
+        Json::Value row;
+        row["vlan"] = vid; row["state"] = resolvable.contains(vid) ? "searching" : "no_uplink"; row["prefix"] = "";
+        pd.append(std::move(row));
+    }
+    auto& interfaces = data["live_interfaces"] = Json::Value(Json::arrayValue);
+    try {
+        for (const auto& row : netbox.links(bridge)) {
+            if (!row.isObject()) continue;
+            Json::Value item;
+            item["name"] = config::string(row, "ifname");
+            item["address"] = config::string(row, "address");
+            item["state"] = row.isMember("operstate") ? config::string(row, "operstate") : "UNKNOWN";
+            interfaces.append(std::move(item));
+        }
+    } catch (const std::exception&) {}
+    auto& neighbors = data["neighbors"] = Json::Value(Json::arrayValue);
+    auto add_neighbors = [&](const std::string& name) {
+        try { for (const auto& row : netbox.neighbors(name)) neighbors.append(row); } catch (const std::exception&) {}
+    };
+    add_neighbors(bridge);
+    for (const auto* vlan : vlans) if (vid_of(*vlan)) add_neighbors(device(vid_of(*vlan)));
+    auto& leases = data["dhcp_leases"] = Json::Value(Json::arrayValue);
+    if (dhcp_needed_ && dhcp_.healthy()) for (const auto* vlan : vlans) for (const bool v6 : {false, true}) {
+        try {
+            const auto response = dhcp_.leases(vid_of(*vlan), v6);
+            const auto& rows = config::member(response, "leases");
+            if (rows.isArray()) for (const auto& lease : rows) {
+                if (!lease.isObject()) continue;
+                Json::Value item;
+                item["expires"] = Json::Int64(rfc3339_seconds(config::string(lease, "expiry")));
+                item["mac"] = config::string(lease, "mac");
+                item["ip"] = config::string(lease, "ip");
+                item["hostname"] = config::string(lease, "hostname");
+                leases.append(std::move(item));
+            }
+        } catch (const std::exception&) {}
+    }
+    // appendInfo.
+    if (!pd_status.empty()) data["pd_status"] = std::move(pd_status);
+    if (!l3_ && !uplink_.empty()) data["resolved_uplink"] = uplink_;
+    if (!mac_security_.empty()) for (const auto& [tap, active] : mac_security_) data["mac_security_active"][tap] = active;
+}
+bool LinuxBridge::pd_action(int vlan, bool release) {
+    return running_ && dhcp_needed_ && dhcp_.healthy() && dhcp_.pd_action(vlan, release);
 }
 Json::Value LinuxBridge::forward_failures() const {
     Json::Value result(Json::objectValue);
@@ -252,7 +404,7 @@ void LinuxBridge::stop() {
         if (retain_taps_) { resources_.netbox.nomaster(tap); return; }
         release_tap(tap);
     });
-    if (!retain_taps_) attached_.clear();
+    if (!retain_taps_) { attached_.clear(); mac_security_.clear(); }
     // Detach a foreign uplink first: it quiesces external traffic and must
     // leave before the bridge can be released.
     if (!l3_ && !firewall_owner_.empty()) attempt([&] { resources_.ports.release(firewall_owner_); });

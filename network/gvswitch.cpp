@@ -62,6 +62,7 @@ void Gvswitch::start(const Json::Value& config) {
     const auto path = "/proc/" + std::to_string(getpid()) + "/fd/" + std::to_string(allocation_.directory.get());
     const auto token = random_id(false);
     client_ = std::make_unique<ControlHttp>(path + "/s", token);
+    socket_ = path + "/s";
     ChildOptions options;
     options.argv = {executable_, "-listen", path + "/s", "-auth-token", token, "-config", path + "/config.json"};
     if (config::boolean(config, "stp")) options.argv.push_back("-stp");
@@ -268,6 +269,63 @@ void Gvswitch::detach(const Json::Value& nic, const std::string& tap) {
         remove_forwards(tap);
     }
     if (links_) release_tap(tap);
+}
+void Gvswitch::live_details(Json::Value& data) const {
+    // Gateway addresses live inside gvswitch: every configured one is bound.
+    auto& addresses = data["live_addresses"] = Json::Value(Json::arrayValue);
+    auto& entries = data["address_entries"] = Json::Value(Json::arrayValue);
+    const auto vlans = l3_vlans(config_);
+    for (const auto* vlan : vlans) {
+        const int vid = static_cast<int>(config::integer(*vlan, "vlan_id"));
+        for (const bool v6 : {false, true}) {
+            const auto cidr = config::string(config::member(*vlan, v6 ? "ipv6" : "ipv4"), "cidr");
+            if (cidr.empty() || (v6 && !static_ipv6(*vlan))) continue;
+            try {
+                const auto prefix = config::NetworkPrefix::parse(cidr, v6);
+                const auto text = prefix.address() + "/" + std::to_string(prefix.prefix());
+                addresses.append(text);
+                entries.append(address_entry(text, vid, true, "configured"));
+            } catch (const std::exception&) {}
+        }
+    }
+    data["pd"] = Json::Value(Json::arrayValue);
+    auto get = [&](const std::string& path) {
+        try { const auto response = call(HttpMethod::get, path); if (response.success()) return wire::parse(response.body); }
+        catch (const std::exception&) {}
+        return Json::Value();
+    };
+    auto& interfaces = data["live_interfaces"] = Json::Value(Json::arrayValue);
+    for (const auto& port : get("/api/v1/ports")) {
+        if (!port.isObject()) continue;
+        Json::Value row;
+        row["name"] = config::string(port, "identifier");
+        row["state"] = config::boolean(port, "online") ? "UP" : "DOWN";
+        row["vlan"] = port.isMember("vlan") ? port["vlan"] : Json::Value();
+        interfaces.append(std::move(row));
+    }
+    auto& neighbors = data["neighbors"] = Json::Value(Json::arrayValue);
+    for (const auto& entry : get("/api/v1/fdb")) {
+        if (!entry.isObject()) continue;
+        Json::Value row;
+        row["lladdr"] = config::string(entry, "mac"); row["dev"] = config::string(entry, "port"); row["dst"] = "";
+        row["state"].append(config::boolean(entry, "static") ? "STATIC" : "LEARNED");
+        neighbors.append(std::move(row));
+    }
+    auto& leases = data["dhcp_leases"] = Json::Value(Json::arrayValue);
+    for (const auto* vlan : vlans) {
+        const int vid = static_cast<int>(config::integer(*vlan, "vlan_id"));
+        for (const char* family : {"dhcp4", "dhcp6"}) for (const auto& lease : get("/api/v1/gateways/" + std::to_string(vid) + "/" + family + "/leases")) {
+            if (!lease.isObject()) continue;
+            Json::Value row;
+            row["ip"] = config::string(lease, "ip"); row["mac"] = config::string(lease, "mac");
+            row["hostname"] = config::string(lease, "port_identifier"); row["expires"] = config::string(lease, "expires_at");
+            row["vlan"] = vid;
+            leases.append(std::move(row));
+        }
+    }
+    const auto status = process_.status();
+    data["gvswitch_exit_code"] = status.exit_code.value_or(-1);
+    data["gvswitch_socket"] = socket_;
 }
 Json::Value Gvswitch::forward_failures() const {
     Json::Value result(Json::objectValue);

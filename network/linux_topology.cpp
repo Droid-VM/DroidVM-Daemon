@@ -86,7 +86,7 @@ std::string LinuxTopology::ensure_vlan(int vid) {
     if (owner_.empty()) throw ServiceError(ErrorCode::unavailable, "Linux topology is stopped");
     const auto device = OwnedLinks::vlan_device(bridge_, vid), leg = OwnedLinks::vlan_leg(bridge_, vid);
     if (std::find(devices_.begin(), devices_.end(), device) != devices_.end()) return device;
-    links_.bridge(owner_, device); devices_.push_back(device);
+    links_.bridge(owner_, device); devices_.push_back(device); extra_vlans_.push_back(vid);
     links_.vlan(owner_, bridge_, leg, vid); devices_.push_back(leg);
     links_.require_owned(owner_, leg); links_.require_owned(owner_, device);
     netbox_.master(leg, device);
@@ -101,6 +101,6 @@ void LinuxTopology::stop() {
     if (owner_.empty()) return;
     const auto failures = links_.cleanup(owner_);
     if (!failures.empty()) throw ServiceError(ErrorCode::io_error, "Linux topology cleanup incomplete: " + wire::stringify(failures));
-    devices_.clear(); owner_.clear();
+    devices_.clear(); extra_vlans_.clear(); owner_.clear();
 }
 }

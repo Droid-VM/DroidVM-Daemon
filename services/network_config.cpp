@@ -144,6 +144,21 @@ bool NetworkConfigService::exists(const CallContext& caller, const std::string& 
 }
 std::string NetworkConfigService::create(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), false); }
 std::string NetworkConfigService::update(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), true); }
+bool NetworkConfigService::remove(const CallContext& caller, const std::string& input_id) {
+    access(caller);
+    const auto id = identity(input_id);
+    std::lock_guard writer(writer_mutex_);
+    const auto previous = state();
+    const auto found = previous->ids.find(id);
+    if (found == previous->ids.end()) return false;
+    require_stopped(id);
+    auto document = previous->document;
+    Json::Value rows(Json::arrayValue);
+    for (Json::ArrayIndex i = 0; i < document["networks"].size(); ++i) if (i != found->second) rows.append(document["networks"][i]);
+    document["networks"] = std::move(rows);
+    install(decode(std::move(document), false));
+    return true;
+}
 void NetworkConfigService::require_stopped(const std::string& id) const {
     std::lock_guard lock(runtime_->mutex);
     if (runtime_->ids.contains(id)) throw ServiceError(ErrorCode::conflict, "Network configuration is reserved by runtime");

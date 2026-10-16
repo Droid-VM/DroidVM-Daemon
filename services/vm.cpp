@@ -232,6 +232,47 @@ std::string VmService::running_vm_using(const std::string& network) const {
     }
     return {};
 }
+std::vector<std::string> VmService::busy_vms_using(const std::string& network) const {
+    std::vector<std::string> names;
+    std::lock_guard lock(mutex_);
+    for (const auto& entry : entries_) {
+        const auto config = entry.vm->config();
+        const auto& nics = config::member(config, "networks");
+        if (!nics.isArray()) continue;
+        for (const auto& nic : nics) if (config::string(nic, "network_id") == network) {
+            if (entry.vm->state() != VmState::stopped) names.push_back(config::string(config, "name"));
+            break;
+        }
+    }
+    return names;
+}
+void VmService::drop_network(const std::string& network) {
+    std::lock_guard lock(mutex_);
+    for (const auto& entry : entries_) {
+        const auto config = entry.vm->config();
+        const auto& nics = config::member(config, "networks");
+        if (!nics.isArray()) continue;
+        Json::Value kept(Json::arrayValue);
+        for (const auto& nic : nics) if (config::string(nic, "network_id") != network) kept.append(nic);
+        if (kept.size() == nics.size()) continue;
+        entry.vm->set_networks(std::move(kept));
+    }
+}
+Json::Value VmService::vm_by_tap(const std::string& tap) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& entry : entries_) {
+        if (entry.vm->state() == VmState::stopped) continue;
+        const auto config = entry.vm->config();
+        const auto& nics = config::member(config, "networks");
+        if (!nics.isArray()) continue;
+        for (const auto& nic : nics) if (config::string(nic, "tap_name") == tap) {
+            Json::Value found;
+            found["vm_id"] = entry.id; found["vm_name"] = config::string(config, "name");
+            return found;
+        }
+    }
+    return {};
+}
 void VmService::auto_up_async() {
     std::lock_guard lock(sweep_mutex_);
     if (shutting_down_->load() || sweep_.joinable()) return;

@@ -20,7 +20,10 @@ public:
     // An access VLAN missing from the config, created as an L2-only segment.
     std::string ensure_vlan(int vid);
     const std::vector<std::string>& devices() const { return devices_; }
+    const std::vector<int>& extra_vlans() const { return extra_vlans_; } // created by ensure_vlan
+    const std::string& bridge() const { return bridge_; }
 private:
+    std::vector<int> extra_vlans_;
     const Netbox& netbox_;
     OwnedLinks& links_;
     Observer observer_;

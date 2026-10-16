@@ -73,7 +73,8 @@ bool legacy_flag(const Json::Value& request, const char* key) {
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
-constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log"};
+constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log",
+    "network_delete", "network_pd_renew", "network_pd_release"};
 bool runtime_command(const std::string& command) {
     return std::find(runtime_commands.begin(), runtime_commands.end(), command) != runtime_commands.end();
 }
@@ -161,6 +162,35 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         if (runtime_ && runtime_command(command)) {
             const auto id = legacy_id(request);
             if (id.empty()) { result["message"] = "missing network_id"; return result; }
+            if (command == "network_delete") {
+                // DeleteHandler: running users first, then NICs leave every VM, then the lookup.
+                if (vms_) {
+                    const auto busy = vms_->busy_vms_using(id);
+                    if (!busy.empty()) {
+                        std::string names;
+                        for (const auto& name : busy) names += (names.empty() ? "" : ", ") + name;
+                        result["message"] = "network is in use by running VM: " + names; return result;
+                    }
+                    vms_->drop_network(id);
+                }
+                if (!networks_->exists(caller, id)) { result["message"] = "network " + id + " not found"; return result; }
+                if (runtime_->get(caller, id).state != NetworkState::stopped) {
+                    try { if (runtime_->stop(caller, id).state != NetworkState::stopped) throw ServiceError(ErrorCode::unavailable, "stop incomplete"); }
+                    catch (const ServiceError&) { result["message"] = "Failed to stop network: " + id; return result; }
+                }
+                networks_->remove(caller, id);
+                result["success"] = true; return result;
+            }
+            if (command == "network_pd_renew" || command == "network_pd_release") {
+                const auto vlan = legacy_int(request, "vlan_id", -1);
+                if (vlan < 0) { result["message"] = "missing vlan_id"; return result; }
+                if (!networks_->exists(caller, id)) { result["message"] = "network " + id + " not found"; return result; }
+                const bool release = command == "network_pd_release";
+                if (!runtime_->pd_action(caller, id, vlan, release)) {
+                    result["message"] = release ? "failed to release PD delegation" : "failed to renew PD delegation"; return result;
+                }
+                result["success"] = true; return result;
+            }
             if (!networks_->exists(caller, id)) { result["message"] = "network " + id + " not found"; return result; }
             if (command == "network_tool_log") {
                 if (!request["tool"].isString() || request["tool"].asString().empty()) { result["message"] = "missing tool"; return result; }
@@ -198,6 +228,13 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                     // BridgeBackend.appendForwardFailures: only when there are any.
                     auto failures = runtime_->forward_failures(caller, id);
                     if (!failures.empty()) row["forward_failures"] = std::move(failures);
+                    auto live = runtime_->live(caller, id);
+                    for (const auto& key : live.getMemberNames()) row[key] = live[key];
+                    if (vms_ && row["live_interfaces"].isArray())
+                        for (auto& item : row["live_interfaces"]) {
+                            const auto owner = vms_->vm_by_tap(config::string(item, "name"));
+                            if (owner.isObject()) { item["vm_id"] = owner["vm_id"]; item["vm_name"] = owner["vm_name"]; }
+                        }
                 }
                 result["data"] = std::move(row);
             }
@@ -377,7 +414,8 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["network_lifecycle_backends"].append("linux-l3"); // no L2 uplink, PD or VM ports yet
                 result["network_watchdog"] = true;
                 result["network_auto_up"] = true;
-                result["network_live_details"] = false;
+                result["network_live_details"] = true;
+                result["network_delete"] = true;
                 result["service_api_minor"] = 4;
             }
             if (host_network_) result["service_api_minor"] = 5;
@@ -388,7 +426,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["vm_runtime_backends"] = Json::Value(Json::arrayValue);
                 result["vm_runtime_backends"].append("crosvm"); // no QEMU yet
                 result["vm_auto_up"] = true;
-                result["service_api_minor"] = 7;
+                result["service_api_minor"] = 8;
             }
         }
         return result;

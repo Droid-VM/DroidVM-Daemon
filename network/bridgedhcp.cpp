@@ -132,6 +132,10 @@ void BridgeDhcp::set_statics(int vlan, DhcpStatics statics) {
         request(HttpMethod::put, path + (ipv6 ? "/statics/6" : "/statics/4"), wire::stringify(body));
     }
 }
+bool BridgeDhcp::pd_action(int vlan, bool release) {
+    try { request(HttpMethod::post, endpoint(vlan) + (release ? "/pd/release" : "/pd/renew")); return true; }
+    catch (const std::exception&) { return false; }
+}
 Json::Value BridgeDhcp::tools() const {
     Json::Value rows(Json::arrayValue), row;
     const auto status = process_.status();

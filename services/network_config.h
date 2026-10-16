@@ -35,6 +35,7 @@ public:
     bool exists(const CallContext& caller, const std::string& id) const;
     std::string create(const CallContext& caller, Json::Value value);
     std::string update(const CallContext& caller, Json::Value value);
+    bool remove(const CallContext& caller, const std::string& id); // false when unknown; conflict while reserved
     // Persist stable Linux MAC/DUID/PD table identities before returning a
     // runtime lease. occupied_tables excludes host tables from NEW allocation;
     // existing allocations still require backend ownership checks before use.
