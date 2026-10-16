@@ -30,6 +30,8 @@ private:
 // network side effects. Runtime activation/deletion will compose this service.
 class NetworkConfigService {
 public:
+    // Two full-sized documents (observed/replacement) plus operation envelopes.
+    static constexpr size_t max_import_bytes = 2 * config::JsonFile::max_bytes + (1u << 20);
     explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {},
         TaskService* events = nullptr, bool claim_ownership = false);
     bool has_events() const { return events_ != nullptr; }
@@ -42,6 +44,10 @@ public:
     // Runtime projections are not valid expectations. No implicit retry/merge
     // with a concurrently changed target; unrelated network edits are allowed.
     std::string update_if_matches(const CallContext& caller, const Json::Value& expected, Json::Value value);
+    // Internal atomic import primitive. Each operation contains config and
+    // expected (null for creation, exact observed object for replacement).
+    // No deletes; preserve all unrelated/inactive entries and root extensions.
+    Json::Value merge_if_matches(const CallContext& caller, const Json::Value& operations);
     bool remove(const CallContext& caller, const std::string& id); // false when unknown; conflict while reserved
     // Persist stable Linux MAC/DUID/PD table identities before returning a
     // runtime lease. occupied_tables excludes host tables from NEW allocation;

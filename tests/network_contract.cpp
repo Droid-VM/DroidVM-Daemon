@@ -97,6 +97,121 @@ void extension_merge_and_null() {
     check(result.isMember("extension") && result["extension"].isNull() && result["l3"]["future_section"].asBool() && !result["l3"].isMember("vlans"),
           "explicit null and removal of known fields remain distinct");
 }
+Json::Value import_edit(const Json::Value& expected, const Json::Value& value) {
+    Json::Value operation; operation["expected"] = expected; operation["config"] = value;
+    return operation;
+}
+void atomic_network_import() {
+    Temporary temp;
+    auto first = network("first"), second = network("second"), future = network("reserved");
+    first["extension"] = "keep"; future["schema"] = 99;
+    Json::Value seed; seed["root_extension"] = "keep";
+    seed["networks"].append(first); seed["networks"].append(second); seed["networks"].append(future);
+    config::JsonFile file(temp.directory.get(), "networks.json", getuid()); file.save(seed);
+    int writes = 0;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (std::string_view(stage) == "before_write") ++writes;
+    });
+    const auto a = service.get(admin, first["id"].asString()), b = service.get(admin, second["id"].asString());
+    auto changed_a = a, changed_b = b, added = network("added");
+    changed_a["name"] = "second"; changed_a.removeMember("extension"); changed_b["name"] = "first";
+    Json::Value operations(Json::arrayValue);
+    operations.append(import_edit(a, changed_a)); operations.append(import_edit(b, changed_b));
+    operations.append(import_edit({}, added));
+    auto ids = service.merge_if_matches(admin, operations);
+    check(ids.size() == 3 && writes == 1, "mixed import commits once");
+    const auto saved = file.load()->value;
+    check(saved["root_extension"] == "keep" && saved["networks"][2] == future, "root and inactive records preserved");
+    check(saved["networks"][0]["name"] == "second" && saved["networks"][0]["extension"] == "keep"
+        && saved["networks"][1]["name"] == "first" && saved["networks"][3]["id"] == added["id"],
+        "atomic name swap, extension retention, and append order");
+    error(ErrorCode::conflict, [&] { service.merge_if_matches(admin, operations); });
+    check(writes == 1 && file.load()->value == saved, "stale batch writes nothing");
+    auto reserved = network("reserved");
+    Json::Value collision(Json::arrayValue); collision.append(import_edit({}, network("valid-first")));
+    collision.append(import_edit({}, reserved));
+    error(ErrorCode::conflict, [&] { service.merge_if_matches(admin, collision); });
+    reserved["name"] = "new name"; reserved["id"] = future["id"]; collision[1] = import_edit({}, reserved);
+    error(ErrorCode::conflict, [&] { service.merge_if_matches(admin, collision); });
+    check(writes == 1 && file.load()->value == saved, "inactive name and ID conflicts abort complete batch");
+    Json::Value duplicate(Json::arrayValue);
+    duplicate.append(import_edit({}, reserved)); duplicate.append(import_edit({}, reserved));
+    error(ErrorCode::invalid_argument, [&] { service.merge_if_matches(admin, duplicate); });
+    error(ErrorCode::unauthenticated, [&] { service.merge_if_matches({}, operations); });
+    error(ErrorCode::permission_denied, [&] { service.merge_if_matches(owner, operations); });
+    check(service.merge_if_matches(admin, Json::Value(Json::arrayValue)).empty() && writes == 1, "empty import does not write");
+}
+void network_import_failure_and_busy() {
+    Temporary temp;
+    std::string fail;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fail == stage) throw std::runtime_error("injected import failure");
+    });
+    const auto id = service.create(admin, network("before"));
+    auto original = service.get(admin, id), edited = original; edited["name"] = "after";
+    auto created = network("new");
+    Json::Value operations(Json::arrayValue); operations.append(import_edit({}, created));
+    operations.append(import_edit(original, edited));
+    {
+        auto lease = service.prepare_runtime(admin, id);
+        // Runtime preparation may persist generated identities: use that exact view.
+        original = service.get(admin, id); edited = original; edited["name"] = "after";
+        operations[1] = import_edit(original, edited);
+        error(ErrorCode::conflict, [&] { service.merge_if_matches(admin, operations); });
+        check(!service.exists(admin, created["id"].asString()), "busy later target does not create earlier network");
+    }
+    fail = "before_install";
+    error(ErrorCode::io_error, [&] { service.merge_if_matches(admin, operations); });
+    check(service.get(admin, id) == original && !service.exists(admin, created["id"].asString()),
+        "pre-install failure preserves every target");
+    fail = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.merge_if_matches(admin, operations); });
+    check(service.get(admin, id)["name"] == "after" && service.exists(admin, created["id"].asString()),
+        "uncertain install publishes the entire batch");
+    fail.clear();
+    error(ErrorCode::conflict, [&] { service.merge_if_matches(admin, operations); });
+}
+void concurrent_network_imports() {
+    Temporary temp;
+    NetworkConfigService service(temp.directory.get(), getuid());
+    const auto id = service.create(admin, network("before"));
+    const auto original = service.get(admin, id);
+    std::atomic<int> committed{0}, conflicts{0}, failures{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 12; ++i) workers.emplace_back([&, i] {
+        auto edited = original; edited["name"] = "winner-" + std::to_string(i);
+        Json::Value operations(Json::arrayValue); operations.append(import_edit(original, edited));
+        operations.append(import_edit({}, network("new-" + std::to_string(i))));
+        try { service.merge_if_matches(admin, operations); ++committed; }
+        catch (const ServiceError& error) { if (error.code() == ErrorCode::conflict) ++conflicts; else ++failures; }
+        catch (...) { ++failures; }
+    });
+    for (auto& worker : workers) worker.join();
+    check(committed == 1 && conflicts == 11 && failures == 0 && service.list(admin).size() == 2,
+        "one whole batch wins; rejected imports leave no new networks");
+}
+void full_capacity_network_import() {
+    Temporary temp;
+    Json::Value document; document["networks"] = Json::Value(Json::arrayValue);
+    document["root_padding"] = "";
+    Json::Value operations(Json::arrayValue);
+    for (int i = 0; i < 32; ++i) {
+        auto original = network("n" + std::to_string(i));
+        original["payload"] = std::string(240u << 10, 'x');
+        document["networks"].append(original);
+        auto edited = original; edited["name"] = "m" + std::to_string(i);
+        operations.append(import_edit(original, edited));
+    }
+    const auto initial_size = config::encode_json(document).size();
+    document["root_padding"] = std::string(config::JsonFile::max_bytes - initial_size, 'r');
+    config::JsonFile file(temp.directory.get(), "networks.json", getuid()); file.save(document);
+    NetworkConfigService service(temp.directory.get(), getuid());
+    check(service.merge_if_matches(admin, operations).size() == 32, "full capacity import accepted");
+    const auto saved = file.load()->value;
+    check(config::encode_json(saved).size() == config::JsonFile::max_bytes
+        && saved["root_padding"] == document["root_padding"] && saved["networks"][31]["name"] == "m31",
+        "complete storage capacity and opaque root data survive one import");
+}
 void persistent_network_ownership() {
     Temporary temp;
     config::require_legacy_network_config(temp.directory.get(), getuid());
@@ -536,6 +651,10 @@ int main(int argc, char** argv) {
     return run({{"migration_opaque_identity_permissions", migration_retention_identity}, {"nested_extensions_vlan_identity_null", extension_merge_and_null},
         {"conditional_update_failures_and_runtime", conditional_updates},
         {"persistent_network_ownership", persistent_network_ownership},
+        {"atomic_network_import", atomic_network_import},
+        {"network_import_failure_and_busy", network_import_failure_and_busy},
+        {"twelve_concurrent_network_imports", concurrent_network_imports},
+        {"full_capacity_network_import", full_capacity_network_import},
         {"twelve_conditional_update_writers", conditional_update_race},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
         {"network_snapshot_replay_failure_permissions", configuration_event_handoff},

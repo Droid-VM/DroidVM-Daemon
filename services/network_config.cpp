@@ -6,6 +6,7 @@
 #include "common/identity.h"
 #include <regex>
 #include <set>
+#include <vector>
 
 namespace droidvm {
 struct NetworkRuntimeLease::Registry { std::mutex mutex; std::set<std::string> ids; };
@@ -168,6 +169,73 @@ bool NetworkConfigService::remove(const CallContext& caller, const std::string& 
     document["networks"] = std::move(rows);
     install(decode(std::move(document), false));
     return true;
+}
+Json::Value NetworkConfigService::merge_if_matches(const CallContext& caller, const Json::Value& operations) {
+    access(caller);
+    if (!operations.isArray() || operations.size() > 1024)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid network import operations");
+    try { config::encode_json(operations, max_import_bytes); }
+    catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "Network import is too large"); }
+    struct Edit { std::string id; Json::Value value; const Json::Value* expected; };
+    std::vector<Edit> edits;
+    std::set<std::string> ids;
+    for (const auto& operation : operations) {
+        if (!operation.isObject() || !operation.isMember("expected")
+            || (!operation["expected"].isNull() && !operation["expected"].isObject()))
+            throw ServiceError(ErrorCode::invalid_argument, "Network import expectation is required");
+        for (const auto& key : operation.getMemberNames())
+            if (key != "config" && key != "expected")
+                throw ServiceError(ErrorCode::invalid_argument, "Unexpected network import field");
+        auto value = operation["config"];
+        std::string id;
+        try {
+            if (!value.isObject() || config::schema(value) != 2)
+                throw std::invalid_argument("Unsupported network config schema (expected 2)");
+            id = config::uuid(value);
+            config::validate_network(value);
+        } catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::invalid_argument, error.what()); }
+        if (!ids.insert(id).second) throw ServiceError(ErrorCode::invalid_argument, "Repeated network import ID");
+        try { config::encode_json(value, 256u << 10); }
+        catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "Network configuration is too large"); }
+        edits.push_back({std::move(id), std::move(value), &operation["expected"]});
+    }
+    Json::Value changed(Json::arrayValue);
+    if (edits.empty()) return changed;
+    std::lock_guard writer(writer_mutex_);
+    const auto previous = state();
+    auto document = previous->document;
+    auto& rows = document["networks"];
+    std::vector<Json::ArrayIndex> changed_indices;
+    for (auto& edit : edits) {
+        const auto found = previous->ids.find(edit.id);
+        if (edit.expected->isNull()) {
+            if (found != previous->ids.end()) throw ServiceError(ErrorCode::conflict, "Imported network already exists");
+            // Inactive/future records reserve their IDs too.
+            for (const auto& row : rows) {
+                std::string reserved;
+                try { reserved = config::uuid(row); } catch (const std::invalid_argument&) {}
+                if (reserved == edit.id) throw ServiceError(ErrorCode::conflict, "Network ID is reserved by an inactive configuration");
+            }
+            changed_indices.push_back(rows.size());
+            rows.append(std::move(edit.value));
+        } else {
+            if (found == previous->ids.end() || previous->document["networks"][found->second] != *edit.expected)
+                throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before importing");
+            require_stopped(edit.id);
+            preserve(rows[found->second], edit.value, network_shape());
+            rows[found->second] = std::move(edit.value);
+            changed_indices.push_back(found->second);
+        }
+        changed.append(edit.id);
+    }
+    // Validate names against the final document, allowing atomic name swaps.
+    // Inactive/future entries reserve names just as in single-entry edits.
+    for (const auto index : changed_indices)
+        for (Json::ArrayIndex other = 0; other < rows.size(); ++other)
+            if (other != index && config::string(rows[index], "name") == config::string(rows[other], "name"))
+                throw ServiceError(ErrorCode::conflict, "Imported network name is already reserved");
+    install(decode(std::move(document), false));
+    return changed;
 }
 void NetworkConfigService::require_stopped(const std::string& id) const {
     std::lock_guard lock(runtime_->mutex);
