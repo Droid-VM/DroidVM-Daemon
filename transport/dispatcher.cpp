@@ -18,7 +18,7 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
                               "network_config_snapshot", "resource_snapshot_page", "resource_snapshot_release",
                               "resource_subscribe", "resource_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
-bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply"; }
+bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot"; }
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
 bool host_command(const std::string& command) {
     return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
@@ -566,6 +566,12 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["commands"].append("vm_config_apply");
                 result["vm_config_updates"] = "revisioned-batch-v1";
                 result["service_api_minor"] = 13;
+                if (vm_config_->has_events()) {
+                    result["commands"].append("vm_config_snapshot");
+                    result["vm_config_events"] = "invalidation-v1";
+                    result["vm_config_snapshot"] = "base64-json-chunks-v1";
+                    result["service_api_minor"] = 14;
+                }
             }
         }
         return result;
@@ -577,6 +583,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         result["success"] = true;
         if (command == "vm_config_status") {
             return config_status(vm_config_->snapshot(caller));
+        } else if (command == "vm_config_snapshot") {
+            if (!vm_config_->has_events()) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");
+            return snapshot_json(tasks_.vm_config_snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
         } else if (command == "vm_config_apply") {
             // Server dispatches this to the bounded worker pool. Also support
             // direct adapter callers without a second implementation.

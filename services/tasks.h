@@ -12,6 +12,7 @@
 #include <string>
 
 namespace droidvm {
+struct VmConfigSnapshot;
 enum class TaskState { queued, running, cancelling, succeeded, failed, cancelled };
 bool task_terminal(TaskState state);
 const char* task_state_name(TaskState state);
@@ -102,6 +103,8 @@ public:
     // are acquired under the journal lock. Caller serializes domain commits.
     void publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept;
     SnapshotPage network_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
+    void publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snapshot) noexcept;
+    SnapshotPage vm_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
     SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
     void release_snapshot(const CallContext& caller, const std::string& id);
     std::string subscribe(const CallContext& caller, const EventCursor& cursor);

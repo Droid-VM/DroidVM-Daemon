@@ -4,9 +4,28 @@
 #include "common/wire.h"
 #include <charconv>
 #include <limits>
+#include <algorithm>
 
 namespace droidvm {
 namespace {
+constexpr size_t document_chunk_bytes = 48u << 10;
+std::string document_chunk(const std::string& document, size_t offset) {
+    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto count = std::min(document_chunk_bytes, document.size() - offset);
+    std::string encoded;
+    encoded.reserve((count + 2) / 3 * 4);
+    for (size_t i = 0; i < count; i += 3) {
+        uint32_t value = static_cast<unsigned char>(document[offset + i]) << 16;
+        if (i + 1 < count) value |= static_cast<unsigned char>(document[offset + i + 1]) << 8;
+        if (i + 2 < count) value |= static_cast<unsigned char>(document[offset + i + 2]);
+        encoded += alphabet[(value >> 18) & 63]; encoded += alphabet[(value >> 12) & 63];
+        encoded += i + 1 < count ? alphabet[(value >> 6) & 63] : '=';
+        encoded += i + 2 < count ? alphabet[value & 63] : '=';
+    }
+    Json::Value row;
+    row["type"] = "chunk"; row["offset"] = Json::UInt64(offset); row["data"] = std::move(encoded);
+    return wire::stringify(row);
+}
 void validate_scope(const EventScope& scope) {
     if (scope.principal.empty() || scope.principal.size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Invalid event scope");
@@ -163,7 +182,27 @@ std::string EventJournal::snapshot(const EventScope& scope, std::vector<std::str
     if (bytes > limits_.snapshot_bytes - snapshot_bytes_)
         throw ServiceError(ErrorCode::resource_exhausted, "Snapshot byte capacity exhausted");
     auto id = random_id(true);
-    if (!snapshots_.emplace(id, Snapshot{scope, sequence_, now_(), std::move(items), bytes}).second)
+    if (!snapshots_.emplace(id, Snapshot{scope, sequence_, now_(), std::move(items), bytes, {}}).second)
+        throw ServiceError(ErrorCode::internal, "Snapshot ID collision");
+    snapshot_bytes_ += bytes;
+    return id;
+}
+std::string EventJournal::snapshot_document(const EventScope& scope, std::shared_ptr<const std::string> document, std::string metadata) {
+    validate_scope(scope);
+    available();
+    prune();
+    if (!document) throw ServiceError(ErrorCode::invalid_argument, "Missing snapshot document");
+    const size_t overhead = 512 + scope.principal.size() + metadata.capacity();
+    const auto limit = std::min(limits_.max_document_snapshot_bytes, limits_.snapshot_bytes);
+    if (snapshots_.size() >= limits_.snapshots || overhead > limit || document->capacity() > limit - overhead ||
+        document->capacity() + overhead > limits_.snapshot_bytes - snapshot_bytes_ ||
+        metadata.size() > limits_.max_snapshot_item_bytes ||
+        std::min(document->size(), document_chunk_bytes) * 4 / 3 + 128 > limits_.max_snapshot_item_bytes)
+        throw ServiceError(ErrorCode::resource_exhausted, "Document snapshot capacity exhausted");
+    const auto bytes = overhead + document->capacity();
+    std::vector<std::string> items; items.push_back(std::move(metadata));
+    auto id = random_id(true);
+    if (!snapshots_.emplace(id, Snapshot{scope, sequence_, now_(), std::move(items), bytes, std::move(document)}).second)
         throw ServiceError(ErrorCode::internal, "Snapshot ID collision");
     snapshot_bytes_ += bytes;
     return id;
@@ -177,19 +216,20 @@ SnapshotPage EventJournal::page(const EventScope& scope, const std::string& id, 
     if (found == snapshots_.end()) throw ServiceError(ErrorCode::snapshot_expired, "Snapshot expired or released");
     const auto& snapshot = found->second;
     same_scope(scope, snapshot.scope);
-    if (offset > snapshot.items.size()) throw ServiceError(ErrorCode::invalid_argument, "Invalid snapshot offset");
-    SnapshotPage page{id, {epoch_, snapshot.sequence}, {}, snapshot.items.size(), {}};
+    const auto total = snapshot.document ? 1 + (snapshot.document->size() + document_chunk_bytes - 1) / document_chunk_bytes : snapshot.items.size();
+    if (offset > total) throw ServiceError(ErrorCode::invalid_argument, "Invalid snapshot offset");
+    SnapshotPage page{id, {epoch_, snapshot.sequence}, {}, total, {}};
     size_t bytes = 0;
-    for (; offset < snapshot.items.size(); ++offset) {
-        const auto& item = snapshot.items[offset];
+    for (; offset < total; ++offset) {
+        auto item = snapshot.document && offset ? document_chunk(*snapshot.document, (offset - 1) * document_chunk_bytes) : snapshot.items[offset];
         if (item.size() + 64 > max_bytes - bytes) {
             if (page.items.empty()) throw ServiceError(ErrorCode::resource_exhausted, "Snapshot row exceeds page budget; increase max_bytes");
             break;
         }
-        page.items.push_back(item);
         bytes += item.size() + 64;
+        page.items.push_back(std::move(item));
     }
-    if (offset < snapshot.items.size()) page.next = offset;
+    if (offset < total) page.next = offset;
     return page;
 }
 void EventJournal::release_snapshot(const EventScope& scope, const std::string& id) {

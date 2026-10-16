@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
+#include "snapshot_document.h"
 #include "common/identity.h"
 #include "services/vm_config.h"
 #include "store/vm_config.h"
@@ -259,6 +260,67 @@ void batch_validation_and_permissions() {
     error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
     check(service.snapshot(admin) == initial && !initial->persisted, "invalid batches never initialize file");
 }
+void snapshots_events_and_failure() {
+    Temporary temp;
+    TaskService tasks;
+    std::string fail;
+    VmConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fail == stage) throw std::runtime_error("injected failure");
+    }, {}, &tasks);
+    auto page = tasks.vm_config_snapshot(admin);
+    check(page.cursor.epoch == tasks.epoch() && page.cursor.sequence == 1, "VM snapshot uses shared task epoch and sequence");
+    auto subscription = tasks.subscribe(admin, page.cursor);
+    auto hidden = tasks.subscribe(owner, page.cursor);
+    error(ErrorCode::permission_denied, [&] { tasks.vm_config_snapshot(owner); });
+    error(ErrorCode::permission_denied, [&] { tasks.snapshot_page(owner, page.id, 0); });
+    auto initial = service.snapshot(admin);
+    auto doc = document(vm("large 🌏")); doc["vms"][0]["opaque"]["text"] = std::string(150000, 'x');
+    auto saved = service.replace(admin, initial->revision, doc);
+    Json::Value header;
+    check(wire::parse(read_document(tasks, admin, page, header)) == initial->document && header["revision"] == initial->revision, "held document snapshot remains old after commit");
+    tasks.release_snapshot(admin, page.id);
+    auto events = tasks.poll(admin, subscription);
+    check(events.events.size() == 1 && wire::parse(events.events[0].encoded)["kind"] == "vm.config.invalidated", "commit emits invalidation event");
+    check(tasks.poll(owner, hidden).events.empty(), "configuration events are administrator only");
+    page = tasks.vm_config_snapshot(admin, 128u << 10);
+    check(read_document(tasks, admin, page, header) == *saved->encoded && header["revision"] == saved->revision, "multi-page document reconstructs exact persisted JSON");
+    tasks.release_snapshot(admin, page.id);
+    fail = "before_install"; doc = saved->document; doc["vms"][0]["name"] = "changed";
+    error(ErrorCode::io_error, [&] { service.replace(admin, saved->revision, doc); });
+    check(tasks.poll(admin, subscription).events.empty(), "pre-install failure publishes no event");
+    fail = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.replace(admin, saved->revision, doc); });
+    check(tasks.poll(admin, subscription).events.size() == 1, "installed failure publishes invalidation");
+    page = tasks.vm_config_snapshot(admin);
+    read_document(tasks, admin, page, header);
+    check(header["durability_uncertain"].asBool() && header["revision"] == service.snapshot(admin)->revision, "uncertain snapshot metadata follows installed version");
+    tasks.release_snapshot(admin, page.id);
+    fail.clear();
+    auto confirmed = service.replace(admin, service.snapshot(admin)->revision, doc);
+    tasks.poll(admin, subscription);
+    service.replace(admin, confirmed->revision, confirmed->document);
+    check(tasks.poll(admin, subscription).events.empty(), "durable no-op produces no invalidation");
+}
+void full_capacity_document_snapshot() {
+    Temporary temp;
+    TaskService tasks;
+    VmConfigService service(temp.directory.get(), getuid(), {}, {}, &tasks);
+    auto initial = service.snapshot(admin);
+    auto seed = document(vm("full capacity")); seed["padding"] = "";
+    auto normalized = service.replace(admin, initial->revision, seed);
+    seed = normalized->document;
+    seed["padding"] = std::string(VmConfigService::max_bytes - normalized->encoded->size(), 'x');
+    auto full = service.replace(admin, normalized->revision, seed);
+    check(full->encoded->size() == VmConfigService::max_bytes, "exact 16 MiB fixture");
+    auto page = tasks.vm_config_snapshot(admin);
+    Json::Value header;
+    check(read_document(tasks, admin, page, header) == *full->encoded, "full capacity document crosses frame boundaries losslessly");
+    error(ErrorCode::resource_exhausted, [&] { tasks.vm_config_snapshot(admin); });
+    tasks.release_snapshot(admin, page.id);
+    auto fresh = tasks.vm_config_snapshot(admin);
+    tasks.release_snapshot(admin, fresh.id);
+    error(ErrorCode::snapshot_expired, [&] { tasks.snapshot_page(admin, fresh.id, 0); });
+}
 }
 int main() {
     return run({{"migration_roundtrip_revision", migration_roundtrip_and_revision},
@@ -267,5 +329,6 @@ int main() {
         {"failure_visibility_retry", failure_visibility_and_retry},
         {"recovery_semantic_corruption", recovery_and_corruption},
         {"capacity_before_side_effects", capacity_before_side_effects},
-        {"atomic_batches", atomic_batches}, {"batch_validation_permissions", batch_validation_and_permissions}});
+        {"atomic_batches", atomic_batches}, {"batch_validation_permissions", batch_validation_and_permissions},
+        {"snapshots_events_failure", snapshots_events_and_failure}, {"full_capacity_snapshot", full_capacity_document_snapshot}});
 }

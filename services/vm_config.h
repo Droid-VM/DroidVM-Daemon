@@ -7,8 +7,10 @@
 #include <mutex>
 
 namespace droidvm {
+class TaskService;
 struct VmConfigSnapshot {
     Json::Value document;
+    std::shared_ptr<const std::string> encoded;
     // Opaque, process-local optimistic concurrency token, never a JSON number.
     // Reopening a store invalidates every previously issued token.
     std::string revision;
@@ -32,7 +34,8 @@ public:
     using Prepare = std::function<std::unique_ptr<Commit>(const Json::Value&)>;
     using Snapshot = std::shared_ptr<const VmConfigSnapshot>;
     static constexpr size_t max_bytes = 16u << 20;
-    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, Prepare prepare = {});
+    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, Prepare prepare = {}, TaskService* events = nullptr);
+    bool has_events() const { return events_ != nullptr; }
     Snapshot snapshot(const CallContext& caller) const;
     // Replace the COMPLETE document obtained from snapshot, preserving opaque
     // fields in that document. No implicit merge, stale overwrite or retry.
@@ -49,6 +52,7 @@ private:
     std::mutex writer_mutex_;
     Snapshot state_;
     Prepare prepare_;
+    TaskService* events_;
     Snapshot state() const;
     void publish(Snapshot next);
     static Json::Value normalize(Json::Value document);

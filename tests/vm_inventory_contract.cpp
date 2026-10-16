@@ -248,19 +248,25 @@ void revisioned_batch_adapter() {
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     VmService inventory(fixture.context);
     std::string fail;
+    TaskService tasks;
     VmConfigService store(directory.get(), getuid(), [&](const char* stage) {
         if (fail == stage) throw std::runtime_error("injected failure");
-    }, [&](const Json::Value& value) { return inventory.prepare_config(value); });
-    TaskService tasks;
+    }, [&](const Json::Value& value) { return inventory.prepare_config(value); }, &tasks);
     SystemService system([] { return true; }, [] { return "test"; }, "test", tasks.epoch());
     RequestDispatcher dispatcher(system, tasks);
     ClientSession session; session.caller.authorized = true;
     check(!dispatcher.execute(session, "capabilities", {}).isMember("vm_config_updates"), "unattached dispatcher never advertises configuration ownership");
     dispatcher.set_vm_config(&store);
     auto caps = dispatcher.execute(session, "capabilities", {});
-    check(caps["vm_config_updates"] == "revisioned-batch-v1" && caps["service_api_minor"] == 13, "attached dispatcher advertises batch API");
+    check(caps["vm_config_updates"] == "revisioned-batch-v1" && caps["service_api_minor"] == 14 && caps["vm_config_snapshot"] == "base64-json-chunks-v1", "attached dispatcher advertises batch and snapshot APIs");
     check(dispatcher.background("vm_config_apply") && !dispatcher.background("vm_config_status"), "disk operations use bounded worker dispatch");
     auto status = dispatcher.execute(session, "vm_config_status", {});
+    auto snapshot = dispatcher.execute(session, "vm_config_snapshot", {});
+    check(snapshot["success"].asBool() && snapshot["items"][0]["revision"] == status["revision"], "snapshot adapter returns revisioned metadata");
+    Json::Value cursor; cursor["epoch"] = snapshot["epoch"]; cursor["cursor"] = snapshot["cursor"];
+    check(dispatcher.execute(session, "resource_subscribe", cursor)["success"].asBool(), "resource stream starts at snapshot cursor");
+    ClientSession legacy; legacy.caller.authorized = true;
+    check(dispatcher.execute(legacy, "task_subscribe", cursor)["success"].asBool(), "old task subscription starts at same cursor");
     Json::Value request, create;
     request["revision"] = status["revision"];
     create["op"] = "create"; create["config"] = config("adapter"); request["operations"].append(create);
@@ -270,6 +276,11 @@ void revisioned_batch_adapter() {
     assert_error(dispatcher.execute_background({}, "vm_config_apply", {}), "UNAUTHENTICATED");
     assert_error(dispatcher.execute_background(owner, "vm_config_apply", {}), "PERMISSION_DENIED");
     auto created = dispatcher.execute_background(admin, "vm_config_apply", request);
+    auto resource_event = dispatcher.events(session), old_event = dispatcher.events(legacy);
+    check(resource_event && (*resource_event)["events"].size() == 1 && (*resource_event)["events"][0]["kind"] == "vm.config.invalidated", "resource stream carries VM invalidation");
+    check(old_event && (*old_event)["events"].empty(), "old task stream filters VM configuration events");
+    Json::Value release; release["snapshot_id"] = snapshot["snapshot_id"];
+    check(dispatcher.execute(session, "resource_snapshot_release", release)["success"].asBool(), "generic resource release accepts VM document snapshot");
     check(created["success"] == true && created["count"].asUInt() == 1 && created["revision"] != status["revision"], "batch adapter commits and returns compact metadata");
     auto id = create["config"]["id"].asString();
     auto original = inventory.runtime(admin, id);
@@ -283,6 +294,7 @@ void revisioned_batch_adapter() {
     assert_error(dispatcher.execute_background(admin, "vm_config_apply", request), "COMMIT_UNCERTAIN");
     auto uncertain = dispatcher.execute(session, "vm_config_status", {});
     check(uncertain["durability_uncertain"] == true && uncertain["revision"] != created["revision"] && inventory.get(admin, id)["name"] == "changed", "adapter exposes installed-but-uncertain revision for reread");
+    dispatcher.disconnected(session); dispatcher.disconnected(legacy);
     session.caller.authorized = false;
     assert_error(dispatcher.execute(session, "vm_config_status", {}), "UNAUTHENTICATED");
 }

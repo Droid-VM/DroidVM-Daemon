@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tasks.h"
+#include "vm_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
 #include <algorithm>
@@ -77,6 +78,7 @@ struct Shared {
     TaskService::Now now;
     std::unordered_map<std::string, std::shared_ptr<Record>> records;
     std::shared_ptr<const Json::Value> network_config;
+    std::shared_ptr<const VmConfigSnapshot> vm_config;
     std::deque<Job> queue;
     std::deque<Job> background_queue;
     size_t reserved = 0;
@@ -352,6 +354,29 @@ TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
     lock.unlock();
     if (notify_discarded) { try { notify_discarded(ref); } catch (...) {} }
     return result;
+}
+void TaskService::publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snapshot) noexcept {
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.vm_config = std::move(snapshot);
+    shared.events.publish("vm.config.invalidated", "vms", "system", Json::Value(), true);
+}
+SnapshotPage TaskService::vm_config_snapshot(const CallContext& caller, size_t max_bytes) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    if (!shared.vm_config) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");
+    const auto& view = *shared.vm_config;
+    Json::Value metadata;
+    metadata["type"] = "metadata"; metadata["encoding"] = "base64-json";
+    metadata["revision"] = view.revision; metadata["bytes"] = Json::UInt64(view.encoded->size());
+    metadata["persisted"] = view.persisted; metadata["recovered"] = view.recovered;
+    metadata["durability_uncertain"] = view.durability_uncertain;
+    const EventScope scope{caller.principal, caller.administrator};
+    auto id = shared.events.snapshot_document(scope, view.encoded, wire::stringify(metadata));
+    try { return shared.events.page(scope, id, 0, max_bytes); }
+    catch (...) { shared.events.release_snapshot(scope, id); throw; }
 }
 void TaskService::publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept {
     auto& shared = *impl_->shared;

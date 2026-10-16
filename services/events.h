@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -29,6 +30,8 @@ struct EventLimits {
     std::chrono::milliseconds snapshot_age = std::chrono::seconds(30);
     // Configuration rows can exceed an event; still fit one maximum-size page.
     size_t max_snapshot_item_bytes = (1u << 20) - 64;
+    // A full 16 MiB configuration plus metadata; charged to snapshot_bytes too.
+    size_t max_document_snapshot_bytes = 17u << 20;
 };
 struct EventItem {
     uint64_t sequence;
@@ -71,12 +74,16 @@ public:
     EventBatch poll(const EventScope& scope, const std::string& subscription, size_t max_events = 64, size_t max_bytes = 256u << 10);
     void unsubscribe(const EventScope& scope, const std::string& subscription);
     std::string snapshot(const EventScope& scope, std::vector<std::string> items);
+    // Raw immutable JSON is retained once; page encodes bounded base64 chunks.
+    // metadata is an encoded JSON row describing the revision and byte count.
+    std::string snapshot_document(const EventScope& scope, std::shared_ptr<const std::string> document, std::string metadata);
     SnapshotPage page(const EventScope& scope, const std::string& snapshot, size_t offset = 0, size_t max_bytes = 256u << 10);
     void release_snapshot(const EventScope& scope, const std::string& snapshot);
 private:
     struct CachedEvent { EventItem item; Clock::time_point created; size_t bytes; };
     struct Subscription { EventScope scope; uint64_t sequence; Clock::time_point touched; };
-    struct Snapshot { EventScope scope; uint64_t sequence; Clock::time_point created; std::vector<std::string> items; size_t bytes; };
+    struct Snapshot { EventScope scope; uint64_t sequence; Clock::time_point created; std::vector<std::string> items; size_t bytes;
+        std::shared_ptr<const std::string> document; };
     EventLimits limits_;
     Now now_;
     const std::string epoch_;

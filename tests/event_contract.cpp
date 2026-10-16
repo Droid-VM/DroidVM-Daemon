@@ -281,6 +281,32 @@ void cancellation_and_shutdown_events() {
     }
     check(cancelling && terminals[running.id] == 1 && terminals[pending.id] == 1, "shutdown emits exactly one terminal state per task");
 }
+void document_snapshot_limits_and_encoding() {
+    FakeClock clock;
+    EventLimits limits; limits.snapshots = 1;
+    EventJournal journal(limits, clock.now());
+    for (const auto& [raw, encoded] : std::vector<std::pair<std::string, std::string>>{{"f", "Zg=="}, {"fo", "Zm8="}, {"foo", "Zm9v"}, {std::string("\0\xff\x80", 3), "AP+A"}}) {
+        auto id = journal.snapshot_document(admin_scope, std::make_shared<const std::string>(raw), "{}");
+        auto page = journal.page(admin_scope, id);
+        check(page.items.size() == 2 && wire::parse(page.items[1])["data"] == encoded, "base64 known vectors including padding and high bytes");
+        error(ErrorCode::resource_exhausted, [&] { journal.snapshot(admin_scope, {}); });
+        error(ErrorCode::permission_denied, [&] { journal.release_snapshot(own_scope, id); });
+        error(ErrorCode::invalid_argument, [&] { journal.page(admin_scope, id, 3); });
+        check(journal.page(admin_scope, id, 2).items.empty(), "end-of-document offset");
+        journal.release_snapshot(admin_scope, id);
+    }
+    auto large = std::make_shared<const std::string>(100000, 'x');
+    auto id = journal.snapshot_document(admin_scope, large, "{}");
+    error(ErrorCode::resource_exhausted, [&] { journal.page(admin_scope, id, 1, 32u << 10); });
+    clock.ms = 30001;
+    error(ErrorCode::snapshot_expired, [&] { journal.page(admin_scope, id); });
+    auto ordinary = journal.snapshot(admin_scope, {});
+    journal.release_snapshot(admin_scope, ordinary);
+    limits.max_document_snapshot_bytes = 1024;
+    EventJournal tiny(limits);
+    error(ErrorCode::resource_exhausted, [&] { tiny.snapshot_document(admin_scope, large, "{}"); });
+    check(!tiny.snapshot(admin_scope, {}).empty(), "rejected document does not consume snapshot capacity");
+}
 }
 int main() {
     return run({
@@ -291,5 +317,6 @@ int main() {
         {"snapshot_larger_than_8MiB_frame", snapshot_larger_than_frame},
         {"task_snapshot_replay_live_expiration", task_handoff_and_expiration},
         {"snapshot_subscribe_64_races", concurrent_snapshot_subscription},
-        {"cancellation_shutdown_event_terminals", cancellation_and_shutdown_events}});
+        {"cancellation_shutdown_event_terminals", cancellation_and_shutdown_events},
+        {"document_snapshot_limits_encoding", document_snapshot_limits_and_encoding}});
 }

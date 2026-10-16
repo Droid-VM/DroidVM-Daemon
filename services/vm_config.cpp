@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vm_config.h"
+#include "tasks.h"
 #include "common/identity.h"
 #include "common/wire.h"
 #include "store/network_config.h"
@@ -13,6 +14,12 @@ void access(const CallContext& caller) {
     if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
     if (!caller.administrator || caller.principal.empty())
         throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+}
+std::shared_ptr<const std::string> encoded_document(const Json::Value& document) {
+    const auto encoded = config::encode_json(document, VmConfigService::max_bytes);
+    // The bounded writer reserves its full quota; do not retain that capacity
+    // for tiny documents or charge it to every fixed snapshot.
+    return std::make_shared<const std::string>(encoded.data(), encoded.size());
 }
 }
 Json::Value VmConfigService::normalize(Json::Value document) {
@@ -42,18 +49,19 @@ Json::Value VmConfigService::normalize(Json::Value document) {
     try { return wire::parse(config::encode_json(document, max_bytes)); }
     catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "VM configuration storage limit exceeded"); }
 }
-VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare)
-    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)) {
+VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare, TaskService* events)
+    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)), events_(events) {
     auto loaded = file_.load();
     auto initial = std::make_shared<VmConfigSnapshot>();
     initial->document = normalize(loaded ? std::move(loaded->value) : Json::Value(Json::objectValue));
     initial->revision = random_id(true);
+    initial->encoded = encoded_document(initial->document);
     initial->recovered = loaded && loaded->recovered;
     initial->persisted = loaded.has_value();
     initial->durability_uncertain = loaded.has_value();
     auto update = prepare_ ? prepare_(initial->document) : nullptr;
     if (update) update->commit();
-    state_ = std::move(initial);
+    publish(std::move(initial));
 }
 VmConfigService::Snapshot VmConfigService::state() const {
     std::lock_guard lock(state_mutex_);
@@ -62,6 +70,7 @@ VmConfigService::Snapshot VmConfigService::state() const {
 void VmConfigService::publish(Snapshot next) {
     std::lock_guard lock(state_mutex_);
     state_ = std::move(next);
+    if (events_) events_->publish_vm_config(state_);
 }
 VmConfigService::Snapshot VmConfigService::snapshot(const CallContext& caller) const {
     access(caller);
@@ -137,6 +146,7 @@ VmConfigService::Snapshot VmConfigService::replace(const CallContext& caller,
         throw ServiceError(ErrorCode::invalid_argument, "A complete VM configuration list is required");
     auto next = std::make_shared<VmConfigSnapshot>();
     next->document = normalize(std::move(document));
+    next->encoded = encoded_document(next->document);
     next->revision = random_id(true);
     next->persisted = true;
     std::lock_guard writer(writer_mutex_);
