@@ -5,6 +5,7 @@
 #include "common/wire.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
+#include "store/vm_ownership.h"
 #include <set>
 #include <map>
 
@@ -51,6 +52,7 @@ Json::Value VmConfigService::normalize(Json::Value document) {
 }
 VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare, TaskService* events)
     : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)), events_(events) {
+    config::claim_vm_config(directory, owner);
     auto loaded = file_.load();
     auto initial = std::make_shared<VmConfigSnapshot>();
     initial->document = normalize(loaded ? std::move(loaded->value) : Json::Value(Json::objectValue));

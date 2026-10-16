@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "runtime/instance.h"
+#include "store/vm_ownership.h"
 #include "runtime/layout.h"
 #include "runtime/log.h"
 #include "runtime/cleanup.h"
@@ -152,6 +153,10 @@ int main(int argc, char** argv) {
         std::unique_ptr<droidvm::Instance> instance;
         if (!data_directory.empty()) {
             layout = std::make_unique<droidvm::RuntimeLayout>(data_directory);
+            // This entry point still uses the legacy VM inventory. Refuse before
+            // --force can terminate a daemon that owns persistent configuration.
+            auto files = layout->open_files();
+            droidvm::config::require_legacy_vm_config(files.get(), layout->owner());
             instance = std::make_unique<droidvm::Instance>(layout->take_run_directory(), force, layout->owner());
         } else instance = std::make_unique<droidvm::Instance>(directory, force);
         std::unique_ptr<droidvm::RuntimeLog> log;

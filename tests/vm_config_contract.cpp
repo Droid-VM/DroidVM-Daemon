@@ -5,6 +5,7 @@
 #include "services/vm_config.h"
 #include "services/vm_config_upload.h"
 #include "store/vm_config.h"
+#include "store/vm_ownership.h"
 #include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
@@ -60,6 +61,44 @@ std::string stage(VmConfigUploads& uploads, const std::string& revision, const s
         check(uploads.append(admin, id, offset, chunk) == offset + chunk.size(), "upload accepts contiguous bounded chunks");
     }
     return id;
+}
+void ownership_gate() {
+    Temporary temp;
+    config::require_legacy_vm_config(temp.directory.get(), getuid());
+    {
+        Fd legacy(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_CLOEXEC));
+        struct flock lock{}; lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
+        check(fcntl(legacy.get(), F_SETLK, &lock) == 0, "take Java-compatible POSIX write lock");
+        bool refused = false;
+        try { config::claim_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+        check(refused, "native transition excludes legacy write in progress");
+        struct stat info{};
+        check(fstat(legacy.get(), &info) == 0 && info.st_size == 0, "busy transition never installs ownership");
+    }
+    config::claim_vm_config(temp.directory.get(), getuid());
+    config::claim_vm_config(temp.directory.get(), getuid());
+    bool refused = false;
+    try { config::require_legacy_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    check(refused, "persistent owner refuses legacy even after lock release");
+    {
+        Fd file(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_TRUNC | O_CLOEXEC));
+        check(write(file.get(), "native-", 7) == 7, "inject interrupted marker");
+    }
+    config::claim_vm_config(temp.directory.get(), getuid());
+    {
+        Fd file(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_CLOEXEC));
+        char value[10];
+        check(read(file.get(), value, 10) == 10 && std::string_view(value, 10) == "native-v1\n", "recover interrupted ownership marker");
+        check(pwrite(file.get(), "unknown", 7, 0) == 7, "inject unknown owner");
+    }
+    refused = false;
+    try { config::claim_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    check(refused, "unknown marker refuses takeover");
+    Temporary links;
+    check(symlinkat("target", links.directory.get(), "vms.config-owner") == 0, "create unsafe gate link");
+    refused = false;
+    try { config::claim_vm_config(links.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    check(refused && faccessat(links.directory.get(), "target", F_OK, 0) != 0, "gate never follows symlink");
 }
 void migration_roundtrip_and_revision() {
     Temporary temp;
@@ -435,8 +474,19 @@ void strict_base64_chunks() {
     check(bounded, "base64 decoded output respects budget");
 }
 }
-int main() {
-    return run({{"migration_roundtrip_revision", migration_roundtrip_and_revision},
+int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--ownership") {
+        try {
+            Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            struct stat info{};
+            check(directory.get() >= 0 && fstat(directory.get(), &info) == 0, "open isolated ownership directory");
+            if (std::string_view(argv[2]) == "claim") config::claim_vm_config(directory.get(), info.st_uid);
+            else if (std::string_view(argv[2]) == "legacy") config::require_legacy_vm_config(directory.get(), info.st_uid);
+            else throw std::runtime_error("invalid ownership probe mode");
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+    return run({{"ownership_transition", ownership_gate}, {"migration_roundtrip_revision", migration_roundtrip_and_revision},
         {"empty_permissions_validation", empty_permissions_and_validation},
         {"twelve_writers_stale_noop", twelve_writers_and_stale_noop},
         {"failure_visibility_retry", failure_visibility_and_retry},

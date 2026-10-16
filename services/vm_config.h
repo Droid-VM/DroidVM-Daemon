@@ -21,7 +21,9 @@ struct VmConfigSnapshot {
 
 // Persistence layer for the single-writer VM migration. The owner must hold
 // the daemon Instance lock and coordinate runtime edits before replacing the
-// document. Do not instantiate alongside an App that still writes vms.json.
+// document. Construction durably claims the shared ownership gate before loading;
+// cooperating legacy App writes are then refused, including after daemon exit.
+// Older clients without this gate must not run alongside this service.
 // This service is not yet enabled by the production entry point.
 class VmConfigService {
 public:

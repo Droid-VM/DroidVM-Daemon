@@ -2,6 +2,7 @@
 #include "vm.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
+#include "store/vm_ownership.h"
 #include "vm/boot_plan.h"
 #include "vm/nic.h"
 #include <bit>
@@ -59,6 +60,7 @@ VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) 
     context_.app_config = [this] { return app_config(); };
 }
 VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
+    config::require_legacy_vm_config(files_directory, context_.owner);
     try {
         const auto document = parse_strict(read_file(files_directory, "vms.json"));
         const auto& rows = config::member(document, "vms");
