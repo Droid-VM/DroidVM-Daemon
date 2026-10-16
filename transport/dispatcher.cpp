@@ -18,6 +18,7 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
                               "network_config_snapshot", "resource_snapshot_page", "resource_snapshot_release",
                               "resource_subscribe", "resource_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
+bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply"; }
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
 bool host_command(const std::string& command) {
     return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
@@ -125,6 +126,16 @@ Json::Value failure(const ServiceError& error) {
     result["error"]["message"] = error.what();
     return result;
 }
+Json::Value config_status(const VmConfigService::Snapshot& snapshot) {
+    Json::Value result;
+    result["success"] = true;
+    result["revision"] = snapshot->revision;
+    result["persisted"] = snapshot->persisted;
+    result["recovered"] = snapshot->recovered;
+    result["durability_uncertain"] = snapshot->durability_uncertain;
+    result["count"] = snapshot->document["vms"].size();
+    return result;
+}
 Json::Value snapshot_json(const SnapshotPage& page) {
     Json::Value value;
     value["success"] = true;
@@ -150,12 +161,20 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
+    return (vm_config_ && command == "vm_config_apply") || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    if (vm_config_ && command == "vm_config_apply") {
+        try {
+            if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
+            if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+            return config_status(vm_config_->apply(caller, string_field(request, "revision"), request["operations"]));
+        }
+        catch (const ServiceError& error) { return failure(error); }
+    }
     Json::Value result;
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
@@ -474,7 +493,7 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
     } catch (...) { result["message"] = "internal error"; return result; }
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
-    if (std::find(commands.begin(), commands.end(), command) == commands.end()) {
+    if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
             result["service_api_minor"] = 1;
@@ -542,6 +561,12 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["network_config_events"] = "invalidation-v1";
                 result["service_api_minor"] = 12;
             }
+            if (vm_config_) {
+                result["commands"].append("vm_config_status");
+                result["commands"].append("vm_config_apply");
+                result["vm_config_updates"] = "revisioned-batch-v1";
+                result["service_api_minor"] = 13;
+            }
         }
         return result;
     }
@@ -550,7 +575,13 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
         Json::Value result;
         result["success"] = true;
-        if (command == "task_get" || command == "task_cancel") {
+        if (command == "vm_config_status") {
+            return config_status(vm_config_->snapshot(caller));
+        } else if (command == "vm_config_apply") {
+            // Server dispatches this to the bounded worker pool. Also support
+            // direct adapter callers without a second implementation.
+            return execute_background(caller, command, request);
+        } else if (command == "task_get" || command == "task_cancel") {
             TaskRef ref{string_field(request, "epoch"), string_field(request, "task_id")};
             const auto task = command == "task_get" ? tasks_.get(caller, ref) : tasks_.cancel(caller, ref);
             result["task"] = task_summary(task);

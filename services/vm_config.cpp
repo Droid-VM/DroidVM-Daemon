@@ -5,6 +5,7 @@
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include <set>
+#include <map>
 
 namespace droidvm {
 namespace {
@@ -65,6 +66,63 @@ void VmConfigService::publish(Snapshot next) {
 VmConfigService::Snapshot VmConfigService::snapshot(const CallContext& caller) const {
     access(caller);
     return state();
+}
+VmConfigService::Snapshot VmConfigService::apply(const CallContext& caller,
+        const std::string& expected_revision, const Json::Value& operations) {
+    access(caller);
+    if (expected_revision.empty() || expected_revision.size() > 128)
+        throw ServiceError(ErrorCode::invalid_argument, "Missing or invalid VM configuration revision");
+    const auto previous = state();
+    if (previous->revision != expected_revision)
+        throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before saving");
+    if (!operations.isArray()) throw ServiceError(ErrorCode::invalid_argument, "VM operations must be an array");
+    try { config::encode_json(operations, max_bytes); }
+    catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "VM operation storage limit exceeded"); }
+    std::map<std::string, Json::ArrayIndex> positions;
+    const auto& original = previous->document["vms"];
+    for (Json::ArrayIndex i = 0; i < original.size(); ++i) positions.emplace(config::uuid(original[i]), i);
+    std::set<std::string> touched, deleted;
+    auto document = previous->document;
+    auto& rows = document["vms"];
+    for (const auto& operation : operations) {
+        if (!operation.isObject() || !operation["op"].isString())
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid VM operation");
+        const auto kind = operation["op"].asString();
+        if (kind != "create" && kind != "replace" && kind != "delete")
+            throw ServiceError(ErrorCode::invalid_argument, "Unknown VM operation");
+        // Reject ambiguous/typo fields instead of silently dropping an edit.
+        for (const auto& key : operation.getMemberNames())
+            if (key != "op" && key != (kind == "delete" ? "id" : "config"))
+                throw ServiceError(ErrorCode::invalid_argument, "Unexpected VM operation field");
+        std::string id;
+        Json::Value value;
+        try {
+            value = kind == "delete" ? operation : operation["config"];
+            // Require an explicit target, even if legacy migration can invent one.
+            id = config::uuid(value);
+            if (kind != "delete") { value = config::migrate_vm(std::move(value)); value["id"] = id; }
+        } catch (const std::invalid_argument&) {
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid VM operation target or configuration");
+        }
+        if (!touched.insert(id).second) throw ServiceError(ErrorCode::invalid_argument, "Repeated VM operation target");
+        const auto found = positions.find(id);
+        if (kind == "create") {
+            if (found != positions.end()) throw ServiceError(ErrorCode::conflict, "VM already exists");
+            rows.append(std::move(value));
+        } else {
+            if (found == positions.end()) throw ServiceError(ErrorCode::not_found, "VM not found");
+            if (kind == "delete") deleted.insert(id);
+            else rows[found->second] = std::move(value);
+        }
+    }
+    if (!deleted.empty()) {
+        Json::Value kept(Json::arrayValue);
+        for (auto& row : rows) if (!deleted.contains(config::uuid(row))) kept.append(std::move(row));
+        rows = std::move(kept);
+    }
+    // Recheck the original revision under the existing writer lock. No retry
+    // against a newer document: even disjoint stale edits must report conflict.
+    return replace(caller, expected_revision, std::move(document));
 }
 VmConfigService::Snapshot VmConfigService::replace(const CallContext& caller,
         const std::string& expected_revision, Json::Value document) {

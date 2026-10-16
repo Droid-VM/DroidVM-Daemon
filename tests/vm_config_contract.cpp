@@ -190,10 +190,74 @@ void capacity_before_side_effects() {
     auto saved = service.replace(admin, initial->revision, oversized);
     VmConfigService reopened(temp.directory.get(), getuid());
     check(reopened.snapshot(admin)->document == saved->document, "legacy VM file capacity above 8 MiB survives restart");
+    Json::Value small(Json::arrayValue), create;
+    create["op"] = "create"; create["config"] = vm("small additional VM"); small.append(create);
+    saved = service.apply(admin, saved->revision, small);
+    check(saved->document["vms"].size() == 2 && saved->document["vms"][0] == reopened.snapshot(admin)->document["vms"][0],
+        "small batch edits inventory larger than a transport frame without resending large VM");
     auto many = initial->document;
     for (int i = 0; i < 1025; ++i) many["vms"].append(vm("vm " + std::to_string(i)));
     auto populated = service.replace(admin, saved->revision, many);
     check(populated->document["vms"].size() == 1025, "network count quota is not imposed on VM inventory");
+}
+Json::Value operation(const char* kind, Json::Value value) {
+    Json::Value result; result["op"] = kind;
+    if (std::string_view(kind) == "delete") result["id"] = value["id"];
+    else result["config"] = std::move(value);
+    return result;
+}
+void atomic_batches() {
+    Temporary temp;
+    unsigned writes = 0;
+    VmConfigService service(temp.directory.get(), getuid(), [&](const char* stage) { if (std::string_view(stage) == "before_write") ++writes; });
+    auto empty = service.snapshot(admin);
+    auto doc = document(vm("one")); doc["vms"].append(vm("two")); doc["vms"].append(vm("three"));
+    auto initial = service.replace(admin, empty->revision, doc);
+    auto one = initial->document["vms"][0], two = initial->document["vms"][1];
+    one["name"] = "two"; two["name"] = "one";
+    Json::Value edits(Json::arrayValue);
+    edits.append(operation("replace", one)); edits.append(operation("replace", two));
+    edits.append(operation("delete", initial->document["vms"][2]));
+    auto added = vm("four"); edits.append(operation("create", added));
+    auto saved = service.apply(admin, initial->revision, edits);
+    check(writes == 2 && saved->document["vms"].size() == 3, "whole batch persists once");
+    check(saved->document["future_root"] == initial->document["future_root"] && saved->document["vms"][0] == one && saved->document["vms"][1] == two,
+        "atomic name swap preserves order and extensions");
+    check(saved->document["vms"][2]["id"] == added["id"], "new VM appended after kept rows");
+    error(ErrorCode::conflict, [&] { service.apply(admin, initial->revision, Json::Value(Json::arrayValue)); });
+    check(service.apply(admin, saved->revision, Json::Value(Json::arrayValue)) == saved && writes == 2, "durable empty batch is a no-op");
+    edits.clear(); edits.append(operation("replace", one)); edits.append(operation("delete", vm("missing")));
+    error(ErrorCode::not_found, [&] { service.apply(admin, saved->revision, edits); });
+    edits.clear(); edits.append(operation("create", vm("one")));
+    error(ErrorCode::conflict, [&] { service.apply(admin, saved->revision, edits); });
+    check(service.snapshot(admin) == saved && writes == 2, "invalid final state and late operation failure leave disk and view unchanged");
+}
+void batch_validation_and_permissions() {
+    Temporary temp;
+    VmConfigService service(temp.directory.get(), getuid());
+    auto initial = service.snapshot(admin);
+    error(ErrorCode::unauthenticated, [&] { service.apply({}, "", {}); });
+    error(ErrorCode::permission_denied, [&] { service.apply(owner, "", {}); });
+    error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, Json::Value(Json::objectValue)); });
+    Json::Value edits(Json::arrayValue);
+    auto valid = operation("create", vm("one"));
+    for (auto invalid : {Json::Value(), Json::Value("create"), Json::Value(Json::objectValue)}) {
+        edits.clear(); edits.append(invalid);
+        error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    }
+    for (const auto* field : {"op", "config"}) {
+        auto invalid = valid; invalid.removeMember(field); edits.clear(); edits.append(invalid);
+        error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    }
+    auto invalid = valid; invalid["op"] = "upsert"; edits.clear(); edits.append(invalid);
+    error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    invalid = valid; invalid["extra"] = true; edits[0] = invalid;
+    error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    invalid = valid; invalid["config"].removeMember("id"); edits[0] = invalid;
+    error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    edits[0] = valid; edits.append(valid);
+    error(ErrorCode::invalid_argument, [&] { service.apply(admin, initial->revision, edits); });
+    check(service.snapshot(admin) == initial && !initial->persisted, "invalid batches never initialize file");
 }
 }
 int main() {
@@ -202,5 +266,6 @@ int main() {
         {"twelve_writers_stale_noop", twelve_writers_and_stale_noop},
         {"failure_visibility_retry", failure_visibility_and_retry},
         {"recovery_semantic_corruption", recovery_and_corruption},
-        {"capacity_before_side_effects", capacity_before_side_effects}});
+        {"capacity_before_side_effects", capacity_before_side_effects},
+        {"atomic_batches", atomic_batches}, {"batch_validation_permissions", batch_validation_and_permissions}});
 }

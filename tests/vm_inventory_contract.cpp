@@ -2,6 +2,7 @@
 #include "contracts.h"
 #include "common/identity.h"
 #include "services/vm.h"
+#include "transport/dispatcher.h"
 #include <atomic>
 #include <dirent.h>
 #include <future>
@@ -242,6 +243,49 @@ void persistent_publication_and_writers() {
     check(success == 1 && conflicts == 11 && failures == 0, "one persistent inventory writer wins revision race");
     check(inventory.get(admin, id) == store.snapshot(admin)->document["vms"][0], "winning runtime agrees with winning configuration");
 }
+void revisioned_batch_adapter() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    std::string fail;
+    VmConfigService store(directory.get(), getuid(), [&](const char* stage) {
+        if (fail == stage) throw std::runtime_error("injected failure");
+    }, [&](const Json::Value& value) { return inventory.prepare_config(value); });
+    TaskService tasks;
+    SystemService system([] { return true; }, [] { return "test"; }, "test", tasks.epoch());
+    RequestDispatcher dispatcher(system, tasks);
+    ClientSession session; session.caller.authorized = true;
+    check(!dispatcher.execute(session, "capabilities", {}).isMember("vm_config_updates"), "unattached dispatcher never advertises configuration ownership");
+    dispatcher.set_vm_config(&store);
+    auto caps = dispatcher.execute(session, "capabilities", {});
+    check(caps["vm_config_updates"] == "revisioned-batch-v1" && caps["service_api_minor"] == 13, "attached dispatcher advertises batch API");
+    check(dispatcher.background("vm_config_apply") && !dispatcher.background("vm_config_status"), "disk operations use bounded worker dispatch");
+    auto status = dispatcher.execute(session, "vm_config_status", {});
+    Json::Value request, create;
+    request["revision"] = status["revision"];
+    create["op"] = "create"; create["config"] = config("adapter"); request["operations"].append(create);
+    auto assert_error = [](const Json::Value& result, const char* code) {
+        check(result["success"] == false && result["error"]["code"] == code, "structured configuration adapter error");
+    };
+    assert_error(dispatcher.execute_background({}, "vm_config_apply", {}), "UNAUTHENTICATED");
+    assert_error(dispatcher.execute_background(owner, "vm_config_apply", {}), "PERMISSION_DENIED");
+    auto created = dispatcher.execute_background(admin, "vm_config_apply", request);
+    check(created["success"] == true && created["count"].asUInt() == 1 && created["revision"] != status["revision"], "batch adapter commits and returns compact metadata");
+    auto id = create["config"]["id"].asString();
+    auto original = inventory.runtime(admin, id);
+    assert_error(dispatcher.execute_background(admin, "vm_config_apply", request), "CONFLICT");
+    request["revision"] = created["revision"];
+    request["operations"][0]["op"] = "replace"; request["operations"][0]["config"]["name"] = "changed";
+    fail = "before_install";
+    assert_error(dispatcher.execute_background(admin, "vm_config_apply", request), "IO_ERROR");
+    check(inventory.runtime(admin, id) == original && store.snapshot(admin)->revision == created["revision"].asString(), "adapter failure preserves runtime and revision");
+    fail = "installed";
+    assert_error(dispatcher.execute_background(admin, "vm_config_apply", request), "COMMIT_UNCERTAIN");
+    auto uncertain = dispatcher.execute(session, "vm_config_status", {});
+    check(uncertain["durability_uncertain"] == true && uncertain["revision"] != created["revision"] && inventory.get(admin, id)["name"] == "changed", "adapter exposes installed-but-uncertain revision for reread");
+    session.caller.authorized = false;
+    assert_error(dispatcher.execute(session, "vm_config_status", {}), "UNAUTHENTICATED");
+}
 }
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
@@ -249,5 +293,6 @@ int main() {
         {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
         {"persistent_inventory_commit", persistent_inventory_commit},
         {"persistent_busy_and_unchanged", persistent_busy_and_unchanged},
-        {"persistent_publication_and_writers", persistent_publication_and_writers}});
+        {"persistent_publication_and_writers", persistent_publication_and_writers},
+        {"revisioned_batch_adapter", revisioned_batch_adapter}});
 }

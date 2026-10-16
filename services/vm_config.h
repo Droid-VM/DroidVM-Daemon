@@ -39,6 +39,10 @@ public:
     // An installed-but-unsynced commit changes the view/revision and throws
     // COMMIT_UNCERTAIN; clients must re-read before deciding what to do next.
     Snapshot replace(const CallContext& caller, const std::string& expected_revision, Json::Value document);
+    // Atomic small edits against one observed revision, preserving root extensions
+    // and untouched entries. Each operation is create/replace with config, or
+    // delete with id. A target may occur once; replacements retain list order.
+    Snapshot apply(const CallContext& caller, const std::string& expected_revision, const Json::Value& operations);
 private:
     config::JsonFile file_;
     mutable std::mutex state_mutex_;

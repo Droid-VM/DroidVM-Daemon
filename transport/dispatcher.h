@@ -41,6 +41,7 @@ public:
     void set_display_attach(std::function<void(const std::string& nonce)> attach) { display_attach_ = std::move(attach); }
     void set_usb(usb::UsbService* service) { usb_ = service; }
     void set_packages(pkg::PkgService* service) { packages_ = service; }
+    void set_vm_config(VmConfigService* service) { vm_config_ = service; }
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
     TaskService& workers() { return tasks_; }
@@ -60,6 +61,7 @@ private:
     std::function<void(const std::string&)> display_attach_;
     usb::UsbService* usb_ = nullptr;
     pkg::PkgService* packages_ = nullptr;
+    VmConfigService* vm_config_ = nullptr;
     bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);
     Json::Value execute_keyboard(const CallContext& caller, const std::string& command, const Json::Value& request);
