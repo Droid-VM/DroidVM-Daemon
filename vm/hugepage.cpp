@@ -42,7 +42,14 @@ bool HugepagePool::write(const char* knob, const std::string& value) const {
     return written == static_cast<ssize_t>(text.size()) && closed;
 }
 bool HugepagePool::set_reserved(int64_t pages) const {
-    if (!write("pool_want", std::to_string(pages))) return false;
+    // gh_hugepage_reserve rejects a write that closely follows the previous
+    // one (a stop then an immediate start); the legacy single write failed there.
+    bool written = write("pool_want", std::to_string(pages));
+    for (int attempt = 0; !written && attempt < 10 && resizable(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        written = write("pool_want", std::to_string(pages));
+    }
+    if (!written) return false;
     const auto actual = read("pool_want");
     return actual && (*actual == pages || (pages > 0 && *actual > pages));
 }

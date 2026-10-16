@@ -2,6 +2,7 @@
 #include "vm.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
+#include "vm/boot_plan.h"
 #include "vm/nic.h"
 #include <bit>
 #include <regex>
@@ -48,6 +49,12 @@ VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) 
     auto flag = shutting_down_;
     auto outer = context_.shutting_down;
     context_.shutting_down = [flag, outer] { return flag->load() || outer(); };
+    // KEY_OPTIMIZE_SDCARD through DataItem.optBoolean: only a boolean counts.
+    context_.optimize_sdcard = [this] {
+        std::lock_guard lock(app_mutex_);
+        const auto& value = config::member(app_config_, "optimize_sdcard");
+        return value.isBool() ? value.asBool() : true;
+    };
 }
 VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
     try {
@@ -225,8 +232,49 @@ std::string VmService::running_vm_using(const std::string& network) const {
     }
     return {};
 }
+void VmService::auto_up_async() {
+    std::lock_guard lock(sweep_mutex_);
+    if (shutting_down_->load() || sweep_.joinable()) return;
+    sweep_ = std::thread(&VmService::auto_up, this);
+}
+void VmService::auto_up() {
+    std::vector<std::shared_ptr<vm::VmRuntime>> pending;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& entry : entries_)
+            if (config::boolean(entry.vm->config(), "auto_up") && entry.vm->state() == VmState::stopped) pending.push_back(entry.vm);
+    }
+    for (const auto& target : pending) {
+        if (shutting_down_->load()) {
+            context_.warn("the daemon is going down; abandoning the rest of the auto-start sweep");
+            return;
+        }
+        if (target->state() != VmState::stopped) continue;
+        if (!target->start())
+            context_.warn("Failed to auto-start VM " + config::string(target->config(), "name") + " [" + target->id() + "]");
+    }
+}
+Json::Value VmService::boot_scan(const CallContext& caller, const std::string& image) const {
+    access(caller);
+    return vm::scan_boot_entries(context_.lbx, image);
+}
+void VmService::set_app_config(const CallContext& caller, Json::Value value) {
+    access(caller);
+    if (!value.isObject()) throw std::invalid_argument("config is not an object");
+    std::lock_guard lock(app_mutex_);
+    app_config_ = std::move(value);
+}
+Json::Value VmService::app_config() const {
+    std::lock_guard lock(app_mutex_);
+    return app_config_;
+}
 void VmService::stop_all() {
     shutting_down_->store(true);
+    {
+        // The sweep reads the flag before each start; one inside start() finishes its handoff.
+        std::lock_guard lock(sweep_mutex_);
+        if (sweep_.joinable() && sweep_.get_id() != std::this_thread::get_id()) sweep_.join();
+    }
     std::vector<std::shared_ptr<vm::VmRuntime>> targets;
     { std::lock_guard lock(mutex_); for (const auto& entry : entries_) targets.push_back(entry.vm); }
     for (auto& target : targets) if (target->state() != VmState::stopped) target->stop();

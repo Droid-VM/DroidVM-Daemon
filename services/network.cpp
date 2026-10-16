@@ -209,9 +209,9 @@ void NetworkService::schedule_reconcile(TaskService& workers) {
             }
         }
         if (id.empty()) return;
-        maintenance_cursor_ = id; maintenance_pending_ = true;
+        maintenance_cursor_ = id; maintenance_pending_ = true; autostart_running_ = autostart;
     }
-    auto release = [this] { std::lock_guard lock(mutex_); maintenance_pending_ = false; };
+    auto release = [this] { std::lock_guard lock(mutex_); maintenance_pending_ = false; autostart_running_ = false; };
     try {
         workers.post({"network-watchdog", true, true, true}, [this, id, release, autostart](bool discarded) {
             try {
@@ -227,10 +227,14 @@ void NetworkService::schedule_reconcile(TaskService& workers) {
             release();
         });
     } catch (...) {
-        std::lock_guard lock(mutex_); maintenance_pending_ = false;
+        std::lock_guard lock(mutex_); maintenance_pending_ = false; autostart_running_ = false;
         if (autostart) autostart_.push_front(id);
         throw;
     }
+}
+bool NetworkService::autostart_settled() {
+    std::lock_guard lock(mutex_);
+    return shutting_down_ || (autostart_.empty() && !autostart_running_);
 }
 void NetworkService::request_autostart(const CallContext& caller) {
     auto rows = configs_.list(caller);

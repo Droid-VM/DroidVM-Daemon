@@ -224,7 +224,8 @@ bool VmRuntime::start_locked(bool relaunch) {
         set_state(State::starting);
         { std::lock_guard state(state_mutex_); worker_ = true; }
         std::thread([self = shared_from_this()] { self->run(); }).detach();
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+        context_.warn("Cannot start VM " + config::string(config(), "name") + ": " + error.what());
         cleanup_taps();
         cleanup_backend();
         set_state(State::stopped);

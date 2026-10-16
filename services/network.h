@@ -39,6 +39,7 @@ public:
     Json::Value tool_log(const CallContext& caller, const std::string& id, const std::string& key);
     void schedule_reconcile(TaskService& workers); // event-loop caller, no backend I/O
     void request_autostart(const CallContext& caller); // once, before serving
+    bool autostart_settled(); // every auto_up network was tried
     // VMInstance.setupTap: a stopped network is started first. The NIC is
     // already sanitized and validated against this network's config.
     void attach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap);
@@ -60,6 +61,7 @@ private:
     std::string maintenance_cursor_;
     Clock::time_point next_maintenance_{};
     std::deque<std::string> autostart_;
+    bool autostart_running_ = false;
     std::function<std::string(const std::string&)> in_use_;
     std::shared_ptr<Slot> slot(const CallContext& caller, const std::string& id);
     static NetworkView view(Slot& slot);

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace droidvm {
@@ -35,6 +36,12 @@ public:
     // The VM's runtime; not_found carries the legacy "VM not found: <id>".
     std::shared_ptr<vm::VmRuntime> runtime(const CallContext& caller, const std::string& id) const;
     void stop_all(); // stopAll: refuses further starts
+    // VMInstanceStore.autoUpAsync: starts auto_up VMs in store order on a thread of its own.
+    void auto_up_async();
+    Json::Value boot_scan(const CallContext& caller, const std::string& image) const; // BootPlan.scanEntries
+    // SetAppConfig: the UI's settings, read at each VM start.
+    void set_app_config(const CallContext& caller, Json::Value config);
+    Json::Value app_config() const;
     // BridgeDhcp.buildStatics over every known VM, for each VLAN of the network.
     std::map<int, network::DhcpStatics> statics(const Json::Value& network) const;
     std::string running_vm_using(const std::string& network) const; // empty when none
@@ -46,10 +53,15 @@ private:
     mutable std::mutex mutex_;
     std::vector<Entry> entries_;
     std::shared_ptr<std::atomic<bool>> shutting_down_ = std::make_shared<std::atomic<bool>>(false);
+    mutable std::mutex app_mutex_; // read from VMM launch threads
+    Json::Value app_config_{Json::objectValue};
+    std::mutex sweep_mutex_;
+    std::thread sweep_;
     size_t loaded_ = 0;
     std::string load_error_;
     static std::optional<std::string> canonical(const std::string& id);
     const Entry* find(const std::string& id) const;
     void add(const std::string& id, Json::Value config);
+    void auto_up();
 };
 }

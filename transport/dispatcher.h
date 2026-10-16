@@ -24,10 +24,12 @@ public:
                       network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr, LegacyEvents* events = nullptr)
         : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms), events_(events) {}
     LegacyEvents* legacy_events() const { return events_; }
-    bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr; }
+    bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr || (vms_ && !vms_swept_); }
     void maintenance() {
         if (runtime_) runtime_->schedule_reconcile(tasks_);
         if (host_ipv4_) host_ipv4_->schedule(tasks_);
+        // Server.run: VMs come up behind the socket, after the network auto-up.
+        if (vms_ && !vms_swept_ && (!runtime_ || runtime_->autostart_settled())) { vms_swept_ = true; vms_->auto_up_async(); }
     }
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
@@ -44,6 +46,7 @@ private:
     network::HostIpv4Watch* host_ipv4_;
     VmService* vms_;
     LegacyEvents* events_;
+    bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);
 };
 }

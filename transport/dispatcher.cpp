@@ -22,7 +22,8 @@ bool host_command(const std::string& command) {
 }
 constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status",
     "vm_start", "vm_stop", "vm_stop_all", "vm_reboot", "vm_suspend", "vm_resume", "vm_control", "vm_console_list",
-    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info", "vm_input"};
+    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info", "vm_input",
+    "vm_bootscan", "set_app_config"};
 // android.util.Base64.decode(NO_WRAP) of a client's evdev bytes.
 std::string base64_decode(const std::string& text) {
     std::string out;
@@ -218,6 +219,13 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
         if (command == "vm_create" || command == "vm_modify") {
             if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
             result["vm_id"] = command == "vm_create" ? vms_->create(caller, request["config"]) : vms_->modify(caller, request["config"]);
+        } else if (command == "set_app_config") {
+            // A missing or non-object config is a plain exception: "internal error".
+            vms_->set_app_config(caller, request.isMember("config") ? request["config"] : Json::Value());
+        } else if (command == "vm_bootscan") {
+            const auto image = legacy_id(request, "image");
+            if (image.empty()) { result["message"] = "missing image"; return result; }
+            result["entries"] = vms_->boot_scan(caller, image);
         } else if (command == "vm_list") {
             result["data"] = vms_->list(caller);
         } else if (command == "vm_stop_all") {
@@ -374,7 +382,8 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["vm_runtime"] = true;
                 result["vm_runtime_backends"] = Json::Value(Json::arrayValue);
                 result["vm_runtime_backends"].append("crosvm"); // no QEMU yet
-                result["service_api_minor"] = 6;
+                result["vm_auto_up"] = true;
+                result["service_api_minor"] = 7;
             }
         }
         return result;
