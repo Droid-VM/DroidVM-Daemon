@@ -386,6 +386,25 @@ void TaskService::publish_network_config(std::shared_ptr<const Json::Value> rows
     // overflow the bounded event history. Subscribers fetch a fresh fixed view.
     shared.events.publish("network.config.invalidated", "networks", "system", Json::Value(), true);
 }
+SnapshotPage TaskService::network_config_document(const CallContext& caller, size_t max_bytes) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    if (!shared.network_config) throw ServiceError(ErrorCode::unavailable, "Network configuration view unavailable");
+    Json::Value document;
+    document["networks"] = *shared.network_config;
+    std::shared_ptr<const std::string> encoded;
+    try { encoded = std::make_shared<const std::string>(wire::stringify_bounded(document, 8u << 20)); }
+    catch (const std::length_error&) { throw ServiceError(ErrorCode::resource_exhausted, "Network configuration exceeds document limit"); }
+    Json::Value metadata;
+    metadata["type"] = "metadata"; metadata["encoding"] = "base64-json";
+    metadata["bytes"] = Json::UInt64(encoded->size());
+    const EventScope scope{caller.principal, caller.administrator};
+    auto id = shared.events.snapshot_document(scope, std::move(encoded), wire::stringify(metadata));
+    try { return shared.events.page(scope, id, 0, max_bytes); }
+    catch (...) { shared.events.release_snapshot(scope, id); throw; }
+}
 SnapshotPage TaskService::network_config_snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);
     if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");

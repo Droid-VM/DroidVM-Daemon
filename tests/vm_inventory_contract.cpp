@@ -73,7 +73,8 @@ void conditional_network_adapter() {
     RequestDispatcher dispatcher(system, tasks, &networks);
     ClientSession session; session.caller.authorized = true;
     const auto caps = dispatcher.execute(session, "capabilities", {});
-    check(caps["network_config_update"] == "compare-config-v1" && caps["service_api_minor"] == 18,
+    check(caps["network_config_update"] == "compare-config-v1" && caps["service_api_minor"] == 19
+        && caps["network_config_document"] == "base64-json-chunks-v1",
         "conditional network edit capability is advertised");
     check(dispatcher.background("network_config_get") && dispatcher.background("network_config_update"),
         "configuration operations use bounded workers");

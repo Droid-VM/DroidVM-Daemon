@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
+#include "snapshot_document.h"
 #include "services/network_config.h"
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
@@ -253,6 +254,36 @@ void conditional_updates() {
     const auto lease = service.prepare_runtime(admin, id);
     auto current = service.get(admin, id);
     error(ErrorCode::conflict, [&] { service.update_if_matches(admin, current, current); });
+}
+void full_capacity_network_document() {
+    TaskService tasks;
+    error(ErrorCode::unavailable, [&] { tasks.network_config_document(admin); });
+    Json::Value document;
+    document["networks"] = Json::Value(Json::arrayValue);
+    auto row = network("large stored extension"); row["extension"] = "";
+    document["networks"].append(row);
+    document["networks"][0]["extension"] = std::string((8u << 20) - wire::stringify(document).size(), 'x');
+    const auto expected = wire::stringify(document);
+    check(expected.size() == (8u << 20), "exact network document capacity");
+    tasks.publish_network_config(std::make_shared<const Json::Value>(document["networks"]));
+    error(ErrorCode::permission_denied, [&] { tasks.network_config_document(owner); });
+    error(ErrorCode::unauthenticated, [&] { tasks.network_config_document({}); });
+    error(ErrorCode::resource_exhausted, [&] { tasks.network_config_snapshot(admin); });
+    for (int i = 0; i < 10; ++i)
+        error(ErrorCode::invalid_argument, [&] { tasks.network_config_document(admin, 0); });
+    auto page = tasks.network_config_document(admin, 128u << 10);
+    error(ErrorCode::permission_denied, [&] { tasks.snapshot_page({"other-admin", true, true, true}, page.id, 0); });
+    tasks.publish_network_config(std::make_shared<const Json::Value>(Json::arrayValue));
+    Json::Value metadata;
+    check(read_document(tasks, admin, page, metadata) == expected, "large single row retains immutable full document");
+    tasks.release_snapshot(admin, page.id);
+    error(ErrorCode::snapshot_expired, [&] { tasks.snapshot_page(admin, page.id, 0); });
+    auto empty = tasks.network_config_document(admin);
+    check(wire::parse(read_document(tasks, admin, empty, metadata))["networks"].empty(), "new view observes publication");
+    tasks.release_snapshot(admin, empty.id);
+    document["networks"][0]["extension"] = document["networks"][0]["extension"].asString() + "x";
+    tasks.publish_network_config(std::make_shared<const Json::Value>(document["networks"]));
+    error(ErrorCode::resource_exhausted, [&] { tasks.network_config_document(admin); });
 }
 void conditional_update_race() {
     Temporary temp;
@@ -655,6 +686,7 @@ int main(int argc, char** argv) {
         {"network_import_failure_and_busy", network_import_failure_and_busy},
         {"twelve_concurrent_network_imports", concurrent_network_imports},
         {"full_capacity_network_import", full_capacity_network_import},
+        {"full_capacity_network_document", full_capacity_network_document},
         {"twelve_conditional_update_writers", conditional_update_race},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
         {"network_snapshot_replay_failure_permissions", configuration_event_handoff},

@@ -16,7 +16,7 @@ namespace droidvm {
 namespace {
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe",
-                              "network_config_snapshot", "resource_snapshot_page", "resource_snapshot_release",
+                              "network_config_snapshot", "network_config_document", "resource_snapshot_page", "resource_snapshot_release",
                               "resource_subscribe", "resource_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists",
     "network_config_get", "network_config_update"};
@@ -593,7 +593,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
             result["service_api_minor"] = 1;
-            for (const auto* name : commands) result["commands"].append(name);
+            for (const auto* name : commands) {
+                if (std::string_view(name) == "network_config_document" && (!networks_ || !networks_->has_events())) continue;
+                result["commands"].append(name);
+            }
             result["task_events"] = "explicit-subscription-v1";
             if (networks_) {
                 for (const auto* name : network_commands) result["commands"].append(name);
@@ -682,6 +685,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["network_config_import"] = "conditional-chunks-v1";
                 for (const auto* name : network_upload_commands) result["commands"].append(name);
                 result["service_api_minor"] = 18;
+                if (networks_->has_events()) {
+                    result["network_config_document"] = "base64-json-chunks-v1";
+                    result["service_api_minor"] = 19;
+                }
             }
         }
         return result;
@@ -707,6 +714,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (task.state == TaskState::succeeded) result["task"]["result"] = task.result;
         } else if (command == "task_snapshot") {
             return snapshot_json(tasks_.snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
+        } else if (command == "network_config_document") {
+            if (!networks_ || !networks_->has_events()) throw ServiceError(ErrorCode::unavailable, "Network configuration view unavailable");
+            return snapshot_json(tasks_.network_config_document(caller, size_field(request, "max_bytes", 256u << 10)));
         } else if (command == "network_config_snapshot") {
             return snapshot_json(tasks_.network_config_snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
         } else if (command == "task_snapshot_page" || command == "resource_snapshot_page") {

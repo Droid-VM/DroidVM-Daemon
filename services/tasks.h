@@ -103,6 +103,7 @@ public:
     // are acquired under the journal lock. Caller serializes domain commits.
     void publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept;
     SnapshotPage network_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
+    SnapshotPage network_config_document(const CallContext& caller, size_t max_bytes = 256u << 10);
     void publish_vm_config(std::shared_ptr<const VmConfigSnapshot> snapshot) noexcept;
     SnapshotPage vm_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
     SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
