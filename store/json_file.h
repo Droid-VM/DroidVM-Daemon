@@ -24,6 +24,7 @@ struct LoadedJson {
     Json::Value value;
     bool recovered = false;
 };
+enum class JsonSyntax { compatible, strict };
 // One service owns a file under the daemon's already-held Instance lock.
 // Call from a worker: filesystem operations can block. Existing JSON shape and
 // all unknown fields are retained; schema migration belongs to the service.
@@ -33,7 +34,10 @@ public:
     // Optional fault observer allows crash/write failure testing at durable
     // boundaries without replacing persistence with a second implementation.
     using Observer = std::function<void(const char* stage)>;
-    JsonFile(int directory, std::string name, uid_t owner, Observer observer = {});
+    // VM inventory historically allows 16 MiB; other stores keep the 8 MiB
+    // default. This changes file capacity, never a transport frame limit.
+    JsonFile(int directory, std::string name, uid_t owner, Observer observer = {}, size_t byte_limit = max_bytes,
+        JsonSyntax syntax = JsonSyntax::compatible);
     std::optional<LoadedJson> load();
     void save(const Json::Value& value);
 private:
@@ -42,6 +46,8 @@ private:
     std::string name_;
     uid_t owner_;
     Observer observer_;
+    size_t byte_limit_;
+    JsonSyntax syntax_;
     std::mutex mutex_;
     Read read(const std::string& name);
     std::optional<LoadedJson> load_unlocked(Read* primary = nullptr);

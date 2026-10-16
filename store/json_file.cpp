@@ -28,10 +28,14 @@ void normalize_numbers(Json::Value& value, unsigned depth = 0) {
 void require(bool result, const char* operation) {
     if (!result) throw std::system_error(errno, std::generic_category(), operation);
 }
-Json::Value parse(std::string_view bytes) {
+Json::Value parse(std::string_view bytes, JsonSyntax syntax) {
     Json::CharReaderBuilder builder;
     builder["failIfExtra"] = true;
     builder["stackLimit"] = 64;
+    if (syntax == JsonSyntax::strict) {
+        builder["rejectDupKeys"] = true;
+        builder["allowComments"] = false;
+    }
     std::unique_ptr<Json::CharReader> parser(builder.newCharReader());
     Json::Value result;
     std::string error;
@@ -48,8 +52,9 @@ std::string encode_json(const Json::Value& value, size_t max_bytes) {
     normalize_numbers(normalized);
     return wire::stringify_bounded(normalized, max_bytes);
 }
-JsonFile::JsonFile(int directory, std::string name, uid_t owner, Observer observer)
-    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), name_(std::move(name)), owner_(owner), observer_(std::move(observer)) {
+JsonFile::JsonFile(int directory, std::string name, uid_t owner, Observer observer, size_t byte_limit, JsonSyntax syntax)
+    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), name_(std::move(name)), owner_(owner), observer_(std::move(observer)), byte_limit_(byte_limit), syntax_(syntax) {
+    if (!byte_limit_ || byte_limit_ > (16u << 20)) throw std::invalid_argument("Invalid configuration file byte limit");
     require(directory_.get() >= 0, "duplicate configuration directory");
     if (name_.empty() || name_.size() > 128 || name_.front() == '.' || name_.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_.-") != std::string::npos)
         throw std::invalid_argument("invalid configuration filename");
@@ -83,7 +88,7 @@ JsonFile::Read JsonFile::read(const std::string& name) {
     require(fstat(file.get(), &info) == 0, "stat configuration");
     if (!S_ISREG(info.st_mode) || info.st_nlink != 1)
         throw std::runtime_error("configuration must be a single-link regular file");
-    if (info.st_size < 0 || static_cast<uint64_t>(info.st_size) > max_bytes) return {std::nullopt, true};
+    if (info.st_size < 0 || static_cast<uint64_t>(info.st_size) > byte_limit_) return {std::nullopt, true};
     std::string bytes(static_cast<size_t>(info.st_size), '\0');
     size_t offset = 0;
     while (offset < bytes.size()) {
@@ -104,14 +109,14 @@ std::optional<LoadedJson> JsonFile::load_unlocked(Read* primary) {
     auto current = read(name_);
     if (current.bytes) {
         try {
-            auto value = parse(*current.bytes);
+            auto value = parse(*current.bytes, syntax_);
             if (primary) *primary = std::move(current);
             return LoadedJson{std::move(value), false};
         } catch (const std::invalid_argument&) { current.corrupt = true; }
     }
     auto backup = read(name_ + ".bak");
     if (primary) *primary = current;
-    if (backup.bytes) return LoadedJson{parse(*backup.bytes), true};
+    if (backup.bytes) return LoadedJson{parse(*backup.bytes, syntax_), true};
     if (current.corrupt || backup.corrupt) throw std::runtime_error("configuration and recovery copy are unavailable");
     return std::nullopt;
 }
@@ -138,8 +143,8 @@ std::string JsonFile::temporary(std::string_view bytes) {
 void JsonFile::save(const Json::Value& value) {
     // Encoding limits and schema-independent JSON validity are checked before IO.
     if (!value.isObject()) throw std::invalid_argument("configuration must be an object");
-    auto bytes = encode_json(value, max_bytes);
-    parse(bytes);
+    auto bytes = encode_json(value, byte_limit_);
+    parse(bytes, syntax_);
     std::lock_guard guard(mutex_);
     Read primary;
     auto previous = load_unlocked(&primary);
