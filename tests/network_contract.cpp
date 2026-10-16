@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <future>
+#include <regex>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -154,6 +155,163 @@ void shared_worker_queue() {
     proceed.release(); stopping.get();
     check(discarded && tasks.snapshot(admin).total == 0, "RPC callbacks share limits without retained task records");
 }
+Json::Value pd_network(const std::string& name, int vid = 0) {
+    auto value = network(name);
+    auto vlan = config::default_vlan(vid);
+    vlan["ipv6"]["source"] = "dhcp_pd";
+    vlan["ipv6"]["pd"]["uplink"] = "wlan0";
+    value["l3"]["vlans"].append(vlan);
+    return value;
+}
+const Json::Value& pd(const Json::Value& value, int index = 0) { return value["l3"]["vlans"][index]["ipv6"]["pd"]; }
+void runtime_identity_and_edit_guard() {
+    Temporary temp;
+    unsigned writes = 0;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) { if (std::string_view(stage) == "before_write") ++writes; });
+    auto value = pd_network("prepared");
+    value["extension"] = "keep";
+    const auto id = service.create(admin, value);
+    error(ErrorCode::unauthenticated, [&] { service.prepare_runtime({}, id); });
+    error(ErrorCode::permission_denied, [&] { service.prepare_runtime(owner, id); });
+    auto lease = service.prepare_runtime(admin, id, {9991, 9993});
+    const auto first = lease->config();
+    const auto mac = lease->bridge_mac();
+    check(std::regex_match(mac, std::regex("02(:[0-9a-f]{2}){5}")), "legacy random MAC shape");
+    check(first["generated_mac"] == mac && pd(first)["duid"] == "00:03:00:01:" + mac && pd(first)["route_table"] == 9992,
+        "stable identities prepared with host table exclusion");
+    check(first["extension"] == "keep" && service.get(admin, id) == first, "durable identities published together");
+    config::JsonFile disk(temp.directory.get(), "networks.json", getuid());
+    check(disk.load()->value["networks"][0] == first, "lease returned only after persisted snapshot");
+    error(ErrorCode::conflict, [&] { service.update(admin, value); });
+    error(ErrorCode::conflict, [&] { service.prepare_runtime(admin, id); });
+    service.create(admin, network("other"));
+    lease.reset();
+    const auto count = writes;
+    lease = service.prepare_runtime(admin, id, {9992});
+    check(lease->config() == first && writes == count, "idempotent prepare never reallocates an existing table or rewrites");
+    lease.reset();
+    NetworkConfigService restart(temp.directory.get(), getuid());
+    auto restarted = restart.prepare_runtime(admin, id);
+    check(restarted->config() == first && restarted->bridge_mac() == mac, "restart preserves exact identities");
+    restarted.reset();
+    auto edited = first; edited["name"] = "edited";
+    restart.update(admin, edited);
+    check(restart.get(admin, id)["name"] == "edited", "successful cleanup/release permits editing");
+}
+void runtime_tables_concurrent_and_opaque() {
+    Temporary temp;
+    auto future = pd_network("future"); future["schema"] = 9;
+    future["l3"]["vlans"][0]["ipv6"]["pd"]["route_table"] = 9991;
+    Json::Value document; document["networks"].append(future);
+    config::JsonFile file(temp.directory.get(), "networks.json", getuid()); file.save(document);
+    NetworkConfigService service(temp.directory.get(), getuid());
+    std::vector<std::string> ids;
+    for (int i = 0; i < 12; ++i) ids.push_back(service.create(admin, pd_network("concurrent-" + std::to_string(i))));
+    std::vector<std::future<std::unique_ptr<NetworkRuntimeLease>>> jobs;
+    for (const auto& id : ids) jobs.push_back(std::async(std::launch::async, [&, id] { return service.prepare_runtime(admin, id, {9993}); }));
+    std::set<uint32_t> tables;
+    std::vector<std::unique_ptr<NetworkRuntimeLease>> leases;
+    for (auto& job : jobs) {
+        auto lease = job.get();
+        auto table = pd(lease->config())["route_table"].asUInt();
+        check(table != 9991 && table != 9993 && tables.insert(table).second, "concurrent preparations reserve unique tables");
+        leases.push_back(std::move(lease));
+    }
+    check(file.load()->value["networks"][0] == future, "inactive future entry remains unchanged and reserves table");
+    auto duplicate = pd_network("duplicate");
+    duplicate["l3"]["vlans"][0]["ipv6"]["pd"]["route_table"] = *tables.begin();
+    const auto duplicate_id = service.create(admin, duplicate);
+    error(ErrorCode::conflict, [&] { service.prepare_runtime(admin, duplicate_id); });
+    auto stored = pd_network("configured");
+    stored["l3"]["mac_address"] = "02:AA:BB:CC:DD:EE";
+    stored["l3"]["vlans"][0]["ipv6"]["pd"]["duid"] = "00:AA:BB";
+    stored["l3"]["vlans"][0]["ipv6"]["pd"]["route_table"] = Json::Int64(4000000000LL);
+    auto fixed = service.prepare_runtime(admin, service.create(admin, stored));
+    check(fixed->bridge_mac() == "02:AA:BB:CC:DD:EE" && pd(fixed->config())["duid"] == "00:AA:BB" &&
+        pd(fixed->config())["route_table"].asInt64() == 4000000000LL && !fixed->config().isMember("generated_mac"), "explicit persisted identities retained");
+    for (int64_t table : {-1LL, 253LL, 254LL, 255LL, 4294967296LL}) {
+        auto invalid = pd_network("invalid-" + std::to_string(table));
+        invalid["l3"]["vlans"][0]["ipv6"]["pd"]["route_table"] = Json::Int64(table);
+        const auto invalid_id = service.create(admin, invalid);
+        error(ErrorCode::invalid_argument, [&] { service.prepare_runtime(admin, invalid_id); });
+        check(!service.get(admin, invalid_id).isMember("generated_mac"), "invalid table rejects entire preparation transaction");
+    }
+}
+void runtime_durable_failures_and_racing_edit() {
+    Temporary temp;
+    std::string fail_stage;
+    Gate reached, proceed;
+    bool block = false;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fail_stage == stage) throw std::runtime_error("injected runtime save failure");
+        if (block && std::string_view(stage) == "before_install") { reached.release(); proceed.wait(); }
+    });
+    auto original = pd_network("before"); const auto id = service.create(admin, original);
+    fail_stage = "before_write";
+    error(ErrorCode::io_error, [&] { service.prepare_runtime(admin, id); });
+    check(!service.get(admin, id).isMember("generated_mac"), "failed preparation publishes no identity");
+    original["name"] = "after failure"; fail_stage.clear(); service.update(admin, original);
+    fail_stage = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.prepare_runtime(admin, id); });
+    const auto installed = service.get(admin, id);
+    check(installed.isMember("generated_mac"), "installed uncertain identity remains visible for reconciliation");
+    fail_stage = "before_write";
+    error(ErrorCode::io_error, [&] { service.prepare_runtime(admin, id); });
+    check(service.get(admin, id) == installed, "retry attempts durable write even with unchanged identities");
+    {
+        NetworkConfigService restart(temp.directory.get(), getuid(), [](const char* stage) {
+            if (std::string_view(stage) == "before_write") throw std::runtime_error("restart sync failure");
+        });
+        error(ErrorCode::io_error, [&] { restart.prepare_runtime(admin, id); });
+    }
+    fail_stage.clear(); block = true;
+    auto startup = std::async(std::launch::async, [&] { return service.prepare_runtime(admin, id); });
+    reached.wait();
+    check(service.get(admin, id) == installed, "readers retain immutable snapshot during startup write");
+    auto update = std::async(std::launch::async, [&] {
+        auto value = installed; value["name"] = "racing";
+        error(ErrorCode::conflict, [&] { service.update(admin, value); });
+    });
+    proceed.release();
+    auto lease = startup.get(); update.get(); block = false;
+    check(lease->config() == installed, "edit cannot slip between durable preparation and lease publication");
+}
+void runtime_modes_and_single_owner() {
+    Temporary temp;
+    NetworkConfigService service(temp.directory.get(), getuid());
+    auto value = pd_network("multiple VLANs");
+    auto second = value["l3"]["vlans"][0]; second["vlan_id"] = 257;
+    value["l3"]["vlans"].append(second);
+    const auto id = service.create(admin, value);
+    std::vector<std::future<std::unique_ptr<NetworkRuntimeLease>>> jobs;
+    for (int i = 0; i < 12; ++i) jobs.push_back(std::async(std::launch::async, [&]() -> std::unique_ptr<NetworkRuntimeLease> {
+        try { return service.prepare_runtime(admin, id); }
+        catch (const ServiceError& e) { check(e.code() == ErrorCode::conflict, "duplicate startup rejected as conflict"); return {}; }
+    }));
+    std::unique_ptr<NetworkRuntimeLease> winner;
+    unsigned count = 0;
+    for (auto& job : jobs) if (auto lease = job.get()) { ++count; winner = std::move(lease); }
+    check(count == 1 && pd(winner->config())["route_table"] == 9991 && pd(winner->config(), 1)["route_table"] == 9992 &&
+        pd(winner->config())["duid"] == pd(winner->config(), 1)["duid"], "one runtime owner and distinct per-VLAN tables");
+    auto l2 = network("L2"); l2["uplink_mode"] = "l2"; l2["l2"]["uplink"] = "wlan0";
+    l2["l3"]["mac_address"] = "02:00:00:00:00:01";
+    auto l2_lease = service.prepare_runtime(admin, service.create(admin, l2));
+    check(l2_lease->bridge_mac() == l2_lease->config()["generated_mac"].asString() &&
+        l2_lease->bridge_mac() != "02:00:00:00:00:01", "L2 uses stable generated MAC, not ignored L3 setting");
+    auto gvisor = network("gvisor"); gvisor["bridge_type"] = "gvisor";
+    auto gvisor_lease = service.prepare_runtime(admin, service.create(admin, gvisor));
+    check(gvisor_lease->bridge_mac().empty() && !gvisor_lease->config().isMember("generated_mac"), "gvisor retains implicit helper MAC behavior");
+    auto invalid = network("invalid MAC"); invalid["generated_mac"] = "broken";
+    const auto bad_id = service.create(admin, invalid);
+    error(ErrorCode::invalid_argument, [&] { service.prepare_runtime(admin, bad_id); });
+    std::unique_ptr<NetworkRuntimeLease> surviving;
+    {
+        Temporary other;
+        NetworkConfigService short_lived(other.directory.get(), getuid());
+        surviving = short_lived.prepare_runtime(admin, short_lived.create(admin, network("guard lifetime")));
+    }
+    surviving.reset(); // guard registry has no dangling service reference
+}
 int half_close(int port, const char* token) {
     Fd socket(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
     check(socket.get() >= 0, "create client socket");
@@ -203,5 +361,8 @@ int main(int argc, char** argv) {
     }
     return run({{"migration_opaque_identity_permissions", migration_retention_identity}, {"nested_extensions_vlan_identity_null", extension_merge_and_null},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
-        {"shared_bounded_worker_shutdown", shared_worker_queue}});
+        {"shared_bounded_worker_shutdown", shared_worker_queue}, {"runtime_identity_and_edit_guard", runtime_identity_and_edit_guard},
+        {"runtime_tables_concurrent_and_opaque", runtime_tables_concurrent_and_opaque},
+        {"runtime_durable_failures_and_racing_edit", runtime_durable_failures_and_racing_edit},
+        {"runtime_modes_and_single_owner", runtime_modes_and_single_owner}});
 }

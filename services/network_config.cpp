@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "network_config.h"
 #include "store/network_config.h"
+#include "common/identity.h"
+#include <regex>
 #include <set>
 
 namespace droidvm {
+struct NetworkRuntimeLease::Registry { std::mutex mutex; std::set<std::string> ids; };
+NetworkRuntimeLease::NetworkRuntimeLease(std::shared_ptr<Registry> registry, std::string id, Json::Value config, std::string mac)
+    : registry_(std::move(registry)), id_(std::move(id)), bridge_mac_(std::move(mac)), config_(std::move(config)) {
+    std::lock_guard lock(registry_->mutex);
+    if (!registry_->ids.insert(id_).second) throw ServiceError(ErrorCode::conflict, "Network is already reserved for runtime");
+}
+NetworkRuntimeLease::~NetworkRuntimeLease() { std::lock_guard lock(registry_->mutex); registry_->ids.erase(id_); }
 namespace {
 void access(const CallContext& caller) {
     if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
@@ -14,6 +23,17 @@ std::string identity(const std::string& id) {
     value["id"] = id;
     try { return config::uuid(value); }
     catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid network ID"); }
+}
+const Json::Value& vlans(const Json::Value& row) { return config::member(config::member(row, "l3"), "vlans"); }
+int64_t route_table(const Json::Value& vlan) {
+    return config::integer(config::member(config::member(vlan, "ipv6"), "pd"), "route_table");
+}
+std::string generated_mac() {
+    // Match NetUtils.generateRandomMac's fixed 02 prefix and 40 random bits.
+    const auto bytes = random_id(false);
+    std::string result = "02";
+    for (size_t i = 2; i < 12; i += 2) result += ":" + bytes.substr(i, 2);
+    return result;
 }
 // Known fields retain replacement/removal semantics. Unrecognized fields from
 // a newer UI survive an edit by an older client. Explicit null still clears.
@@ -84,11 +104,15 @@ std::shared_ptr<NetworkConfigService::State> NetworkConfigService::decode(Json::
     return result;
 }
 NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer)
-    : file_(directory, "networks.json", owner, std::move(observer)) {
+    : file_(directory, "networks.json", owner, std::move(observer)), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
     auto loaded = file_.load();
     Json::Value empty;
     empty["networks"] = Json::Value(Json::arrayValue);
-    state_ = decode(loaded ? std::move(loaded->value) : std::move(empty), loaded && loaded->recovered);
+    auto initial = decode(loaded ? std::move(loaded->value) : std::move(empty), loaded && loaded->recovered);
+    // A previous process could have died after rename and before directory
+    // fsync. Verify durability on first runtime preparation after reopening.
+    initial->durability_uncertain = loaded.has_value();
+    state_ = std::move(initial);
 }
 std::shared_ptr<const NetworkConfigService::State> NetworkConfigService::state() const {
     std::lock_guard guard(state_mutex_);
@@ -120,6 +144,73 @@ bool NetworkConfigService::exists(const CallContext& caller, const std::string& 
 }
 std::string NetworkConfigService::create(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), false); }
 std::string NetworkConfigService::update(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), true); }
+void NetworkConfigService::require_stopped(const std::string& id) const {
+    std::lock_guard lock(runtime_->mutex);
+    if (runtime_->ids.contains(id)) throw ServiceError(ErrorCode::conflict, "Network configuration is reserved by runtime");
+}
+std::unique_ptr<NetworkRuntimeLease> NetworkConfigService::prepare_runtime(const CallContext& caller,
+        const std::string& input_id, const std::set<uint32_t>& occupied_tables) {
+    access(caller);
+    const auto id = identity(input_id);
+    std::lock_guard writer(writer_mutex_);
+    require_stopped(id);
+    const auto previous = state();
+    const auto found = previous->ids.find(id);
+    if (found == previous->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
+    auto document = previous->document;
+    auto& value = document["networks"][found->second];
+    try { config::validate_network(value); }
+    catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::invalid_argument, error.what()); }
+    const bool linux_backend = config::string(value, "bridge_type") != "gvisor";
+    const bool l3 = config::string(value, "uplink_mode") != "l2";
+    std::string mac = l3 ? config::string(config::member(value, "l3"), "mac_address") : "";
+    if (linux_backend && mac.empty()) {
+        mac = config::string(value, "generated_mac");
+        if (mac.empty()) value["generated_mac"] = mac = generated_mac();
+        if (!std::regex_match(mac, std::regex("([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}")))
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid stored generated bridge MAC");
+    }
+    if (linux_backend && l3 && vlans(value).isArray()) {
+        // Reserve all known persisted table numbers, even on inactive/future
+        // entries or currently static VLANs. Never rewrite another network.
+        std::map<uint32_t, size_t> used;
+        for (const auto& row : document["networks"]) if (vlans(row).isArray()) for (const auto& vlan : vlans(row)) {
+            const auto table = route_table(vlan);
+            if (table > 0 && table <= UINT32_MAX) ++used[static_cast<uint32_t>(table)];
+        }
+        uint64_t candidate = 9991;
+        for (auto& vlan : value["l3"]["vlans"]) {
+            if (!vlan.isObject() || config::string(config::member(vlan, "ipv6"), "source") != "dhcp_pd") continue;
+            auto& pd = vlan["ipv6"]["pd"];
+            auto table = route_table(vlan);
+            if (table < 0 || table > UINT32_MAX || (table >= 253 && table <= 255))
+                throw ServiceError(ErrorCode::invalid_argument, "Invalid or reserved PD route table");
+            if (table && used[static_cast<uint32_t>(table)] != 1)
+                throw ServiceError(ErrorCode::conflict, "PD route table is reserved by another VLAN");
+            if (!table) {
+                while (candidate <= UINT32_MAX && (used.contains(static_cast<uint32_t>(candidate)) ||
+                    occupied_tables.contains(static_cast<uint32_t>(candidate)))) ++candidate;
+                if (candidate > UINT32_MAX) throw ServiceError(ErrorCode::resource_exhausted, "No PD route table available");
+                table = static_cast<int64_t>(candidate);
+                pd["route_table"] = Json::Int64(table);
+                used[static_cast<uint32_t>(table)] = 1;
+            }
+            if (config::string(pd, "duid").empty()) {
+                std::string duid = "00:03:00:01:" + mac;
+                for (auto& c : duid) if (c >= 'A' && c <= 'F') c += 'a' - 'A';
+                pd["duid"] = std::move(duid);
+            }
+        }
+    }
+    try { config::encode_json(value, 256u << 10); }
+    catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "Prepared network configuration is too large"); }
+    const auto prepared = value;
+    // A prior post-rename failure must be synced again even if identities did
+    // not change. Never launch after merely observing uncertain in-memory data.
+    if (document != previous->document || previous->durability_uncertain || previous->recovered)
+        install(decode(std::move(document), false));
+    return std::unique_ptr<NetworkRuntimeLease>(new NetworkRuntimeLease(runtime_, id, prepared, mac));
+}
 std::string NetworkConfigService::change(const CallContext& caller, Json::Value value, bool updating) {
     access(caller);
     std::string id;
@@ -143,6 +234,7 @@ std::string NetworkConfigService::change(const CallContext& caller, Json::Value 
     auto found = previous->ids.find(id);
     if (updating && found == previous->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
     if (!updating && found != previous->ids.end()) throw ServiceError(ErrorCode::conflict, "Network already exists");
+    if (updating) require_stopped(id);
     auto document = previous->document;
     auto& rows = document["networks"];
     for (Json::ArrayIndex i = 0; i < rows.size(); ++i) {
@@ -156,11 +248,16 @@ std::string NetworkConfigService::change(const CallContext& caller, Json::Value 
     if (updating) { preserve(rows[found->second], value, network_shape()); rows[found->second] = std::move(value); }
     else rows.append(std::move(value));
     auto next = decode(std::move(document), false);
+    install(std::move(next));
+    return id;
+}
+void NetworkConfigService::install(std::shared_ptr<State> next) {
     try { config::encode_json(next->document, config::JsonFile::max_bytes); }
     catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "Network configuration storage limit exceeded"); }
     try { file_.save(next->document); }
     catch (const config::CommitError& error) {
         if (error.installed) {
+            next->durability_uncertain = true;
             std::lock_guard guard(state_mutex_);
             state_ = next;
         }
@@ -168,6 +265,5 @@ std::string NetworkConfigService::change(const CallContext& caller, Json::Value 
             error.installed ? "Configuration installed; durability could not be confirmed" : "Configuration could not be saved");
     } catch (const std::exception&) { throw ServiceError(ErrorCode::io_error, "Configuration could not be saved"); }
     { std::lock_guard guard(state_mutex_); state_ = std::move(next); }
-    return id;
 }
 }

@@ -3,6 +3,7 @@
 #include "network/control_http.h"
 #include "network/links.h"
 #include "network/helper_config.h"
+#include "services/network_config.h"
 #include "runtime/managed_process.h"
 #include "common/identity.h"
 #include <cstring>
@@ -233,8 +234,11 @@ void real_gvswitch() {
     const auto path = work + "/gv";
     check(mkdir(path.c_str(), 0700) == 0, "unique gvswitch test directory");
     auto network = wire::parse(R"({"schema":2,"name":"helper contract","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"192.0.2.1/24","dhcp":{"enabled":true,"offset_start":10,"offset_end":20}}},{"vlan_id":123,"ipv6":{"cidr":"2001:db8::1/64","dhcp":{"enabled":true},"slaac":{"enabled":true}}}]}})");
-    write_file(path + "/config", wire::stringify(gvswitch_config(network)));
     Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    network["id"] = random_id(true);
+    NetworkConfigService configs(directory.get(), getuid());
+    auto lease = configs.prepare_runtime(admin, configs.create(admin, network));
+    write_file(path + "/config", wire::stringify(gvswitch_config(lease->config())));
     Netbox netbox(binaries + "/netbox");
     OwnedLinks links(directory.get(), getuid(), netbox);
     const auto tap = "gc" + random_id(false).substr(0, 8);
@@ -269,7 +273,8 @@ void real_gvswitch() {
     check(client.request(HttpMethod::get, "/contract-missing").code == 404, "real gvswitch 404 preserved");
     process.stop();
     check(!process.status().running, "real gvswitch stopped");
-    for (const char* name : {"s", "config", "network-links.json", "network-links.json.bak"}) unlinkat(directory.get(), name, 0);
+    lease.reset();
+    for (const char* name : {"s", "config", "networks.json", "networks.json.bak", "network-links.json", "network-links.json.bak"}) unlinkat(directory.get(), name, 0);
     check(rmdir(path.c_str()) == 0, "gvswitch test files removed");
 }
 void real_bridgedhcp() {
@@ -284,10 +289,14 @@ void real_bridgedhcp() {
     // forwarding or PD. No existing network interface is configured.
     auto network = wire::parse(R"({"schema":2,"name":"helper contract","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"192.0.2.1/24","dhcp":{"enabled":true,"offset_start":10,"offset_end":20}},"ipv6":{"cidr":"2001:db8::1/64","dhcp":{"enabled":true},"slaac":{"enabled":true}}}]}})");
     network["bridge_name"] = bridge;
+    network["id"] = random_id(true);
+    NetworkConfigService configs(dir.get(), getuid());
+    auto lease = configs.prepare_runtime(admin, configs.create(admin, network));
+    netbox.mac(bridge, lease->bridge_mac());
     DhcpStatics initial;
     initial.ipv4 = wire::parse(R"([{"id":"initial4","mac":"02:00:00:12:34:56","offset":15}])");
     initial.ipv6 = wire::parse(R"([{"id":"initial6","mac":"02:00:00:12:34:56","offset":19}])");
-    auto plan = bridgedhcp_config(network, {path + "/s", path + "/key", path + "/state"}, {}, {{0, initial}});
+    auto plan = bridgedhcp_config(lease->config(), {path + "/s", path + "/key", path + "/state"}, {}, {{0, initial}});
     check(plan.needed && plan.unresolved_pd.empty(), "generated DHCP helper required with no unresolved PD");
     write_file(path + "/key", token); write_file(path + "/config", wire::stringify(plan.config));
     ManagedProcess process;
@@ -296,13 +305,14 @@ void real_bridgedhcp() {
         // This must not solicit a delegation or allocate any route/rule.
         auto pd_network = network;
         pd_network["id"] = "12345678-1234-1234-abcd-123456789abc";
+        pd_network["name"] = "PD preparation contract";
         auto& pd_vlan = pd_network["l3"]["vlans"][0];
         pd_vlan["vlan_id"] = 2;
         pd_vlan["ipv6"]["source"] = "dhcp_pd";
         pd_vlan["ipv6"]["pd"]["uplink"] = bridge;
-        pd_vlan["ipv6"]["pd"]["duid"] = "00:03:00:01:02:00:00:12:34:56";
         pd_vlan["ipv6"]["pd"]["route_table"] = Json::Int64(4000000000LL);
-        auto pd_plan = bridgedhcp_config(pd_network, {path + "/pd-s", path + "/key", path + "/pd-state"}, {{2, bridge}});
+        auto pd_lease = configs.prepare_runtime(admin, configs.create(admin, pd_network));
+        auto pd_plan = bridgedhcp_config(pd_lease->config(), {path + "/pd-s", path + "/key", path + "/pd-state"}, {{2, bridge}});
         write_file(path + "/pd-config", wire::stringify(pd_plan.config));
         ChildOptions validate; validate.argv = {binaries + "/bridgedhcp", "--config", path + "/pd-config", "-check"};
         Child validation(validate);
@@ -318,6 +328,7 @@ void real_bridgedhcp() {
         const auto& iface_status = status["ifaces"][0];
         check(iface_status["exists"].asBool() && iface_status["up"].asBool() && iface_status["dhcp4"].asBool() &&
             iface_status["dhcp6"].asBool() && iface_status["slaac"].asBool(), "generated dual-stack services active on owned bridge");
+        check(iface_status["mac"] == lease->bridge_mac(), "helper observes persisted bridge MAC");
         check(iface_status["statics4"].size() == 1 && iface_status["statics4"][0]["id"] == "initial4" &&
             iface_status["statics6"].size() == 1 && iface_status["statics6"][0]["id"] == "initial6", "generated static bindings read back from helper");
         const auto unauthorized = ControlHttp(path + "/s", "wrong").request(HttpMethod::get, "/v1/status");
@@ -334,7 +345,8 @@ void real_bridgedhcp() {
         process.stop(); links.cleanup("control-test"); throw;
     }
     check(links.cleanup("control-test").empty(), "remove owned DHCP bridge");
-    for (const char* name : {"s", "key", "config", "state", "pd-config", "network-links.json", "network-links.json.bak"}) unlinkat(dir.get(), name, 0);
+    lease.reset();
+    for (const char* name : {"s", "key", "config", "state", "pd-config", "networks.json", "networks.json.bak", "network-links.json", "network-links.json.bak"}) unlinkat(dir.get(), name, 0);
     check(rmdir(path.c_str()) == 0, "bridgedhcp test files removed");
 }
 }
