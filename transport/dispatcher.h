@@ -7,6 +7,7 @@
 #include "services/network.h"
 #include "services/vm.h"
 #include "services/vm_config_upload.h"
+#include "services/configuration.h"
 #include "services/legacy_events.h"
 #include "network/host_watch.h"
 #include "input/keyboard_grab.h"
@@ -46,8 +47,21 @@ public:
     void set_packages(pkg::PkgService* service) { packages_ = service; }
     // Startup binding only; service outlives dispatcher and in-flight workers.
     void set_vm_config(VmConfigService* service) {
+        if (configuration_ && service != &configuration_->vms()) throw std::invalid_argument("Cannot replace coordinated VM configuration");
+        if (configuration_) return;
         vm_uploads_ = service || networks_ ? std::make_unique<ConfigUploads>(service, networks_) : nullptr;
         vm_config_ = service;
+    }
+    // Startup only. One staging manager shares all quotas across three domains.
+    void set_configuration(ConfigurationService* service) {
+        if (!service || configuration_ || networks_ != &service->networks() || vms_ != &service->inventory() || &tasks_ != &service->events())
+            throw std::invalid_argument("Configuration adapter participants do not match");
+        set_vm_config(&service->vms());
+        vm_uploads_ = std::make_unique<ConfigUploads>(vm_config_, networks_, [] { return ConfigUploads::Clock::now(); },
+            [service](const CallContext& caller, const std::string& revision, const Json::Value& expected) {
+                return service->remove_network(caller, revision, expected);
+            });
+        configuration_ = service;
     }
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
@@ -69,6 +83,7 @@ private:
     usb::UsbService* usb_ = nullptr;
     pkg::PkgService* packages_ = nullptr;
     VmConfigService* vm_config_ = nullptr;
+    ConfigurationService* configuration_ = nullptr;
     std::unique_ptr<VmConfigUploads> vm_uploads_;
     bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);

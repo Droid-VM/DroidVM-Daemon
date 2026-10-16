@@ -22,6 +22,9 @@ constexpr std::array network_commands{"network_create", "network_modify", "netwo
     "network_config_get", "network_config_update"};
 constexpr std::array vm_upload_commands{"vm_config_upload_begin", "vm_config_upload_append", "vm_config_upload_commit", "vm_config_upload_abort"};
 constexpr std::array network_upload_commands{"network_config_import_begin", "network_config_import_append", "network_config_import_commit", "network_config_import_abort"};
+constexpr std::array delete_upload_commands{"network_config_delete_begin", "network_config_delete_append", "network_config_delete_commit", "network_config_delete_abort"};
+bool delete_upload_command(const std::string& command) { return std::find(delete_upload_commands.begin(), delete_upload_commands.end(), command) != delete_upload_commands.end(); }
+bool configuration_command(const std::string& command) { return command == "configuration_recover" || delete_upload_command(command); }
 bool network_upload_command(const std::string& command) { return std::find(network_upload_commands.begin(), network_upload_commands.end(), command) != network_upload_commands.end(); }
 bool vm_upload_command(const std::string& command) { return std::find(vm_upload_commands.begin(), vm_upload_commands.end(), command) != vm_upload_commands.end(); }
 bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || command == "vm_start_configured" || vm_upload_command(command); }
@@ -167,6 +170,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
+    if (configuration_ && configuration_command(command)) return true;
     if (networks_ && network_upload_command(command)) return true;
     return (vm_config_ && (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
@@ -174,6 +178,43 @@ bool RequestDispatcher::background(const std::string& command) const {
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    if (configuration_ && configuration_command(command)) {
+        try {
+            if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
+            if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Configuration request must be an object");
+            const bool begin = command == "network_config_delete_begin", append = command == "network_config_delete_append";
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command != "configuration_recover" && ((begin && (key == "revision" || key == "bytes"))
+                    || (!begin && key == "upload_id") || (append && (key == "offset" || key == "data")))) continue;
+                throw ServiceError(ErrorCode::invalid_argument, "Unexpected configuration transaction field");
+            }
+            Json::Value result; result["success"] = true;
+            if (command == "configuration_recover") { configuration_->recover(caller); return result; }
+            if (begin) {
+                result["upload_id"] = vm_uploads_->begin_delete(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
+                result["chunk_bytes"] = Json::UInt64(ConfigUploads::chunk_bytes);
+                result["expires_in_seconds"] = 120;
+            } else {
+                const auto id = string_field(request, "upload_id");
+                if (command == "network_config_delete_commit") {
+                    const auto deleted = vm_uploads_->commit_delete(caller, id);
+                    result = config_status(deleted.vms); result["network_id"] = deleted.id;
+                } else if (command == "network_config_delete_abort") vm_uploads_->abort_delete(caller, id);
+                else {
+                    if (!request["data"].isString() || !request.isMember("offset"))
+                        throw ServiceError(ErrorCode::invalid_argument, "Missing deletion chunk data or offset");
+                    std::string bytes;
+                    try { bytes = wire::decode_base64(request["data"].asString(), ConfigUploads::chunk_bytes); }
+                    catch (const std::exception&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid deletion chunk encoding"); }
+                    result["received"] = Json::UInt64(vm_uploads_->append_delete(caller, id, size_field(request, "offset", 0), bytes));
+                }
+            }
+            return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Configuration outcome unknown; recover and reload before further operations")); }
+    }
     if (vm_config_ && command == "vm_start_configured") {
         try {
             auto snapshot = vm_config_->snapshot(caller);
@@ -308,6 +349,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             const auto id = legacy_id(request);
             if (id.empty()) { result["message"] = "missing network_id"; return result; }
             if (command == "network_delete") {
+                if (configuration_) throw ServiceError(ErrorCode::conflict, "Network deletion requires a coordinated confirmation");
                 // DeleteHandler: running users first, then NICs leave every VM, then the lookup.
                 if (vms_) {
                     const auto busy = vms_->busy_vms_using(id);
@@ -589,7 +631,8 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
     } catch (...) { result["message"] = "internal error"; return result; }
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
-    if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))) {
+    if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
+        && !(configuration_ && configuration_command(command))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
             result["service_api_minor"] = 1;
@@ -690,6 +733,13 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                     result["service_api_minor"] = 19;
                 }
             }
+            if (configuration_) {
+                result["network_config_delete"] = "revisioned-stopped-chunks-v1";
+                result["configuration_recover"] = "redo-v1";
+                for (const auto* name : delete_upload_commands) result["commands"].append(name);
+                result["commands"].append("configuration_recover");
+                result["service_api_minor"] = 20;
+            }
         }
         return result;
     }
@@ -698,7 +748,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
         Json::Value result;
         result["success"] = true;
-        if (command == "vm_config_status") {
+        if (configuration_ && configuration_command(command)) {
+            return execute_background(caller, command, request);
+        } else if (command == "vm_config_status") {
             return config_status(vm_config_->snapshot(caller));
         } else if (command == "vm_config_snapshot") {
             if (!vm_config_->has_events()) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");

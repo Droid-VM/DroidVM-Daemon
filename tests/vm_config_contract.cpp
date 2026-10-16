@@ -549,6 +549,45 @@ void upload_commit_faults_and_inflight_budget() {
     proceed.release();
     check(!commit.get()->durability_uncertain, "in-flight expiry cannot interrupt commit or release its reservation");
 }
+void network_delete_staging() {
+    Temporary temp;
+    VmConfigService vms(temp.directory.get(), getuid());
+    NetworkConfigService networks(temp.directory.get(), getuid());
+    auto revision = vms.snapshot(admin)->revision;
+    int calls = 0;
+    Json::Value expected; expected["id"] = random_id(true); expected["padding"] = "";
+    expected["padding"] = std::string((8u << 20) - config::encode_json(expected).size(), 'x');
+    Json::Value document; document["expected"] = expected;
+    const auto bytes = config::encode_json(document, 9u << 20);
+    ConfigUploads uploads(&vms, &networks, [] { return ConfigUploads::Clock::now(); },
+        [&](const CallContext&, const std::string& observed, const Json::Value& network) {
+            check(observed == revision && network == expected, "full old configuration reaches deletion participant");
+            ++calls; return vms.snapshot(admin);
+        });
+    error(ErrorCode::invalid_argument, [&] { uploads.begin_delete(admin, revision, (9u << 20) + 1); });
+    error(ErrorCode::conflict, [&] { uploads.begin_delete(admin, "stale", 1); });
+    auto id = uploads.begin_delete(admin, revision, bytes.size());
+    error(ErrorCode::permission_denied, [&] { uploads.append_delete({"other-admin", true, true, true}, id, 0, "x"); });
+    error(ErrorCode::not_found, [&] { uploads.abort_network(admin, id); });
+    error(ErrorCode::not_found, [&] { uploads.append(admin, id, 0, "x"); });
+    std::vector<std::string> held;
+    for (int i = 0; i < 3; ++i) held.push_back(uploads.begin_network(admin, 2));
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_delete(admin, revision, 1); });
+    for (const auto& other : held) uploads.abort_network(admin, other);
+    for (size_t offset = 0; offset < bytes.size(); offset += ConfigUploads::chunk_bytes) {
+        const auto chunk = std::string_view(bytes).substr(offset, ConfigUploads::chunk_bytes);
+        check(uploads.append_delete(admin, id, offset, chunk) == offset + chunk.size(), "deletion chunk accepted");
+    }
+    auto result = uploads.commit_delete(admin, id);
+    check(result.id == expected["id"].asString() && result.vms->revision == revision && calls == 1,
+        "deletion consumes one upload and returns identities");
+    error(ErrorCode::not_found, [&] { uploads.commit_delete(admin, id); });
+    auto malformed = uploads.begin_delete(admin, revision, 2);
+    uploads.append_delete(admin, malformed, 0, "{}");
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_delete(admin, malformed); });
+    error(ErrorCode::not_found, [&] { uploads.abort_delete(admin, malformed); });
+    check(calls == 1, "malformed payload never invokes deletion");
+}
 void strict_base64_chunks() {
     check(wire::decode_base64("Zg==", 1) == "f" && wire::decode_base64("Zm8=", 2) == "fo" && wire::decode_base64("Zm9v", 3) == "foo", "canonical base64 padding");
     check(wire::decode_base64("AP+A", 3) == std::string("\0\xff\x80", 3), "base64 binary bytes");
@@ -586,5 +625,6 @@ int main(int argc, char** argv) {
         {"upload_commit_faults_inflight_budget", upload_commit_faults_and_inflight_budget}, {"strict_base64_chunks", strict_base64_chunks},
         {"shared_upload_limits_domains", shared_upload_limits_and_domains},
         {"network_upload_full_capacity_conflict", network_upload_full_capacity_and_conflict},
-        {"network_upload_inflight_reservation", network_upload_inflight_reservation}});
+        {"network_upload_inflight_reservation", network_upload_inflight_reservation},
+        {"network_delete_full_capacity_shared_staging", network_delete_staging}});
 }

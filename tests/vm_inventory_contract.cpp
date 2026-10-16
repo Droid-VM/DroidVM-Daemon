@@ -284,6 +284,67 @@ void replacement_and_failure() {
     check(!service.exists(admin, id) && !replacement->start() && fixture.starts == 2, "removed reference cannot restart");
     check(!service.remove(admin, id), "unknown deletion retains legacy false result");
 }
+void coordinated_delete_adapter() {
+    for (bool inject : {false, true}) {
+        Fixture fixture;
+        bool fail = inject;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail && std::string_view(stage) == "participant_synced") throw std::runtime_error("adapter commit failure");
+        });
+        auto input = seed_deletion(c);
+        SystemService system([] { return true; }, [] { return "test"; }, "test", c.tasks.epoch());
+        NetworkService runtime(c.service.networks(), [](const Json::Value&) -> std::unique_ptr<network::Backend> {
+            throw std::runtime_error("test must not start a backend");
+        });
+        RequestDispatcher dispatcher(system, c.tasks, &c.service.networks(), nullptr, &runtime, nullptr, &c.inventory);
+        dispatcher.set_configuration(&c.service);
+        dispatcher.set_vm_config(&c.service.vms()); // Idempotent binding must retain deletion staging.
+        ClientSession session; session.caller.authorized = true;
+        auto caps = dispatcher.execute(session, "capabilities", {});
+        check(caps["service_api_minor"] == 20 && caps["network_config_delete"] == "revisioned-stopped-chunks-v1"
+            && caps["configuration_recover"] == "redo-v1" && dispatcher.background("network_config_delete_commit")
+            && dispatcher.background("configuration_recover"), "coordinated commands advertised and worker dispatched");
+        auto assert_error = [](const Json::Value& result, const char* code) {
+            check(result["success"] == false && result["error"]["code"] == code, "structured coordinated adapter error");
+        };
+        Json::Value old; old["network_id"] = input.network["id"];
+        assert_error(dispatcher.execute_background(admin, "network_delete", old), "CONFLICT");
+        assert_error(dispatcher.execute_background(owner, "configuration_recover", Json::Value(Json::objectValue)), "PERMISSION_DENIED");
+        Json::Value payload; payload["expected"] = input.network;
+        const auto bytes = config::encode_json(payload);
+        Json::Value begin; begin["revision"] = input.baseline->revision; begin["bytes"] = Json::UInt64(bytes.size());
+        auto bad = begin; bad["typo"] = true;
+        assert_error(dispatcher.execute_background(admin, "network_config_delete_begin", bad), "INVALID_ARGUMENT");
+        assert_error(dispatcher.execute_background({}, "network_config_delete_begin", begin), "UNAUTHENTICATED");
+        auto started = dispatcher.execute_background(admin, "network_config_delete_begin", begin);
+        check(started["success"] == true && started["chunk_bytes"] == 49152, "delete upload begun");
+        // Encode a real request payload, keeping this fixture independent of the
+        // production decoder. Full-size chunk handling is covered by upload tests.
+        const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string encoded;
+        for (size_t i = 0; i < bytes.size(); i += 3) {
+            const auto a = static_cast<unsigned char>(bytes[i]);
+            const auto b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
+            const auto d = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
+            encoded += alphabet[a >> 2]; encoded += alphabet[((a & 3) << 4) | (b >> 4)];
+            encoded += i + 1 < bytes.size() ? alphabet[((b & 15) << 2) | (d >> 6)] : '=';
+            encoded += i + 2 < bytes.size() ? alphabet[d & 63] : '=';
+        }
+        Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0; chunk["data"] = encoded;
+        check(dispatcher.execute_background(admin, "network_config_delete_append", chunk)["received"] == bytes.size(), "encoded delete confirmation accepted");
+        Json::Value commit; commit["upload_id"] = started["upload_id"];
+        const auto reply = dispatcher.execute_background(admin, "network_config_delete_commit", commit);
+        if (inject) {
+            assert_error(reply, "COMMIT_UNCERTAIN");
+            fail = false;
+            check(dispatcher.execute_background(admin, "configuration_recover", Json::Value(Json::objectValue))["success"] == true,
+                "explicit recovery repairs the original decision");
+        } else check(reply["success"] == true && reply["network_id"] == input.network["id"] && reply["persisted"] == true
+            && reply["revision"] != input.baseline->revision, "delete acknowledgement includes network identity and VM version");
+        assert_error(dispatcher.execute_background(admin, "network_config_delete_commit", commit), "NOT_FOUND");
+        check(!c.service.networks().exists(admin, input.network["id"].asString()), "adapter deletion reaches both stores");
+    }
+}
 void conditional_network_adapter() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -775,6 +836,7 @@ int main() {
         {"coordinated_gate_validation_delete_race", coordinated_constructor_and_delete_race},
         {"network_removal_atomic_inventory", network_removal_is_atomic},
         {"conditional_network_config_adapter", conditional_network_adapter},
+        {"coordinated_delete_upload_adapter", coordinated_delete_adapter},
         {"sixteen_network_removal_start_races", network_removal_races},
         {"session_overrides_failed_admission", session_overrides_and_failed_admission},
         {"invalid_session_overrides", invalid_session_overrides},

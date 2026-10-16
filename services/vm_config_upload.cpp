@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vm_config_upload.h"
 #include "common/identity.h"
+#include "store/network_config.h"
 #include <algorithm>
 
 namespace droidvm {
@@ -45,6 +46,35 @@ std::string ConfigUploads::begin_network(const CallContext& caller, size_t bytes
     if (!bytes || bytes > NetworkConfigService::max_import_bytes)
         throw ServiceError(ErrorCode::invalid_argument, "Invalid network import size");
     return begin_impl(caller, "", bytes, Kind::network);
+}
+std::string ConfigUploads::begin_delete(const CallContext& caller, const std::string& revision, size_t bytes) {
+    access(caller);
+    if (!deletion_ || !store_) throw ServiceError(ErrorCode::unavailable, "Coordinated network deletion is unavailable");
+    // Full 8 MiB stored target plus its JSON envelope, not a transport frame.
+    if (revision.empty() || revision.size() > 128 || !bytes || bytes > (9u << 20))
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid network deletion revision or size");
+    if (store_->snapshot(caller)->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before deleting");
+    return begin_impl(caller, revision, bytes, Kind::network_delete);
+}
+size_t ConfigUploads::append_delete(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+    return append_impl(caller, id, offset, bytes, Kind::network_delete);
+}
+ConfigUploads::DeletedNetwork ConfigUploads::commit_delete(const CallContext& caller, const std::string& id) {
+    DeletedNetwork result;
+    consume(caller, id, Kind::network_delete, [&](const std::string& revision, std::string_view bytes) {
+        Json::Value document;
+        try { document = config::parse_json(bytes); }
+        catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid network deletion JSON"); }
+        if (document.size() != 1 || !document["expected"].isObject())
+            throw ServiceError(ErrorCode::invalid_argument, "Expected complete network configuration");
+        try { result.id = config::uuid(document["expected"]); }
+        catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid expected network ID"); }
+        result.vms = deletion_(caller, revision, document["expected"]);
+    });
+    return result;
+}
+void ConfigUploads::abort_delete(const CallContext& caller, const std::string& id) {
+    abort_impl(caller, id, Kind::network_delete);
 }
 std::string ConfigUploads::begin_impl(const CallContext& caller, const std::string& revision, size_t bytes, Kind kind) {
     std::lock_guard lock(mutex_);

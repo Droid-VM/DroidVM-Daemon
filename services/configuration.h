@@ -16,6 +16,8 @@ public:
         VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer = {});
     VmConfigService& vms() { return *vms_; }
     NetworkConfigService& networks() { return *networks_; }
+    VmService& inventory() { return inventory_; }
+    TaskService& events() { return events_; }
     // Internal service primitive: target network must already be stopped and
     // every affected VM must admit a stopped edit. No runtime stop side effects.
     // One exact VM revision and exact network config protect the confirmation.
@@ -26,6 +28,8 @@ public:
     void recover(const CallContext& caller);
 private:
     std::shared_ptr<ConfigurationGate> gate_;
+    VmService& inventory_;
+    TaskService& events_;
     std::unique_ptr<config::ConfigTransaction> journal_;
     std::unique_ptr<NetworkConfigService> networks_;
     std::unique_ptr<VmConfigService> vms_;

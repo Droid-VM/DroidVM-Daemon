@@ -19,7 +19,8 @@ bool references(const Json::Value& nic, const std::string& id) {
 }
 }
 ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shared_ptr<ConfigurationGate> gate,
-        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer) : gate_(std::move(gate)) {
+        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer)
+    : gate_(std::move(gate)), inventory_(inventory), events_(events) {
     if (!gate_ || inventory.context_.configuration_gate != gate_ || events.config_gate_ != gate_)
         throw std::invalid_argument("Configuration participants must share one gate");
     auto exclusive = gate_->transaction();

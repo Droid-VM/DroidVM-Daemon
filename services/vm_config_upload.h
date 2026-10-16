@@ -14,13 +14,15 @@ class ConfigUploads {
 public:
     using Clock = std::chrono::steady_clock;
     using Now = std::function<Clock::time_point()>;
+    using DeleteNetwork = std::function<VmConfigService::Snapshot(const CallContext&, const std::string&, const Json::Value&)>;
+    struct DeletedNetwork { std::string id; VmConfigService::Snapshot vms; };
     static constexpr size_t chunk_bytes = 48u << 10;
     static constexpr size_t max_uploads = 4, max_reserved = 32u << 20;
     static constexpr auto lifetime = std::chrono::minutes(2);
     explicit ConfigUploads(VmConfigService& store, Now now = [] { return Clock::now(); })
         : ConfigUploads(&store, nullptr, std::move(now)) {}
-    ConfigUploads(VmConfigService* store, NetworkConfigService* networks, Now now = [] { return Clock::now(); })
-        : store_(store), networks_(networks), now_(std::move(now)) {}
+    ConfigUploads(VmConfigService* store, NetworkConfigService* networks, Now now = [] { return Clock::now(); }, DeleteNetwork deletion = {})
+        : store_(store), networks_(networks), now_(std::move(now)), deletion_(std::move(deletion)) {}
     std::string begin(const CallContext& caller, const std::string& revision, size_t bytes);
     // Exact contiguous byte offsets; repeated identical chunks are idempotent.
     size_t append(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes);
@@ -30,8 +32,12 @@ public:
     size_t append_network(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes);
     Json::Value commit_network(const CallContext& caller, const std::string& id);
     void abort_network(const CallContext& caller, const std::string& id);
+    std::string begin_delete(const CallContext& caller, const std::string& revision, size_t bytes);
+    size_t append_delete(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes);
+    DeletedNetwork commit_delete(const CallContext& caller, const std::string& id);
+    void abort_delete(const CallContext& caller, const std::string& id);
 private:
-    enum class Kind { vm, network };
+    enum class Kind { vm, network, network_delete };
     struct Upload {
         std::string principal, revision;
         std::vector<char> data;
@@ -43,6 +49,7 @@ private:
     VmConfigService* store_;
     NetworkConfigService* networks_;
     Now now_;
+    DeleteNetwork deletion_;
     std::mutex mutex_;
     std::map<std::string, std::shared_ptr<Upload>> uploads_;
     size_t reserved_ = 0;
