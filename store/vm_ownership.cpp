@@ -55,4 +55,6 @@ void claim_vm_config(int directory, uid_t owner) { gate(directory, owner, true, 
 void require_legacy_vm_config(int directory, uid_t owner) { gate(directory, owner, false, "vms.config-owner"); }
 void claim_network_config(int directory, uid_t owner) { gate(directory, owner, true, "networks.config-owner"); }
 void require_legacy_network_config(int directory, uid_t owner) { gate(directory, owner, false, "networks.config-owner"); }
+void claim_disk_config(int directory, uid_t owner) { gate(directory, owner, true, "disks.config-owner"); }
+void require_legacy_disk_config(int directory, uid_t owner) { gate(directory, owner, false, "disks.config-owner"); }
 }

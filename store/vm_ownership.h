@@ -10,4 +10,6 @@ void claim_vm_config(int directory, uid_t owner);
 void require_legacy_vm_config(int directory, uid_t owner);
 void claim_network_config(int directory, uid_t owner);
 void require_legacy_network_config(int directory, uid_t owner);
+void claim_disk_config(int directory, uid_t owner);
+void require_legacy_disk_config(int directory, uid_t owner);
 }

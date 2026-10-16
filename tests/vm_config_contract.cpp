@@ -150,43 +150,53 @@ void network_upload_inflight_reservation() {
     proceed.release();
     check(commit.get().size() == 1, "inflight import retains shared slot through publication");
 }
-void ownership_gate() {
+void ownership_gate_impl(const char* name, void (*claim)(int, uid_t), void (*legacy_check)(int, uid_t)) {
     Temporary temp;
-    config::require_legacy_vm_config(temp.directory.get(), getuid());
+    legacy_check(temp.directory.get(), getuid());
     {
-        Fd legacy(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_CLOEXEC));
+        Fd legacy(openat(temp.directory.get(), name, O_RDWR | O_CLOEXEC));
         struct flock lock{}; lock.l_type = F_WRLCK; lock.l_whence = SEEK_SET;
         check(fcntl(legacy.get(), F_SETLK, &lock) == 0, "take Java-compatible POSIX write lock");
         bool refused = false;
-        try { config::claim_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+        try { claim(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
         check(refused, "native transition excludes legacy write in progress");
         struct stat info{};
         check(fstat(legacy.get(), &info) == 0 && info.st_size == 0, "busy transition never installs ownership");
     }
-    config::claim_vm_config(temp.directory.get(), getuid());
-    config::claim_vm_config(temp.directory.get(), getuid());
+    claim(temp.directory.get(), getuid());
+    claim(temp.directory.get(), getuid());
     bool refused = false;
-    try { config::require_legacy_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    try { legacy_check(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
     check(refused, "persistent owner refuses legacy even after lock release");
     {
-        Fd file(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_TRUNC | O_CLOEXEC));
+        Fd file(openat(temp.directory.get(), name, O_RDWR | O_TRUNC | O_CLOEXEC));
         check(write(file.get(), "native-", 7) == 7, "inject interrupted marker");
     }
-    config::claim_vm_config(temp.directory.get(), getuid());
+    claim(temp.directory.get(), getuid());
     {
-        Fd file(openat(temp.directory.get(), "vms.config-owner", O_RDWR | O_CLOEXEC));
+        Fd file(openat(temp.directory.get(), name, O_RDWR | O_CLOEXEC));
         char value[10];
         check(read(file.get(), value, 10) == 10 && std::string_view(value, 10) == "native-v1\n", "recover interrupted ownership marker");
         check(pwrite(file.get(), "unknown", 7, 0) == 7, "inject unknown owner");
     }
     refused = false;
-    try { config::claim_vm_config(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    try { claim(temp.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
     check(refused, "unknown marker refuses takeover");
     Temporary links;
-    check(symlinkat("target", links.directory.get(), "vms.config-owner") == 0, "create unsafe gate link");
+    check(symlinkat("target", links.directory.get(), name) == 0, "create unsafe gate link");
     refused = false;
-    try { config::claim_vm_config(links.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
+    try { claim(links.directory.get(), getuid()); } catch (const std::exception&) { refused = true; }
     check(refused && faccessat(links.directory.get(), "target", F_OK, 0) != 0, "gate never follows symlink");
+}
+void ownership_gate() {
+    ownership_gate_impl("vms.config-owner", config::claim_vm_config, config::require_legacy_vm_config);
+}
+void disk_ownership_gate() {
+    ownership_gate_impl("disks.config-owner", config::claim_disk_config, config::require_legacy_disk_config);
+    Temporary temp;
+    config::claim_disk_config(temp.directory.get(), getuid());
+    config::require_legacy_vm_config(temp.directory.get(), getuid());
+    config::require_legacy_network_config(temp.directory.get(), getuid());
 }
 void migration_roundtrip_and_revision() {
     Temporary temp;
@@ -613,7 +623,7 @@ int main(int argc, char** argv) {
             return 0;
         } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     }
-    return run({{"ownership_transition", ownership_gate}, {"migration_roundtrip_revision", migration_roundtrip_and_revision},
+    return run({{"ownership_transition", ownership_gate}, {"disk_ownership_transition", disk_ownership_gate}, {"migration_roundtrip_revision", migration_roundtrip_and_revision},
         {"empty_permissions_validation", empty_permissions_and_validation},
         {"twelve_writers_stale_noop", twelve_writers_and_stale_noop},
         {"failure_visibility_retry", failure_visibility_and_retry},
