@@ -61,14 +61,13 @@ int legacy_int(const Json::Value& request, const char* key, int fallback) {
     return static_cast<int>(number);
 }
 // JSONObject.optBoolean: a boolean, or the strings "true"/"false" in any case.
-bool legacy_flag(const Json::Value& request, const char* key) {
-    if (!request.isMember(key)) return false;
-    const auto& value = request[key];
-    if (value.isBool()) return value.asBool();
-    if (!value.isString()) return false;
-    auto text = value.asString();
-    for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return text == "true";
+bool legacy_flag(const Json::Value& request, const char* key, bool fallback = false) {
+    if (!request.isMember(key)) return fallback;
+    return input::java_boolean(request[key], fallback);
+}
+constexpr std::array keyboard_commands{"kbd_config", "kbd_grab", "kbd_status"};
+bool keyboard_command(const std::string& command) {
+    return std::find(keyboard_commands.begin(), keyboard_commands.end(), command) != keyboard_commands.end();
 }
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
@@ -143,7 +142,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (host_network_ && host_command(command)) || (vms_ && vm_command(command)) ||
+    return (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
@@ -152,6 +151,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
     if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
+    if (keyboard_ && keyboard_command(command)) return execute_keyboard(caller, command, request);
     try {
         if (host_command(command) && host_network_) {
             result["data"] = command == "network_list_uplinks" ? host_network_->uplinks(caller) :
@@ -405,6 +405,35 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
         return result;
     } catch (...) { result["message"] = "internal error"; return result; }
 }
+Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    Json::Value result;
+    result["success"] = false;
+    try {
+        if (command == "kbd_config") {
+            // Through from_json, so one place decides what a usable chord is.
+            const auto current = keyboard_->config();
+            Json::Value config;
+            config["enabled"] = legacy_flag(request, "enabled", current.enabled);
+            config["escape_chord"] = request.isMember("escape_chord") && request["escape_chord"].isArray() ? request["escape_chord"] : current.json()["escape_chord"];
+            keyboard_->set_config(input::KeyboardGrabConfig::from_json(config));
+        } else if (command == "kbd_grab") {
+            const auto vm = legacy_id(request, "vm_id");
+            const auto screen = legacy_id(request, "screen");
+            if (!legacy_flag(request, "grab", true)) {
+                if (vm.empty()) keyboard_->release("asked over IPC");
+                else keyboard_->release_for(vm, screen);
+            } else {
+                if (vm.empty()) { result["message"] = "missing vm_id"; return result; }
+                if (!vms_ || !vms_->exists(caller, vm)) { result["message"] = "VM not found: " + vm; return result; }
+                keyboard_->request(vm, screen);
+            }
+        }
+        auto status = keyboard_->status();
+        for (const auto& key : status.getMemberNames()) result[key] = status[key];
+        result["success"] = true;
+        return result;
+    } catch (...) { result["message"] = "internal error"; return result; }
+}
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end()) {
         auto result = system_.execute(session.caller, command, request);
@@ -446,6 +475,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["vm_runtime_backends"].append("qemu");
                 result["vm_auto_up"] = true;
                 result["service_api_minor"] = 8;
+            }
+            if (keyboard_) {
+                for (const auto* name : keyboard_commands) result["commands"].append(name);
+                result["keyboard_grab"] = true;
+                result["service_api_minor"] = 9;
             }
         }
         return result;

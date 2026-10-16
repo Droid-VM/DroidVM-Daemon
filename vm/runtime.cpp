@@ -169,6 +169,11 @@ void VmRuntime::set_state(State next) {
     if (next == State::stopped && context_.pool) context_.pool->release(id_);
     { std::lock_guard lock(state_mutex_); state_ = next; }
     fire("state");
+    if (context_.state_changed) {
+        // Guarded: a state change never fails because of the keyboard.
+        try { context_.state_changed(id_, config::string(config(), "name"), next); }
+        catch (const std::exception& error) { context_.warn(std::string("keyboard: state hook failed: ") + error.what()); }
+    }
     if (next == State::stopped) idle_.notify_all();
 }
 void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
@@ -411,7 +416,10 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     const auto command = crosvm_command(config, run, plan, host);
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.
-        try { input_.listen(command.input_sockets); }
+        InputBridge::Status status;
+        if (context_.input_status)
+            status = [this](const std::string& screen, int, std::string records) { context_.input_status(id_, screen, std::move(records)); };
+        try { input_.listen(command.input_sockets, std::move(status)); }
         catch (const std::invalid_argument& error) { failure = std::string("display input setup failed: ") + error.what(); return false; }
     }
     if (command.udmabuf_limit_mb) {

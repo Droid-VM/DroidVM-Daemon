@@ -16,6 +16,8 @@
 #include "network/host_watch.h"
 #include "services/vm.h"
 #include "services/legacy_events.h"
+#include "input/keyboard_grab.h"
+#include "vm/command_common.h"
 #include "vm/hugepage.h"
 #include "vm/nic.h"
 #include "build_metadata.h"
@@ -45,6 +47,9 @@ int main(int argc, char** argv) {
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
         int write_delay_ms = 0;
 #endif
+#ifdef DROIDVM_KEYBOARD_FIXTURE
+        std::string keyboard_name; // the only keyboard this test daemon may see
+#endif
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help") {
@@ -57,6 +62,9 @@ int main(int argc, char** argv) {
             else if (arg == "--run-dir" && i + 1 < argc) directory = argv[++i];
             else if (arg == "--data-dir" && i + 1 < argc) data_directory = argv[++i];
             else if (arg == "--apk" && i + 1 < argc) apk = argv[++i];
+#ifdef DROIDVM_KEYBOARD_FIXTURE
+            else if (arg == "--test-keyboard-name" && i + 1 < argc) keyboard_name = argv[++i];
+#endif
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
             else if (arg == "--test-write-delay-ms" && i + 1 < argc) {
                 write_delay_ms = std::stoi(argv[++i]);
@@ -67,6 +75,9 @@ int main(int argc, char** argv) {
         }
         if ((directory.empty() == data_directory.empty()) || apk.empty())
             throw std::runtime_error("exactly one of --run-dir/--data-dir and --apk are required");
+#ifdef DROIDVM_KEYBOARD_FIXTURE
+        if (keyboard_name.empty()) throw std::runtime_error("--test-keyboard-name is required");
+#endif
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
         auto first_write = std::make_shared<std::atomic<bool>>(true);
         observer = [first_write, write_delay_ms](const char* stage) {
@@ -146,6 +157,8 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::NetworkHostService> host_network;
             std::unique_ptr<droidvm::NetworkService> network_runtime;
             std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
+            // Outlives vms: their state hooks reach it until the last VM stops.
+            std::unique_ptr<droidvm::input::KeyboardGrab> keyboard;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
             droidvm::vm::HugepagePool hugepages;
@@ -202,7 +215,38 @@ int main(int argc, char** argv) {
                     else owned_links->cleanup(network + "/" + tap); // network gone: remove the TAP directly
                 };
                 context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
+                context.state_changed = [&](const std::string& id, const std::string& name, droidvm::VmState state) {
+                    if (keyboard) keyboard->on_vm_state(id, name, droidvm::vm::command::lower(droidvm::vm_state_name(state)));
+                };
+                context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
+                    if (keyboard) keyboard->on_guest_status(id, screen, records);
+                };
                 vms = std::make_unique<droidvm::VmService>(files.get(), context);
+                droidvm::input::KeyboardGrab::Hooks keys;
+                keys.find = [&, internal](const std::string& id) -> std::optional<std::string> {
+                    try { return vms->runtime(internal, id)->id(); }
+                    catch (const droidvm::ServiceError&) { return std::nullopt; }
+                };
+                keys.running = [&, internal](const std::string& id) {
+                    try { return vms->state(internal, id) == droidvm::VmState::running; }
+                    catch (const droidvm::ServiceError&) { return false; }
+                };
+                keys.deliver = [&, internal](const std::string& id, const std::string& screen, std::string_view records) {
+                    std::shared_ptr<droidvm::vm::VmRuntime> target;
+                    try { target = vms->runtime(internal, id); }
+                    catch (const droidvm::ServiceError&) { return false; }
+                    // VMInstance.writeNativeInput: only a running VM; channel 1 is the keyboard.
+                    return target->state() == droidvm::VmState::running && target->write_input(screen, 1, records);
+                };
+                keys.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+#ifdef DROIDVM_KEYBOARD_FIXTURE
+                keys.scan = [keyboard_name] {
+                    auto found = droidvm::input::scan_keyboards();
+                    std::erase_if(found, [&](const droidvm::input::HostKeyboard& item) { return item.name != keyboard_name; });
+                    return found;
+                };
+#endif
+                keyboard = std::make_unique<droidvm::input::KeyboardGrab>(files.get(), std::move(keys));
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
@@ -232,7 +276,7 @@ int main(int argc, char** argv) {
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events);
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();

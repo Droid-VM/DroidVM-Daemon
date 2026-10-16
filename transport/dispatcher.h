@@ -8,6 +8,7 @@
 #include "services/vm.h"
 #include "services/legacy_events.h"
 #include "network/host_watch.h"
+#include "input/keyboard_grab.h"
 
 namespace droidvm {
 struct ClientSession {
@@ -21,8 +22,10 @@ class RequestDispatcher {
 public:
     RequestDispatcher(SystemService& system, TaskService& tasks, NetworkConfigService* networks = nullptr,
                       NetworkHostService* host_network = nullptr, NetworkService* runtime = nullptr,
-                      network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr, LegacyEvents* events = nullptr)
-        : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms), events_(events) {}
+                      network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr, LegacyEvents* events = nullptr,
+                      input::KeyboardGrab* keyboard = nullptr)
+        : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms), events_(events),
+          keyboard_(keyboard) {}
     LegacyEvents* legacy_events() const { return events_; }
     bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr || (vms_ && !vms_swept_); }
     void maintenance() {
@@ -46,7 +49,9 @@ private:
     network::HostIpv4Watch* host_ipv4_;
     VmService* vms_;
     LegacyEvents* events_;
+    input::KeyboardGrab* keyboard_;
     bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);
+    Json::Value execute_keyboard(const CallContext& caller, const std::string& command, const Json::Value& request);
 };
 }
