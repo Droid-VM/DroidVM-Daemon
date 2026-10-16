@@ -2,6 +2,7 @@
 #include "contracts.h"
 #include "common/identity.h"
 #include "runtime/log.h"
+#include "runtime/cleanup.h"
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -72,6 +73,20 @@ void parallel_and_restart() {
             check(text.find("worker=" + std::to_string(worker) + " record=" + std::to_string(i) + '\n') != std::string::npos,
                   "complete concurrent record");
 }
+void cleanup_continues_after_failure() {
+    Cleanup cleanup;
+    std::vector<std::string> stages;
+    auto report = [&](const char* stage, const char*) {
+        stages.emplace_back(stage);
+        throw std::runtime_error("diagnostic sink failed");
+    };
+    check(!cleanup.attempt("VMs", [] { throw std::runtime_error("stop failed"); }, report), "failed cleanup reported");
+    check(cleanup.attempt("USB", [&] { stages.emplace_back("USB"); }, report), "USB cleanup still runs");
+    check(!cleanup.attempt("network", [] { throw 1; }, report), "nonstandard failure contained");
+    check(cleanup.attempt("files", [&] { stages.emplace_back("files"); }, report), "final cleanup still runs");
+    check(stages == std::vector<std::string>({"VMs", "USB", "network", "files"}), "dependency order retained after failures");
+    check(cleanup.failed(), "later success does not erase failure");
+}
 void write_failure() {
     Temporary temp;
     RuntimeLog log(temp.directory.get(), getuid());
@@ -92,5 +107,6 @@ void write_failure() {
 int main() {
     return run({{"bounded_records_same_reader_inode", bounds_and_reader},
                 {"concurrent_lines_and_restart", parallel_and_restart},
-                {"write_failure_disables_sink", write_failure}});
+                {"write_failure_disables_sink", write_failure},
+                {"cleanup_continues_after_failure", cleanup_continues_after_failure}});
 }

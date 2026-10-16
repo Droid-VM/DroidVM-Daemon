@@ -2,6 +2,7 @@
 #include "runtime/instance.h"
 #include "runtime/layout.h"
 #include "runtime/log.h"
+#include "runtime/cleanup.h"
 #include "services/system.h"
 #include "network/switch_runtime.h"
 #include "network/gvswitch.h"
@@ -405,22 +406,30 @@ int main(int argc, char** argv) {
                 dispatcher.set_display_attach([&](const std::string& nonce) { display->attach(nonce); });
             }
 #endif
-            const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
+            droidvm::Cleanup cleanup;
+            const auto report_failure = [&](const char* stage, const char* error) {
+                if (log) log->write("ERROR", std::string(stage) + ": " + error);
+            };
+            int result = 1;
+            cleanup.attempt("server", [&] {
+                result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
+            }, report_failure);
             // Task teardown completes while both the instance lock and log are held.
-            tasks.shutdown();
-            if (packages) packages->shutdown(); // a stopped import removes what it wrote
+            cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure);
+            cleanup.attempt("packages", [&] { if (packages) packages->shutdown(); }, report_failure);
             // VMs leave before USB/networks: their taps and devices go with them.
-            if (vms) vms->stop_all();
-            if (usb) usb->shutdown(); // returns devices and restores drivers_autoprobe
-            if (host_ipv4) host_ipv4->stop();
+            cleanup.attempt("VMs", [&] { if (vms) vms->stop_all(); }, report_failure);
+            cleanup.attempt("USB", [&] { if (usb) usb->shutdown(); }, report_failure);
+            cleanup.attempt("host address monitor", [&] { if (host_ipv4) host_ipv4->stop(); }, report_failure);
 #ifdef DROIDVM_PLATFORM_SERVICES
-            audio_table.stop();
+            cleanup.attempt("audio", [&] { audio_table.stop(); }, report_failure);
 #endif
-            if (network_runtime) {
+            cleanup.attempt("networks", [&] { if (network_runtime) {
                 const auto failures = network_runtime->shutdown();
                 if (!failures.empty()) throw std::runtime_error("Network shutdown incomplete: " + droidvm::wire::stringify(failures));
                 linux_firewall.stop(); // every Linux network was removed above
-            }
+            } }, report_failure);
+            if (cleanup.failed()) result = 1;
             if (log) log->write("INFO", "stopped exit=" + std::to_string(result));
             return result;
         } catch (const std::exception& error) {
