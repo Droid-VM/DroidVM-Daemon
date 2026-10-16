@@ -74,6 +74,7 @@ constexpr std::array usb_commands{"usb_attach", "usb_detach", "usb_host_list", "
 bool usb_command(const std::string& command) {
     return std::find(usb_commands.begin(), usb_commands.end(), command) != usb_commands.end();
 }
+bool package_command(const std::string& command) { return command == "vm_export" || command == "vm_import"; }
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
@@ -147,7 +148,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) ||
+    return (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
@@ -157,6 +158,16 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
     if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
+    if (packages_ && package_command(command)) {
+        // ExportHandler/ImportHandler: RequestException texts, else "internal error".
+        try {
+            const auto response = command == "vm_export" ? packages_->vm_export(request) : packages_->vm_import(request);
+            for (const auto& key : response.getMemberNames()) result[key] = response[key];
+            result["success"] = true;
+        } catch (const pkg::RequestError& error) { result["message"] = error.what(); }
+        catch (...) { result["message"] = "internal error"; }
+        return result;
+    }
     if (keyboard_ && keyboard_command(command)) return execute_keyboard(caller, command, request);
     if (usb_ && usb_command(command)) {
         // RequestException texts reach the client; anything else is "internal error".
@@ -510,6 +521,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (usb_) {
                 for (const auto* name : usb_commands) result["commands"].append(name);
                 result["usb_passthrough"] = true;
+            }
+            if (packages_) {
+                result["commands"].append("vm_export");
+                result["commands"].append("vm_import");
+                result["vm_packages"] = true;
             }
             if (display_attach_) {
                 result["commands"].append("display_attach");

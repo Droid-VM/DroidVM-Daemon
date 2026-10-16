@@ -1,0 +1,521 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// vm_export/vm_import building blocks: tar, compression, the .vmpkg layout,
+// volumes, manifests and the plan helpers, including corrupt input.
+#include "pkg/plan.h"
+#include "pkg/writer.h"
+#include "store/network_config.h"
+#include "common/identity.h"
+#include "common/wire.h"
+#include <cstring>
+#include <fcntl.h>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <random>
+#include <sys/stat.h>
+#include <unistd.h>
+
+using namespace droidvm;
+using namespace droidvm::pkg;
+namespace {
+void check(bool value, const std::string& detail) { if (!value) throw std::runtime_error(detail); }
+template<class F> void fails(const std::string& expected, F&& fn) {
+    try { fn(); } catch (const std::exception& error) {
+        check(std::string(error.what()) == expected, "expected '" + expected + "', got '" + error.what() + "'");
+        return;
+    }
+    throw std::runtime_error("expected failure: " + expected);
+}
+template<class F> void fails_any(F&& fn, const char* detail) {
+    try { fn(); } catch (const std::exception&) { return; }
+    throw std::runtime_error(std::string("expected failure: ") + detail);
+}
+struct Temporary {
+    std::string path = "/data/local/tmp/droidvm-pkg-contract-" + random_id(false);
+    Temporary() { check(mkdir(path.c_str(), 0700) == 0, "create test directory"); }
+    ~Temporary() { delete_tree(path); }
+    std::string at(const std::string& name) const { return path + "/" + name; }
+};
+std::string bytes_of(const std::string& path) {
+    FileSource in(path);
+    std::string out, buffer(65536, '\0');
+    while (const auto count = in.read(buffer.data(), buffer.size())) out.append(buffer.data(), count);
+    return out;
+}
+void put(const std::string& path, std::string_view bytes) {
+    FileSink out(path);
+    out.append(bytes);
+    out.close();
+}
+std::string sample(size_t size, uint32_t seed, bool compressible) {
+    std::mt19937 random(seed);
+    std::string out(size, '\0');
+    for (size_t i = 0; i < size; ++i) out[i] = compressible ? static_cast<char>("droidvm-package "[(i / 7) % 16]) : static_cast<char>(random());
+    return out;
+}
+std::string read_all(Source& in) {
+    std::string out, buffer(7919, '\0');
+    while (const auto count = in.read(buffer.data(), buffer.size())) out.append(buffer.data(), count);
+    return out;
+}
+std::string encode(const std::string& data, Compression compression) {
+    StringSink out;
+    auto encoder = compress(out, compression);
+    // Uneven writes exercise the encoders' buffering.
+    for (size_t offset = 0; offset < data.size();) {
+        const auto chunk = std::min<size_t>(data.size() - offset, 1 + (offset * 31) % 100003);
+        encoder->write(data.data() + offset, chunk);
+        offset += chunk;
+    }
+    encoder->finish();
+    return out.value;
+}
+std::string decode(const std::string& data, Compression compression) {
+    MemorySource in(data);
+    auto decoder = decompress(in, compression);
+    return read_all(*decoder);
+}
+struct Entry { std::string name; int64_t size; std::string data; };
+std::vector<Entry> untar(const std::string& archive) {
+    MemorySource in(archive);
+    std::vector<Entry> entries;
+    TarReader(in).for_each([&](const std::string& name, int, int64_t size, Source& content) {
+        entries.push_back({name, size, read_all(content)});
+    });
+    return entries;
+}
+
+void tar_round_trip() {
+    StringSink out;
+    TarWriter tar(out);
+    const auto big = sample(70000, 1, false);
+    tar.entry("manifest.json", "{}");
+    tar.entry("empty.img", "");
+    tar.entry("block.img", std::string(512, 'b'));
+    tar.entry("big.qcow2", static_cast<int64_t>(big.size()), [&](Sink& sink) { sink.write(big.data(), 1000); sink.write(big.data() + 1000, big.size() - 1000); });
+    tar.close();
+    check(out.value.size() % 512 == 0 && out.value.size() == 512 * 145, "tar layout size");
+    // ustar header fields as TarWriter writes them.
+    check(std::memcmp(out.value.data() + 257, "ustar\0", 6) == 0 && std::memcmp(out.value.data() + 100, "0000644\0", 8) == 0 &&
+          std::memcmp(out.value.data() + 124, "00000000002\0", 12) == 0 && out.value[156] == '0', "ustar header fields");
+    unsigned sum = 0;
+    for (size_t i = 0; i < 512; ++i) sum += i >= 148 && i < 156 ? ' ' : static_cast<unsigned char>(out.value[i]);
+    char text[16];
+    std::snprintf(text, sizeof(text), "%o ", sum);
+    check(std::string(out.value.data() + 148) == text, "checksum is octal plus space");
+    const auto entries = untar(out.value);
+    check(entries.size() == 4 && entries[0].data == "{}" && entries[1].data.empty() && entries[2].data == std::string(512, 'b') &&
+          entries[3].data == big && entries[3].name == "big.qcow2", "tar entries read back");
+}
+void tar_edges() {
+    // A name over 100 units: a regular ./@LongLink entry, then the name cut to 100 bytes.
+    StringSink out;
+    TarWriter tar(out);
+    const std::string name(120, 'n');
+    tar.entry(name, "x");
+    tar.close();
+    auto entries = untar(out.value);
+    check(entries.size() == 2 && entries[0].name == "./@LongLink" && entries[0].data == name && entries[1].name == name.substr(0, 100), "long names");
+    // GNU 'L' entries rename the next one; other types are skipped.
+    auto block = [](const std::string& entry, char type, uint64_t size, bool base256) {
+        std::string header(512, '\0');
+        std::memcpy(header.data(), entry.data(), std::min<size_t>(entry.size(), 100));
+        if (base256) { header[124] = static_cast<char>(0x80); for (int i = 135; i >= 125; --i) { header[i] = static_cast<char>(size & 0xff); size >>= 8; } }
+        else { char digits[16]; std::snprintf(digits, sizeof(digits), "%011llo", static_cast<unsigned long long>(size)); std::memcpy(header.data() + 124, digits, 11); }
+        header[156] = type;
+        return header;
+    };
+    std::string archive = block("././@LongLink", 'L', 9, false) + std::string("long-name") + std::string(503, '\0') +
+        block("short", '0', 3, true) + "abc" + std::string(509, '\0') + block("dir", '5', 0, false) + block("tail", 0, 1, false) + "z" +
+        std::string(511, '\0') + std::string(1024, '\0');
+    entries = untar(archive);
+    check(entries.size() == 2 && entries[0].name == "long-name" && entries[0].data == "abc" && entries[1].name == "tail", "L entries, base-256, skipped types");
+    // A stream that just ends counts as the end of the archive.
+    check(untar("").empty(), "empty stream");
+    fails("unexpected end of tar header", [&] { untar(std::string(100, 'x')); });
+    fails("unexpected end of tar entry", [&] { untar(block("cut", '0', 600, false) + std::string(10, 'y')); });
+    StringSink sink;
+    TarWriter writer(sink);
+    fails("entry overwrote its declared size", [&] { writer.entry("a", 1, [](Sink& o) { o.write("ab", 2); }); });
+    StringSink other;
+    TarWriter second(other);
+    fails("entry b: short write (1 of 3 bytes)", [&] { second.entry("b", 3, [](Sink& o) { o.write("a", 1); }); });
+    second.close();
+    fails("TarWriter closed", [&] { second.entry("c", ""); });
+}
+void compression_round_trips() {
+    for (const auto compression : {Compression::none, Compression::gzip, Compression::xz, Compression::zstd}) {
+        for (const auto& data : {std::string(), sample(1, 2, false), sample(3u << 20, 3, true), sample(1u << 20, 4, false)}) {
+            const auto packed = encode(data, compression);
+            check(decode(packed, compression) == data, std::string("round trip ") + compression_name(compression));
+            if (compression != Compression::none && data.size() > 100) check(packed != data, "encoded");
+        }
+    }
+    // Formats as written: gzip magic, XZ header with CRC64 (check id 4), a zstd frame.
+    check(encode("x", Compression::gzip).substr(0, 3) == "\x1f\x8b\x08", "gzip header");
+    const auto xz = encode("x", Compression::xz);
+    check(std::memcmp(xz.data(), "\xfd" "7zXZ\0", 6) == 0, "xz magic");
+    check(xz[7] == 4, "xz check is CRC64");
+    check(std::memcmp(encode("x", Compression::zstd).data(), "\x28\xb5\x2f\xfd", 4) == 0, "zstd magic");
+    // Concatenated members, streams and frames read as one stream.
+    for (const auto compression : {Compression::gzip, Compression::xz, Compression::zstd})
+        check(decode(encode("first-", compression) + encode("second", compression), compression) == "first-second",
+              std::string("concatenated ") + compression_name(compression));
+}
+void compression_corruption() {
+    const auto data = sample(200000, 5, true);
+    fails("Not in GZIP format", [&] { decode("plain text", Compression::gzip); });
+    fails("Input is not in the XZ format", [&] { decode("plain text, long enough", Compression::xz); });
+    fails("Unknown frame descriptor", [&] { decode("plain text, long enough", Compression::zstd); });
+    for (const auto compression : {Compression::gzip, Compression::xz, Compression::zstd}) {
+        const auto packed = encode(data, compression);
+        fails_any([&] { decode(packed.substr(0, packed.size() / 2), compression); }, "truncated");
+        auto flipped = packed;
+        flipped[flipped.size() / 2] ^= 0x55;
+        flipped[flipped.size() - 6] ^= 0x55;
+        fails_any([&] { if (decode(flipped, compression) != data) throw std::runtime_error("silent corruption"); }, "corrupt");
+    }
+    const auto gz = encode(data, Compression::gzip);
+    fails("Unexpected end of ZLIB input stream", [&] { decode(gz.substr(0, gz.size() - 4), Compression::gzip); });
+    const auto zst = encode(data, Compression::zstd);
+    fails("Read error or truncated source", [&] { decode(zst.substr(0, zst.size() - 3), Compression::zstd); });
+}
+void header_contract() {
+    const auto header = Header::build(2, 31, 1234, Compression::xz, 0x0102030405060708ll, 7);
+    check(std::memcmp(header.data(), "VMPKG\0", 6) == 0 && header[6] == 2 && header[8] == 31 && static_cast<unsigned char>(header[10]) == (1234 & 0xff) &&
+          header[12] == 2 && header[14] == 7 && header[16] == 8 && header[23] == 1, "header layout");
+    const auto parsed = Header::parse(header.data());
+    check(parsed.manifest_version == 2 && parsed.app_version_code == 31 && parsed.manifest_size == 1234 && parsed.compression == 2 &&
+          parsed.volume_count == 7 && parsed.data_size == 0x0102030405060708ll, "header parse");
+    auto bad = header;
+    bad[5] = 'x';
+    fails("invalid package header", [&] { Header::parse(bad.data()); });
+    fails("unsupported vmpkg manifest version: 3", [&] { Header::parse(Header::build(3, 0, 1, Compression::none, 0, 0).data()); });
+    fails("unsupported vmpkg manifest version: 0", [&] { Header::parse(Header::build(0, 0, 1, Compression::none, 0, 0).data()); });
+    bad = Header::build(1, 0, 1, Compression::none, 0, 0); bad[12] = 9;
+    fails("unsupported vmpkg compression: 9", [&] { Header::parse(bad.data()); });
+    fails("empty vmpkg manifest", [&] { Header::parse(Header::build(1, 0, 0, Compression::none, 0, 0).data()); });
+    bad = Header::build(1, 0, 1, Compression::none, 0, 0); bad[23] = static_cast<char>(0x80);
+    fails("vmpkg data size is too large", [&] { Header::parse(bad.data()); });
+    fails("uint16 out of range: 70000", [&] { Header::build(1, 70000, 1, Compression::none, 0, 0); });
+    check(align_up(24) == 4096 && align_up(4096) == 4096 && align_up_strict(4096) == 8192 && align_up_strict(4097) == 8192, "alignment");
+}
+Manifest fixture_manifest() {
+    Manifest manifest;
+    manifest.created_at = 1700000000000;
+    manifest.app_version = "1.0";
+    manifest.app_version_code = 7;
+    manifest.app_build_type = "debug";
+    manifest.compression = Compression::gzip;
+    manifest.vm["name"] = "vm \"one\"/\xe2\x80\xa8";
+    manifest.vm["memory_mb"] = 512;
+    DiskEntry disk;
+    disk.ref = {1, "/data/disk.qcow2", false, "VIRTIO"};
+    disk.name = "disk.qcow2";
+    disk.format = "QCOW2";
+    disk.size = 10;
+    disk.archive_path = "disk.qcow2";
+    manifest.disks.push_back(disk);
+    BootFile boot;
+    boot.archive_path = boot.name = "vmlinuz";
+    boot.path = "/data/vmlinuz";
+    boot.kind = "kernel";
+    boot.size = 3;
+    manifest.boots.push_back(boot);
+    return manifest;
+}
+void manifest_contract() {
+    auto manifest = fixture_manifest();
+    check(manifest.resolve_version() == 1, "base version without chains");
+    const auto text = manifest_text(manifest);
+    check(text.starts_with("{\n    \"app_build_type\": \"debug\",") && text.find("\"compression\": \"GZIP\"") != std::string::npos &&
+          text.find("\"format\": \"qcow2\"") != std::string::npos && text.find("\\/\\u2028") != std::string::npos &&
+          text.find("\"bus\": \"VIRTIO\"") != std::string::npos && text.find("\"networks\": []") != std::string::npos, "org.json indent-4 text");
+    auto parsed = Manifest::parse(text);
+    check(parsed.app_version_code == 7 && parsed.compression == Compression::gzip && parsed.disks.size() == 1 && parsed.disks[0].format == "QCOW2" &&
+          parsed.disks[0].ref.index == 1 && parsed.disks[0].attached && parsed.boots[0].kind == "kernel" && config::string(parsed.vm, "name") == config::string(manifest.vm, "name") &&
+          parsed.vm.isMember("screens"), "manifest parse migrates the VM");
+    manifest.disks[0].attached = false;
+    check(manifest.resolve_version() == 2, "detached file needs version 2");
+    manifest.disks[0].attached = true;
+    manifest.disks[0].backing_archive = "base.img";
+    check(manifest.resolve_version() == 2 && manifest.disks[0].json()["backing_archive"] == "base.img", "backing link needs version 2");
+    manifest.disks[0].target = "/x/y/placed.qcow2";
+    check(manifest.disks[0].json()["path"] == "/x/y/placed.qcow2" && manifest.disks[0].json()["name"] == "placed.qcow2", "placed entries report their target");
+    // Defaults and coercions of older or odd manifests.
+    const auto old = DiskEntry::parse(wire::parse(R"({"archive_path":"a","bus":"scsi","format":"weird","size":"12"})"));
+    check(old.name == "disk.img" && old.format == "RAW" && old.ref.bus == "SCSI" && old.size == 12 && old.attached && old.ref.index == 0, "DiskEntry defaults");
+    fails("vmpkg manifest is not valid UTF-8", [] { Manifest::parse("{\"vm\":{}, \"x\":\"\xc3\x28\"}"); });
+    fails("No value for vm", [] { Manifest::parse(R"({"disks":[],"boots":[],"networks":[]})"); });
+    fails("No value for disks", [] { Manifest::parse(R"({"vm":{}})"); });
+    fails("Value at vm cannot be converted to JSONObject", [] { Manifest::parse(R"({"vm":[]})"); });
+    fails("object is not json", [] { Manifest::parse(R"({"vm":{},"disks":[1],"boots":[],"networks":[]})"); });
+    fails("Unsupported network config schema (expected 2)", [] { Manifest::parse(R"({"vm":{},"disks":[],"boots":[],"networks":[{"schema":1}]})"); });
+    fails_any([] { Manifest::parse("not json"); }, "not json");
+    check(disk_format_of("a.QCOW2") == "QCOW2" && disk_format_of("a.img") == "RAW" && disk_format_of("noext") == "RAW" && disk_format_of("x.iso") == "ISO", "DiskFormat");
+}
+// One package written by the production writer, read back by PackageInput.
+void write_fixture(const std::string& dest, Compression compression, int64_t volume_size, const std::vector<std::pair<std::string, std::string>>& files,
+                   int* volumes = nullptr) {
+    auto manifest = fixture_manifest();
+    manifest.compression = compression;
+    manifest.disks.clear();
+    manifest.boots.clear();
+    for (const auto& [name, data] : files) {
+        DiskEntry disk;
+        disk.name = disk.archive_path = name;
+        disk.size = static_cast<int64_t>(data.size());
+        manifest.disks.push_back(disk);
+    }
+    PackageSpec spec;
+    spec.dest = dest;
+    spec.volume_size = volume_size;
+    spec.compression = compression;
+    spec.app_version_code = 7;
+    const auto count = write_package(spec, manifest_text(manifest), [&](TarWriter& tar) {
+        for (const auto& [name, data] : files) tar.entry(name, data);
+    });
+    if (volumes) *volumes = count;
+}
+std::vector<Entry> read_package(Source& raw, int64_t data_size = -1) {
+    auto input = PackageInput::open(raw, data_size);
+    std::vector<Entry> entries;
+    TarReader(input->data()).for_each([&](const std::string& name, int, int64_t size, Source& content) { entries.push_back({name, size, read_all(content)}); });
+    drain(input->data());
+    input->validate_data_consumed();
+    return entries;
+}
+std::vector<Entry> read_path(const std::string& path) {
+    FileSource in(path);
+    return read_package(in);
+}
+void single_file_packages() {
+    Temporary dir;
+    const auto disk = sample(300000, 6, true), noise = sample(5000, 7, false);
+    for (const auto compression : {Compression::none, Compression::gzip, Compression::xz, Compression::zstd}) {
+        const auto path = dir.at(std::string("single-") + compression_name(compression) + ".vmpkg");
+        write_fixture(path, compression, 0, {{"disk.img", disk}, {"noise.bin", noise}});
+        const auto bytes = bytes_of(path);
+        const auto header = Header::parse(bytes.data());
+        const auto start = align_up_strict(4096 + static_cast<uint64_t>(header.manifest_size));
+        check(bytes.size() % 4096 == 0 && header.volume_count == 0 && header.compression == static_cast<int>(compression) &&
+              bytes.size() == align_up(start + static_cast<uint64_t>(header.data_size)), "single-file layout");
+        const auto entries = read_path(path);
+        check(entries.size() == 3 && entries[0].name == "manifest.json" && entries[0].data == bytes.substr(4096, static_cast<size_t>(header.manifest_size)) &&
+              entries[1].data == disk && entries[2].data == noise, "single-file round trip");
+        // Corruptions PackageInput must refuse.
+        auto damaged = bytes;
+        damaged[100] = 1;
+        fails("vmpkg padding is not zero-filled", [&] { MemorySource in(damaged); read_package(in); });
+        damaged = bytes + std::string(4096, '\0');
+        fails("unexpected bytes after vmpkg package", [&] { MemorySource in(damaged); read_package(in); });
+        damaged = bytes;
+        damaged[static_cast<size_t>(start + static_cast<uint64_t>(header.data_size))] = 9;
+        if (header.data_size % 4096) fails("vmpkg padding is not zero-filled", [&] { MemorySource in(damaged); read_package(in); });
+        fails("unexpected end of vmpkg", [&] { MemorySource in(bytes.substr(0, 20)); read_package(in); });
+        fails("unexpected end of vmpkg", [&] { MemorySource in(bytes.substr(0, 4100)); read_package(in); });
+        damaged = bytes;
+        damaged[12] = static_cast<char>((static_cast<int>(compression) + 1) % 4);
+        fails("vmpkg compression mismatch", [&] { MemorySource in(damaged); read_package(in); });
+        damaged = bytes;
+        damaged[8] = 8;
+        fails("vmpkg app_version_code mismatch", [&] { MemorySource in(damaged); read_package(in); });
+        // A data_size beyond the tar: the stream ends early or the region is short.
+        damaged = bytes;
+        damaged[16] = static_cast<char>(static_cast<unsigned char>(damaged[16]) + 1);
+        // One padding byte more: NONE and GZIP readers stop at the tar/member end and take it
+        // as data, as the legacy streams do; XZ and zstd see trailing garbage.
+        if (compression == Compression::none || compression == Compression::gzip) { MemorySource in(damaged); read_package(in); }
+        else fails_any([&] { MemorySource in(damaged); read_package(in); }, (std::string("data_size off by one ") + compression_name(compression)).c_str());
+        damaged = bytes;
+        damaged[16] = static_cast<char>(static_cast<unsigned char>(damaged[16]) - 1);
+        if (compression != Compression::none) fails_any([&] { MemorySource in(damaged); read_package(in); }, "data_size one short");
+        if (compression != Compression::none) {
+            damaged = bytes;
+            damaged[static_cast<size_t>(start) + static_cast<size_t>(header.data_size) / 2] ^= 0x5a;
+            // zstd frames carry no checksum (zstd-jni's default too): the bytes still differ.
+            fails_any([&] {
+                MemorySource in(damaged);
+                const auto read = read_package(in);
+                if (read.size() != 3 || read[1].data != disk || read[2].data != noise) throw std::runtime_error("silent");
+            }, (std::string("corrupt data ") + compression_name(compression)).c_str());
+        }
+    }
+}
+void split_packages() {
+    Temporary dir;
+    const auto disk = sample(2500000, 8, false);
+    const auto base = dir.at("split.vmpkg");
+    int volumes = 0;
+    // A stale higher-numbered sub-volume from an earlier export is removed.
+    put(volume_name(base, 9), "stale");
+    put(volume_name(base, 10), "stale");
+    write_fixture(base, Compression::none, 1u << 20, {{"disk.img", disk}}, &volumes);
+    check(volumes == 3 && exists(volume_name(base, 3)) && !exists(volume_name(base, 4)) && file_length(volume_name(base, 1)) == 1 << 20, "three sub-volumes");
+    check(exists(volume_name(base, 9)), "stale removal stops at the first gap, as the legacy loop");
+    unlink(volume_name(base, 9).c_str());
+    unlink(volume_name(base, 10).c_str());
+    const auto master = bytes_of(base);
+    const auto header = Header::parse(master.data());
+    check(header.volume_count == 3 && header.data_size > 2500000, "master header");
+    const auto data_start = align_up_strict(4096 + static_cast<uint64_t>(header.manifest_size));
+    const auto index = master.substr(data_start);
+    check(index.starts_with("{\"magic\":\"VMPV\",\"version\":1,\"data_size\":" + std::to_string(header.data_size) + ",\"volumes\":[{\"index\":1,\"size\":1048576,\"crc32\":"),
+          "compact volume index");
+    check(is_sub_volume(volume_name(base, 2)) && master_of(volume_name(base, 2)) == base && !is_sub_volume(base) && master_of(base) == base, "sub-volume names");
+    auto set = VolumeSet::discover(base);
+    check(set.count() == 3 && set.data_size() == header.data_size, "discover");
+    auto logical = set.open_logical();
+    auto entries = read_package(*logical, set.data_size());
+    check(entries.size() == 2 && entries[1].data == disk, "split round trip");
+    // The same set, read as one stream, equals a single-file package of that data.
+    const auto chunk = bytes_of(volume_name(base, 2));
+    put(volume_name(base, 2), chunk.substr(0, chunk.size() - 1));
+    fails("sub-volume 2 size mismatch: on-disk 1048575, expected 1048576", [&] { VolumeSet::discover(base); });
+    auto flipped = chunk;
+    flipped[1000] ^= 1;
+    put(volume_name(base, 2), flipped);
+    fails("sub-volume 2 checksum mismatch", [&] { auto s = VolumeSet::discover(base); auto l = s.open_logical(); read_package(*l, s.data_size()); });
+    put(volume_name(base, 2), chunk);
+    unlink(volume_name(base, 3).c_str());
+    fails("missing sub-volume 3 (split.vmpkg.003)", [&] { VolumeSet::discover(base); });
+    put(dir.at("plain.vmpkg"), std::string(5000, '\0'));
+    fails("invalid package header", [&] { VolumeSet::discover(dir.at("plain.vmpkg")); });
+    write_fixture(dir.at("single.vmpkg"), Compression::zstd, 0, {{"a", "b"}});
+    fails("not a multi-volume package", [&] { VolumeSet::discover(dir.at("single.vmpkg")); });
+    fails("unexpected master size: 0", [&] { VolumeSet::discover(dir.at("missing.vmpkg")); });
+    put(dir.at("cut.vmpkg"), master.substr(0, 5000));
+    fails("truncated master", [&] { VolumeSet::discover(dir.at("cut.vmpkg")); });
+    put(dir.at("idx.vmpkg"), master.substr(0, data_start) + "{\"magic\":\"VMPV\",\"version\":2}");
+    fails("unsupported volume version: 2", [&] { VolumeSet::discover(dir.at("idx.vmpkg")); });
+    put(dir.at("idx.vmpkg"), master.substr(0, data_start) + "{\"version\":1}");
+    fails("missing volume index magic", [&] { VolumeSet::discover(dir.at("idx.vmpkg")); });
+    put(dir.at("idx.vmpkg"), master.substr(0, data_start) + "{\"magic\":\"VMPV\",\"version\":1,\"volumes\":[]}");
+    fails("volume index has no volumes", [&] { VolumeSet::discover(dir.at("idx.vmpkg")); });
+    put(dir.at("idx.vmpkg"), master.substr(0, data_start) + "garbage");
+    fails("failed to parse volume index", [&] { VolumeSet::discover(dir.at("idx.vmpkg")); });
+    put(dir.at("idx.vmpkg"), master.substr(0, data_start) + "{\"magic\":\"VMPV\",\"version\":1,\"volumes\":[{\"index\":1,\"size\":1,\"crc32\":0}]}");
+    fails("volume count mismatch: header 3, index 1", [&] { VolumeSet::discover(dir.at("idx.vmpkg")); });
+    // Too many volumes fails and leaves no sub-volume behind.
+    PackageSpec spec;
+    spec.dest = dir.at("many.vmpkg");
+    spec.volume_size = 1;
+    spec.compression = Compression::none;
+    fails("too many volumes (> 999); use a larger volume size", [&] {
+        write_package(spec, manifest_text(fixture_manifest()), [](TarWriter&) {});
+    });
+    check(!exists(volume_name(spec.dest, 1)) && !exists(spec.dest), "failed split cleans up");
+}
+void chain_plan() {
+    std::map<std::string, std::string> parents{{"/a/top.qcow2", "/b/base.qcow2"}, {"/c/top.qcow2", "/b/base.qcow2"}, {"/b/base.qcow2", "/b/root.img"}};
+    auto lookup = [&](const std::string& path) -> std::optional<std::string> {
+        auto found = parents.find(path);
+        if (found == parents.end()) return std::nullopt;
+        return found->second;
+    };
+    std::vector<DiskRef> tops{{0, "/a/top.qcow2", false, "VIRTIO"}, {1, "/c/top.qcow2", true, "SCSI"}, {2, "/b/root.img", false, "VIRTIO"},
+                              {3, "/a/top.qcow2", false, "VIRTIO"}, {4, "", false, "VIRTIO"}};
+    const auto plan = plan_disks(tops, lookup);
+    check(plan.size() == 5, "plan size");
+    check(plan[0].archive_path == "top.qcow2" && plan[0].backing_archive == "base.qcow2" && plan[0].attachment->index == 0, "first top");
+    check(plan[1].archive_path == "base.qcow2" && plan[1].backing_archive == "root.img" && !plan[1].attachment, "shared base");
+    check(plan[2].archive_path == "root.img" && plan[2].backing_archive.empty() && plan[2].attachment && plan[2].attachment->index == 2, "base that is a disk too");
+    check(plan[3].archive_path == "top_1.qcow2" && plan[3].backing_archive == "base.qcow2" && plan[3].attachment->bus == "SCSI", "colliding names");
+    check(plan[4].archive_path == "top_2.qcow2" && plan[4].path == "/a/top.qcow2" && plan[4].attachment->index == 3, "same file in two slots");
+    const auto entry = disk_entry(plan[1]);
+    check(entry.ref.index == -1 && entry.ref.readonly && !entry.attached && entry.format == "QCOW2" && entry.name == "base.qcow2", "backing entry");
+    parents["/b/root.img"] = "/a/top.qcow2";
+    fails("backing chain of top.qcow2 loops at /a/top.qcow2", [&] { plan_disks({{0, "/a/top.qcow2", false, "VIRTIO"}}, lookup); });
+    std::map<std::string, std::string> deep;
+    for (int i = 0; i < 70; ++i) deep["/d/" + std::to_string(i)] = "/d/" + std::to_string(i + 1);
+    fails("backing chain of 0 is deeper than 64 images", [&] {
+        plan_disks({{0, "/d/0", false, "VIRTIO"}}, [&](const std::string& p) -> std::optional<std::string> { return deep.at(p); });
+    });
+}
+void network_plan() {
+    const auto existing = wire::parse(R"([{"id":"a","name":"lan","bridge_name":"brlan"},{"id":"b","name":"lan_1","bridge_name":"brverylongna"}])");
+    NetworkImportPlan plan(existing);
+    auto packaged = wire::parse(R"({"schema":2,"id":"x","name":"lan","bridge_name":"brlan","pkg_network_ref":"net0"})");
+    const auto first = plan.prepare_create(packaged);
+    check(!first.isMember("pkg_network_ref") && first["id"].asString().size() == 36 && first["name"] == "lan_2" && first["bridge_name"] == "brlan1", "prepare_create renames");
+    const auto second = plan.adopt(wire::parse(R"({"id":"a","name":" ","bridge_name":"brverylongna"})"));
+    check(second["id"].asString() != "a" && second["name"] == "network" && second["bridge_name"] == "brverylongn1", "adopt: taken id, blank name, capped bridge");
+    const auto third = plan.adopt(wire::parse(R"({"id":"fresh","name":"network"})"));
+    check(third["id"] == "fresh" && third["name"] == "network_1" && !third.isMember("bridge_name"), "claims names it handed out");
+    const auto parsed = parse_network_plan(wire::parse(R"([{"ref":"net0","action":"join","network_id":"a"},{"ref":"","action":"skip"},5,
+        {"ref":"net1","action":"bogus","config":{"schema":1}},{"ref":"net2","action":"skip"},{"ref":"net3","config":{"schema":2,"name":"n"}}])"));
+    check(parsed.size() == 3 && parsed[0].action == NetworkAction::join && parsed[0].network_id == "a" && parsed[1].action == NetworkAction::skip &&
+          parsed[2].action == NetworkAction::create && parsed[2].config && find_ref(parsed, "net3") == &parsed[2] && !find_ref(parsed, "net1"), "plan parse drops bad entries");
+}
+void lease_offsets() {
+    const auto vlan = wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"10.0.0.1/24","dhcp":{"enabled":true}},"ipv6":{"source":"dhcp_pd","dhcp":{"enabled":true}}})");
+    std::set<int64_t> used{64, 65};
+    check(resolve_offset(64, used, vlan, Family::ipv4) == 66 && resolve_offset(70, used, vlan, Family::ipv4) == 70, "next free offset");
+    check(resolve_offset(130, used, vlan, Family::ipv4) == 193 && resolve_offset(400, used, vlan, Family::ipv4) == 66, "dynamic pool skipped, out of range restarts");
+    check(resolve_offset(254, {}, vlan, Family::ipv4) == 254 && resolve_offset(254, {254}, vlan, Family::ipv4) == 64, "wraps past the top");
+    check(resolve_offset(1000, {}, vlan, Family::ipv6) == 1000, "PD prefix has a /64 of room");
+    const auto small = wire::parse(R"({"ipv4":{"cidr":"10.0.0.1/27","dhcp":{"enabled":true,"offset_start":1,"offset_end":30}}})");
+    check(resolve_offset(64, {}, small, Family::ipv4) == -1, "VLAN too small");
+    check(vlan_dhcp_enabled(vlan, Family::ipv4) && vlan_dhcp_enabled(vlan, Family::ipv6) && !vlan_dhcp_enabled(wire::parse("{}"), Family::ipv4), "DHCP served");
+    const auto network = wire::parse(R"({"id":"00000000-0000-4000-8000-000000000001","schema":2,"name":"n","bridge_name":"brn","uplink_mode":"l3","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"10.0.0.1/24","dhcp":{"enabled":true}}}]}})");
+    const auto vm = wire::parse(R"({"networks":[{"network_id":"00000000-0000-4000-8000-000000000001","dhcp4_lease":{"enabled":true,"offset":80}},
+        {"network_id":"00000000-0000-4000-8000-000000000001","dhcp4_lease":{"enabled":false,"offset":81}},{"network_id":"n2","dhcp4_lease":{"enabled":true,"offset":82}},
+        {"network_id":"00000000-0000-4000-8000-000000000001","dhcp4_lease":{"enabled":true,"offset":83}}]})");
+    std::set<int64_t> found;
+    add_offsets(found, vm, network, network["l3"]["vlans"][0], Family::ipv4, &vm["networks"][3]);
+    check(found == std::set<int64_t>{80}, "offsets held on the VLAN, the resolving NIC excluded");
+    const auto mac = random_mac();
+    check(mac.size() == 17 && mac.starts_with("02:"), "random MAC");
+}
+void json_contract() {
+    const auto value = wire::parse(R"({"b":[1,{"x":null}],"a":"q\"/\n","e":[],"o":{},"d":1.5,"w":2.0})");
+    check(java_json(value) == R"({"a":"q\"\/\n","b":[1,{"x":null}],"d":1.5,"e":[],"o":{},"w":2})", "compact");
+    check(java_json(value, 4) == "{\n    \"a\": \"q\\\"\\/\\n\",\n    \"b\": [\n        1,\n        {\n            \"x\": null\n        }\n    ],\n"
+                                 "    \"d\": 1.5,\n    \"e\": [],\n    \"o\": {},\n    \"w\": 2\n}", "indent 4");
+    const auto request = wire::parse(R"({"s":5,"n":null,"l":"12.9","i":4294967297,"b":"TRUE","d":-3.7,"o":{"k":1}})");
+    check(opt_string(request, "s") == "5" && opt_string(request, "n") == "null" && opt_string(request, "missing", "fb") == "fb" &&
+          opt_string(request, "o") == "{\"k\":1}", "optString");
+    check(opt_long(request, "l") == 12 && opt_long(request, "d") == -3 && opt_long(request, "b", 9) == 9 && opt_int(request, "i") == 1, "optLong/optInt");
+    check(opt_bool(request, "b") && !opt_bool(request, "s") && opt_enum(request, "b", "NONE", {"TRUE"}) == "TRUE", "optBoolean/optEnum");
+    check(safe_file_name(" a/b:c ", "f") == "a_b_c" && safe_file_name("..", "f") == "f" && pkg::basename("/x/y/") == "y" && pkg::dirname("/x/y") == "/x", "file names");
+    check(java_length("\xf0\x9f\x8c\x8f" "a") == 3 && java_path("//a//b/") == "/a/b" && file_name("/a/b//") == "b", "Java strings and paths");
+    check(valid_utf8("\xe4\xb8\xad") && !valid_utf8("\xed\xa0\x80") && !valid_utf8("\xc0\x80") && !valid_utf8("\xe4\xb8"), "UTF-8 validation");
+}
+void file_helpers() {
+    Temporary dir;
+    check(make_dirs(dir.at("x/y/z")) && !make_dirs(dir.at("x/y/z")) && is_file(dir.at("x")) == false, "mkdirs");
+    put(dir.at("x/y/z/f"), "data");
+    check(canonical_path(dir.at("x/./y/../y/z/f")) == canonical_path(dir.at("x/y/z/f")) && canonical_path(dir.at("x/missing/../q")).ends_with("/x/q"),
+          "canonical paths");
+    check(symlink(dir.at("x/y").c_str(), dir.at("link").c_str()) == 0 && canonical_path(dir.at("link/z/f")) == canonical_path(dir.at("x/y/z/f")), "symlinks resolve");
+    fails(dir.at("nope") + ": open failed: ENOENT (No such file or directory)", [&] { FileSource in(dir.at("nope")); });
+    delete_tree(dir.at("x"));
+    check(!exists(dir.at("x")), "delete tree");
+}
+}
+
+int main() {
+    using Test = std::pair<const char*, std::function<void()>>;
+    const std::vector<Test> tests{
+        {"tar round trip", tar_round_trip}, {"tar edges", tar_edges}, {"compression round trips", compression_round_trips},
+        {"compression corruption", compression_corruption}, {"header", header_contract}, {"manifest", manifest_contract},
+        {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},
+        {"network import plan", network_plan}, {"lease offsets", lease_offsets}, {"org.json behaviour", json_contract},
+        {"file helpers", file_helpers}};
+    Json::Value report;
+    auto& checks = report["checks"] = Json::Value(Json::arrayValue);
+    try {
+        for (const auto& [name, test] : tests) {
+            report["current"] = name;
+            test();
+            checks.append(name);
+        }
+        report.removeMember("current");
+        report["passed"] = true;
+    } catch (const std::exception& error) {
+        report["passed"] = false;
+        report["error"] = error.what();
+    }
+    std::cout << wire::stringify(report, true) << std::endl;
+    return report["passed"].asBool() ? 0 : 1;
+}

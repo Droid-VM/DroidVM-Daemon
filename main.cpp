@@ -19,6 +19,7 @@
 #include "input/keyboard_grab.h"
 #include "usb/service.h"
 #include "usb/watch.h"
+#include "pkg/service.h"
 #include "vm/host_facts.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
@@ -216,6 +217,7 @@ int main(int argc, char** argv) {
             std::unique_ptr<UsbVmStore> usb_vms;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
+            std::unique_ptr<droidvm::pkg::PkgService> packages; // reaches vms, networks and the events
 #ifdef DROIDVM_PLATFORM_SERVICES
             droidvm::platform::AudioTable audio_table;
 #endif
@@ -362,6 +364,13 @@ int main(int argc, char** argv) {
                         if (log) log->write("WARN", "host audio table unavailable");
                 }
 #endif
+                droidvm::pkg::PkgContext package_context;
+                package_context.vms = vms.get();
+                package_context.networks = networks.get();
+                package_context.events = &legacy_events;
+                package_context.data_dir = context.data_dir;
+                package_context.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+                packages = std::make_unique<droidvm::pkg::PkgService>(std::move(package_context));
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
@@ -369,6 +378,7 @@ int main(int argc, char** argv) {
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
+            if (packages) dispatcher.set_packages(packages.get());
             if (usb) {
                 dispatcher.set_usb(usb.get());
                 // Daemon.main starts the USB manager after the VM sweep is queued; its pass recovers leftovers.
@@ -398,6 +408,7 @@ int main(int argc, char** argv) {
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();
+            if (packages) packages->shutdown(); // a stopped import removes what it wrote
             // VMs leave before USB/networks: their taps and devices go with them.
             if (vms) vms->stop_all();
             if (usb) usb->shutdown(); // returns devices and restores drivers_autoprobe
