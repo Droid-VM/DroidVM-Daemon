@@ -4,13 +4,18 @@
 #include "runtime/managed_process.h"
 #include "control_http.h"
 #include "switch_runtime.h"
+#include <map>
+#include <vector>
 
 namespace droidvm::network {
-// One real gvswitch data path. VM port/forward attachment is added by the VM
-// integration; this class currently owns only the switch and its runtime files.
+class Netbox;
+class OwnedLinks;
+// One real gvswitch data path (GvisorBridgeBackend). VM NICs are owned TAPs
+// that gvswitch takes over through AF_XDP, with their static leases and
+// expanded local forwards; a relaunch re-posts the ports of retained TAPs.
 class Gvswitch final : public Backend {
 public:
-    Gvswitch(std::string executable, SwitchRuntime& runtime);
+    Gvswitch(std::string executable, SwitchRuntime& runtime, const Netbox* netbox = nullptr, OwnedLinks* links = nullptr);
     ~Gvswitch() override;
     void start(const Json::Value& config) override;
     bool healthy() const override;
@@ -19,6 +24,9 @@ public:
     void stop() override;
     Json::Value tools() const override;
     Json::Value tool_log(const std::string& key) const override;
+    void attach(const Json::Value& nic, const std::string& tap) override;
+    void detach(const Json::Value& nic, const std::string& tap) override;
+    Json::Value forward_failures() const override;
     ProcessStatus status() const { return process_.status(); }
     std::deque<ProcessLine> log() const { return process_.log(); }
     // Administrative lifecycle control uses held pidfd, never a raw PID.
@@ -30,6 +38,20 @@ private:
     ManagedProcess process_;
     std::unique_ptr<ControlHttp> client_;
     bool ready_ = false;
+    const Netbox* netbox_;
+    OwnedLinks* links_;
+    Json::Value config_;
+    std::map<std::string, Json::Value> attached_; // tap -> NIC
+    std::map<std::string, std::vector<std::string>> installed_, failures_; // tap -> "vlan/id" refs, failure texts
+    bool retain_taps_ = false;
     void remove_directory();
+    std::string tap_owner(const std::string& tap) const;
+    ControlResponse call(HttpMethod method, const std::string& path, const Json::Value* body = nullptr) const;
+    void post_port(const Json::Value& nic, const std::string& tap);
+    void apply_leases(const Json::Value& nic, const std::string& tap);
+    void remove_leases(const Json::Value& nic, const std::string& tap);
+    void install_forwards(Json::Value nic, const std::string& tap);
+    void remove_forwards(const std::string& tap);
+    void release_tap(const std::string& tap);
 };
 }

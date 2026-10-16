@@ -193,7 +193,12 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                 auto row = networks_->get(caller, id);
                 row["state"] = "STOPPED";
                 row["tools"] = Json::Value(Json::arrayValue);
-                if (runtime_) runtime_fields(row, runtime_->get(caller, id), false);
+                if (runtime_) {
+                    runtime_fields(row, runtime_->get(caller, id), false);
+                    // BridgeBackend.appendForwardFailures: only when there are any.
+                    auto failures = runtime_->forward_failures(caller, id);
+                    if (!failures.empty()) row["forward_failures"] = std::move(failures);
+                }
                 result["data"] = std::move(row);
             }
         }

@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
                 network_runtime = std::make_unique<droidvm::NetworkService>(*networks,
                     [&, binaries](const Json::Value& config) -> std::unique_ptr<droidvm::network::Backend> {
                         if (droidvm::config::string(config, "bridge_type") == "gvisor")
-                            return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime);
+                            return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime, netbox.get(), owned_links.get());
                         return std::make_unique<droidvm::network::LinuxBridge>(droidvm::network::LinuxBridge::Resources{
                             *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, pd_ownership, *owned_ports, *owned_pbridge, switch_runtime,
                             (binaries / "bridgedhcp").string(), (binaries / "pbridge").string(), files.get(),
