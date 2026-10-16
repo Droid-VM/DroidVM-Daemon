@@ -368,6 +368,45 @@ void await_exit(Gvswitch& backend) {
     while (backend.status().running && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
     check(!backend.status().running, "owned helper death observed");
 }
+void network_autostart_queue_and_stop() {
+    const auto path = work + "/autostart";
+    check(mkdir(path.c_str(), 0700) == 0, "create autostart case directory");
+    Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    NetworkConfigService configs(dir.get(), getuid());
+    auto configuration = wire::parse(R"({"schema":2,"name":"autostart","bridge_name":"test","bridge_type":"gvisor","auto_up":true,"l3":{"vlans":[]}})");
+    configuration["id"] = random_id(true);
+    const auto id = configs.create(admin, configuration);
+    auto now = NetworkService::Clock::now();
+    bool backend_created = false;
+    NetworkService service(configs, [&](const Json::Value&) -> std::unique_ptr<Backend> {
+        backend_created = true; throw std::runtime_error("unexpected autostart");
+    }, [&] { return now; });
+    service.request_autostart(admin);
+    Gate entered, proceed, completed;
+    TaskLimits limits; limits.workers = 1; limits.queued = 2;
+    TaskService workers(limits);
+    workers.post(admin, [&](bool discarded) { if (!discarded) { entered.release(); proceed.wait(); } });
+    entered.wait();
+    try {
+        service.schedule_reconcile(workers);
+        for (int i = 0; i < 20; ++i) { now += 1s; service.schedule_reconcile(workers); }
+        // This still fits only if repeated ticks enqueue at most one maintenance.
+        workers.post(admin, [&](bool discarded) { if (!discarded) completed.release(); });
+        error(ErrorCode::resource_exhausted, [&] { workers.post(admin, [](bool) {}); });
+        service.stop(admin, id);
+        proceed.release();
+        // The sole worker executes the queued autostart before this marker;
+        // shutdown must not discard the callback and accidentally pass the test.
+        completed.wait();
+        workers.shutdown();
+        check(!backend_created && service.get(admin, id).state == NetworkState::stopped,
+            "explicit stop wins over queued automatic start");
+        configs.update(admin, configuration); // no leaked runtime lease
+    } catch (...) { proceed.release(); workers.shutdown(); throw; }
+    check(service.shutdown().empty(), "autostart test shutdown");
+    for (const char* name : {"networks.json", "networks.json.bak"}) unlinkat(dir.get(), name, 0);
+    check(rmdir(path.c_str()) == 0, "autostart test files removed");
+}
 void real_network_lifecycle() {
     const auto path = work + "/lifecycle";
     check(mkdir(path.c_str(), 0700) == 0, "create lifecycle case directory");
@@ -626,6 +665,15 @@ void real_daemon_startup_recovery() {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "--recover-helper") {
+        try {
+            Fd directory(open(argv[2], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            struct stat info{};
+            check(directory.get() >= 0 && fstat(directory.get(), &info) == 0, "open isolated helper directory");
+            HelperIdentity::recover(directory.get(), info.st_uid, 100ms);
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
+    }
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--orphan-switch") {
         Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         const std::string phase = argc == 5 ? argv[4] : "ready";
@@ -638,6 +686,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 || argc == 4) { binaries = argv[1]; work = argv[2]; if (argc == 4) daemon_executable = argv[3]; }
     if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp},
+        {"network_autostart_queue_and_stop", network_autostart_queue_and_stop},
         {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup},
         {"real_switch_owner_sigkill", real_switch_owner_death},
         {"switch_inventory_sigkill_boundaries", switch_inventory_crash_boundaries},

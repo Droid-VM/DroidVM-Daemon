@@ -4,6 +4,8 @@
 #include "runtime/log.h"
 #include "services/system.h"
 #include "network/switch_runtime.h"
+#include "network/gvswitch.h"
+#include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
 #include "transport/dispatcher.h"
@@ -87,21 +89,34 @@ int main(int argc, char** argv) {
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
             std::unique_ptr<droidvm::NetworkConfigService> networks;
             std::unique_ptr<droidvm::NetworkHostService> host_network;
+            std::unique_ptr<droidvm::NetworkService> network_runtime;
             if (layout) {
                 auto files = layout->open_files();
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
                 host_network = std::make_unique<droidvm::NetworkHostService>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
+                const auto switch_executable = (std::filesystem::absolute(data_directory) / "bin/gvswitch").string();
+                network_runtime = std::make_unique<droidvm::NetworkService>(*networks,
+                    [&, switch_executable](const Json::Value& config) -> std::unique_ptr<droidvm::network::Backend> {
+                        if (droidvm::config::string(config, "bridge_type") != "gvisor")
+                            throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Native Linux network lifecycle is not implemented yet");
+                        return std::make_unique<droidvm::network::Gvswitch>(switch_executable, switch_runtime);
+                    });
+                network_runtime->request_autostart({"network-autostart", true, true, true});
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();
+            if (network_runtime) {
+                const auto failures = network_runtime->shutdown();
+                if (!failures.empty()) throw std::runtime_error("Network shutdown incomplete: " + droidvm::wire::stringify(failures));
+            }
             if (log) log->write("INFO", "stopped exit=" + std::to_string(result));
             return result;
         } catch (const std::exception& error) {

@@ -80,7 +80,15 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
     while (true) {
         // Only subscribed connections need a bounded tail-poll interval. Signals
         // and network IO still wake epoll immediately; workers run no transport code.
-        int count = epoll_wait(epoll.get(), events.data(), events.size(), subscribed ? 25 : -1);
+        if (service.has_maintenance()) {
+            try { service.maintenance(); }
+            catch (const ServiceError& error) {
+                // A full/stopping worker queue retries on the next tick; never
+                // turn watchdog backpressure into a transport outage.
+                if (error.code() != ErrorCode::resource_exhausted && error.code() != ErrorCode::unavailable) throw;
+            }
+        }
+        int count = epoll_wait(epoll.get(), events.data(), events.size(), subscribed ? 25 : service.has_maintenance() ? 250 : -1);
         if (count < 0 && errno == EINTR) continue;
         if (count < 0) throw std::runtime_error("epoll_wait failed");
         for (int i = 0; i < count; ++i) {

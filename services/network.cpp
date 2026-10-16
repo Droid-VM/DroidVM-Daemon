@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "network.h"
 #include "store/network_config.h"
+#include "tasks.h"
 
 namespace droidvm {
+const char* network_state_name(NetworkState state) {
+    switch (state) {
+        case NetworkState::stopped: return "STOPPED";
+        case NetworkState::starting: return "STARTING";
+        case NetworkState::running: return "RUNNING";
+        case NetworkState::recovering: return "RECOVERING";
+        case NetworkState::stopping: return "STOPPING";
+        case NetworkState::failed: return "FAILED";
+    }
+    return "FAILED";
+}
 struct NetworkService::Slot {
     std::mutex operation, observation;
     NetworkView view;
@@ -24,20 +36,34 @@ std::shared_ptr<NetworkService::Slot> NetworkService::slot(const CallContext& ca
 }
 NetworkView NetworkService::view(Slot& slot) { std::lock_guard lock(slot.observation); return slot.view; }
 void NetworkService::state(Slot& slot, NetworkState state, bool desired, std::string error) {
+    auto tools = slot.backend ? slot.backend->tools() : Json::Value(Json::arrayValue);
     std::lock_guard lock(slot.observation);
+    slot.view.tools = std::move(tools);
     slot.view.state = state; slot.view.desired_running = desired;
     slot.view.error = error.substr(0, 4096); ++slot.view.generation;
 }
 NetworkView NetworkService::get(const CallContext& caller, const std::string& id) { return view(*slot(caller, id)); }
+Json::Value NetworkService::tool_log(const CallContext& caller, const std::string& id, const std::string& key) {
+    auto target = slot(caller, id);
+    std::unique_lock operation(target->operation, std::try_to_lock);
+    if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
+    auto lines = target->backend ? target->backend->tool_log(key) : Json::Value();
+    if (lines.isNull()) throw ServiceError(ErrorCode::not_found, "tool " + key + " not available");
+    return lines;
+}
 void NetworkService::cleanup(Slot& slot) {
     if (slot.backend) slot.backend->stop();
     slot.backend.reset(); slot.lease.reset();
 }
 NetworkView NetworkService::start(const CallContext& caller, const std::string& id) {
+    return start_impl(caller, id, false);
+}
+NetworkView NetworkService::start_impl(const CallContext& caller, const std::string& id, bool only_initial) {
     auto target = slot(caller, id);
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
     { std::lock_guard lock(mutex_); if (shutting_down_) throw ServiceError(ErrorCode::unavailable, "Network service is shutting down"); }
+    if (only_initial && view(*target).generation != 0) return view(*target);
     if (view(*target).state == NetworkState::running) {
         if (target->backend && target->backend->healthy()) return view(*target);
         state(*target, NetworkState::failed, true, "Network backend exited; recovery required");
@@ -112,5 +138,52 @@ Json::Value NetworkService::shutdown() {
         }
     }
     return failures;
+}
+void NetworkService::schedule_reconcile(TaskService& workers) {
+    std::string id;
+    bool autostart = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (shutting_down_ || maintenance_pending_ || now_() < next_maintenance_ || (slots_.empty() && autostart_.empty())) return;
+        next_maintenance_ = now_() + std::chrono::milliseconds(250);
+        if (!autostart_.empty()) { id = autostart_.front(); autostart_.pop_front(); autostart = true; }
+        else {
+            auto at = slots_.upper_bound(maintenance_cursor_);
+            for (size_t visited = 0; visited < slots_.size(); ++visited) {
+                if (at == slots_.end()) at = slots_.begin();
+                if (view(*at->second).desired_running) { id = at->first; break; }
+                ++at;
+            }
+        }
+        if (id.empty()) return;
+        maintenance_cursor_ = id; maintenance_pending_ = true;
+    }
+    auto release = [this] { std::lock_guard lock(mutex_); maintenance_pending_ = false; };
+    try {
+        workers.post({"network-watchdog", true, true, true}, [this, id, release, autostart](bool discarded) {
+            try {
+                if (!discarded) {
+                    const CallContext caller{"network-watchdog", true, true, true};
+                    if (autostart) {
+                        // An explicit start/stop before this worker runs wins.
+                        start_impl(caller, id, true);
+                    } else reconcile(caller, id);
+                }
+            }
+            catch (...) { release(); throw; }
+            release();
+        });
+    } catch (...) {
+        std::lock_guard lock(mutex_); maintenance_pending_ = false;
+        if (autostart) autostart_.push_front(id);
+        throw;
+    }
+}
+void NetworkService::request_autostart(const CallContext& caller) {
+    auto rows = configs_.list(caller);
+    std::lock_guard lock(mutex_);
+    if (maintenance_pending_ || !slots_.empty() || !autostart_.empty() || shutting_down_)
+        throw std::logic_error("autostart must be prepared before serving");
+    for (const auto& row : rows) if (config::boolean(row, "auto_up")) autostart_.push_back(config::uuid(row));
 }
 }

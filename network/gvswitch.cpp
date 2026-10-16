@@ -18,6 +18,19 @@ Gvswitch::Gvswitch(std::string executable, SwitchRuntime& runtime)
 }
 Gvswitch::~Gvswitch() { try { stop(); } catch (...) {} }
 bool Gvswitch::healthy() const { return ready_ && process_.status().running; }
+Json::Value Gvswitch::tools() const {
+    Json::Value result(Json::arrayValue), tool;
+    const auto status = process_.status();
+    tool["key"] = "gvswitch"; tool["running"] = status.running;
+    tool["generation"] = std::to_string(status.generation);
+    result.append(std::move(tool)); return result;
+}
+Json::Value Gvswitch::tool_log(const std::string& key) const {
+    if (key != "gvswitch") return {};
+    Json::Value result(Json::arrayValue);
+    for (const auto& line : process_.log()) result.append(line.text);
+    return result;
+}
 void Gvswitch::start(const Json::Value& config) {
     if (!allocation_.name.empty() || process_.status().running) throw std::logic_error("gvswitch requires cleanup before start");
     if (config::string(config, "bridge_type") != "gvisor") throw std::invalid_argument("gvswitch requires a gvisor network");

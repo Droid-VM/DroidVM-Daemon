@@ -10,6 +10,25 @@ namespace {
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
+constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log"};
+bool runtime_command(const std::string& command) {
+    return std::find(runtime_commands.begin(), runtime_commands.end(), command) != runtime_commands.end();
+}
+void runtime_fields(Json::Value& row, const NetworkView& view, bool lowercase) {
+    // Legacy UI knows four states. Unresolved cleanup must never look STOPPED;
+    // publish the exact native state separately for capable clients.
+    auto projected = view.state;
+    if (projected == NetworkState::recovering) projected = NetworkState::starting;
+    if (projected == NetworkState::failed) projected = view.desired_running ? NetworkState::starting : NetworkState::stopping;
+    std::string state = network_state_name(projected);
+    if (lowercase) for (auto& c : state) c += 'a' - 'A';
+    row["state"] = state;
+    row["runtime_state"] = network_state_name(view.state);
+    row["runtime_error"] = view.error;
+    row["runtime_generation"] = std::to_string(view.generation);
+    row["desired_running"] = view.desired_running;
+    row["tools"] = view.tools;
+}
 CallContext context(const ClientSession& session) {
     // The existing IPC token grants local administrator rights. Never accept
     // principal/permissions from fields in the request, or use client_id as owner.
@@ -60,6 +79,7 @@ std::string legacy_id(const Json::Value& request) {
 }
 bool RequestDispatcher::background(const std::string& command) const {
     return (host_network_ && command == "network_list_interfaces") ||
+        (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
@@ -73,14 +93,30 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             return result;
         }
         if (!networks_) { result["message"] = "internal error"; return result; }
+        if (runtime_ && runtime_command(command)) {
+            const auto id = legacy_id(request);
+            if (id.empty()) { result["message"] = "missing network_id"; return result; }
+            if (!networks_->exists(caller, id)) { result["message"] = "network " + id + " not found"; return result; }
+            if (command == "network_tool_log") {
+                if (!request["tool"].isString() || request["tool"].asString().empty()) { result["message"] = "missing tool"; return result; }
+                result["lines"] = runtime_->tool_log(caller, id, string_field(request, "tool"));
+            } else {
+                const auto view = command == "network_start" ? runtime_->start(caller, id) :
+                    command == "network_stop" ? runtime_->stop(caller, id) : runtime_->get(caller, id);
+                result["network_id"] = id;
+                runtime_fields(result, view, true);
+            }
+            result["success"] = true; return result;
+        }
         if (command == "network_create" || command == "network_modify") {
             if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
             result["network_id"] = command == "network_create" ? networks_->create(caller, request["config"]) : networks_->update(caller, request["config"]);
         } else if (command == "network_list") {
             auto rows = networks_->list(caller);
-            // No activation API is exposed yet: all instances this native
-            // service owns are stopped. Runtime state will come from NetworkService.
-            for (auto& row : rows) row["state"] = "stopped";
+            for (auto& row : rows) {
+                if (runtime_) runtime_fields(row, runtime_->get(caller, row["id"].asString()), true);
+                else row["state"] = "stopped";
+            }
             result["data"] = std::move(rows);
         } else {
             auto id = legacy_id(request);
@@ -92,12 +128,15 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                 auto row = networks_->get(caller, id);
                 row["state"] = "STOPPED";
                 row["tools"] = Json::Value(Json::arrayValue);
+                if (runtime_) runtime_fields(row, runtime_->get(caller, id), false);
                 result["data"] = std::move(row);
             }
         }
         result["success"] = true;
         return result;
     } catch (const ServiceError& error) {
+        if (runtime_command(command)) return failure(error);
+        if (runtime_ && command == "network_modify" && error.code() == ErrorCode::conflict) return failure(error);
         if (command == "network_list_interfaces") return failure(error);
         if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::io_error || error.code() == ErrorCode::resource_exhausted)
             return failure(error);
@@ -125,6 +164,15 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["commands"].append("network_list_interfaces");
                 result["network_host_interfaces"] = true;
                 result["service_api_minor"] = 3;
+            }
+            if (runtime_) {
+                for (const auto* name : runtime_commands) result["commands"].append(name);
+                result["network_lifecycle_backends"] = Json::Value(Json::arrayValue);
+                result["network_lifecycle_backends"].append("gvisor");
+                result["network_watchdog"] = true;
+                result["network_auto_up"] = true;
+                result["network_live_details"] = false;
+                result["service_api_minor"] = 4;
             }
         }
         return result;

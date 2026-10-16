@@ -16,6 +16,8 @@ public:
     bool healthy() const override;
     void recover(const Json::Value& config) override;
     void stop() override;
+    Json::Value tools() const override;
+    Json::Value tool_log(const std::string& key) const override;
     ProcessStatus status() const { return process_.status(); }
     std::deque<ProcessLine> log() const { return process_.log(); }
     // Administrative lifecycle control uses held pidfd, never a raw PID.
