@@ -69,11 +69,12 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
     watch(epoll.get(), EPOLL_CTL_ADD, signal_fd, 2, EPOLLIN);
     RequestQueue requests(service);
     watch(epoll.get(), EPOLL_CTL_ADD, requests.fd(), 3, EPOLLIN);
+    if (auto* events = service.legacy_events()) watch(epoll.get(), EPOLL_CTL_ADD, events->fd(), 4, EPOLLIN);
     instance.publish_discovery(ntohs(address.sin_port), token);
     std::cout << "droidvmd ready pid=" << getpid() << " port=" << ntohs(address.sin_port) << std::endl;
     if (log) log->write("INFO", "ready pid=" + std::to_string(getpid()) + " port=" + std::to_string(ntohs(address.sin_port)));
     std::unordered_map<uint64_t, std::unique_ptr<Client>> clients;
-    uint64_t next_id = 4;
+    uint64_t next_id = 5;
     size_t input_reserved = 0, output_reserved = 0;
     std::array<epoll_event, 32> events{};
     bool subscribed = false;
@@ -117,6 +118,30 @@ int serve(Instance& instance, RequestDispatcher& service, const char* token, int
                     const uint64_t key = next_id++;
                     watch(epoll.get(), EPOLL_CTL_ADD, client->fd.get(), key, EPOLLIN | EPOLLRDHUP);
                     clients.emplace(key, std::move(client));
+                }
+                continue;
+            }
+            if (id == 4) {
+                const auto frames = service.legacy_events()->drain();
+                for (auto it = clients.begin(); it != clients.end();) {
+                    auto& client = *it->second;
+                    bool alive = true;
+                    if (client.session.caller.authorized && !client.eof) {
+                        for (const auto& frame : frames) {
+                            // A client that cannot keep up resynchronizes on reconnect.
+                            if (frame.size() > per_client_output - client.queued || frame.size() > max_output - output_reserved) { alive = false; break; }
+                            client.queued += frame.size();
+                            output_reserved += frame.size();
+                            client.outgoing.push_back(frame);
+                        }
+                        if (alive && !frames.empty()) watch(epoll.get(), EPOLL_CTL_MOD, client.fd.get(), it->first, EPOLLIN | EPOLLRDHUP | EPOLLOUT);
+                    }
+                    if (alive) { ++it; continue; }
+                    service.disconnected(client.session);
+                    input_reserved -= client.payload;
+                    output_reserved -= client.queued;
+                    epoll_ctl(epoll.get(), EPOLL_CTL_DEL, client.fd.get(), nullptr);
+                    it = clients.erase(it);
                 }
                 continue;
             }

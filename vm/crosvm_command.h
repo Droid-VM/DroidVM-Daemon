@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include "vm/boot_plan.h"
+#include <json/json.h>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+// Port of CrosvmBackendInstance.buildCommand plus the environment set up by
+// prepareProcess/applyGfxstreamEnv/applyDisplayBlitEnv/applyGpuRtPrioEnv.
+// Pure: every host read and per-launch value is an explicit input.
+//
+// config_probe fixture ("op":"crosvm"); absent fields keep struct defaults,
+// null means "absent" for optional fields:
+//   {"op":"crosvm","name":"...","config":{VM config, pre-migration},
+//    "run":{"control_socket_path":s,"gpu_cgroup_path":s,
+//           "serials":[{"pipe_output_fd":n,"pipe_input_fd":n,"acm_dev_path":s},...],
+//           "vnc":{"<screen id>":{"host":s,"port":n,"password":s}}},
+//    "boot":{"uefi":b,"firmware":s,"vars":s,"vars_enabled":b,"kernel":s,"initrd":s,"cmdline":s},
+//    "host":{"data_dir":s,"has_kvm":b,"has_gunyah":b,"has_gzvm":b,"soc_name":s,
+//            "app_uid":n,"app_gids":[n,...],"cpu_cores":[{"index":n,"capacity":n},...],
+//            "pflash_vars_size":n,"android_release":s,"strace_prebuilt_exists":b,
+//            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
+//            "system_vulkan_hal":s,"viosnd_dump_exists":b}}
+// Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
+// or {"name":...,"status":"error","message":...}.
+namespace droidvm::vm {
+struct CpuCore {
+    int index = 0; // CpuUtils.CpuCore.index
+    int64_t capacity = 0; // CpuUtils.CpuCore.capacity
+};
+struct HostFacts {
+    std::string data_dir; // Constants.DATA_DIR; empty = compile-time /data/data/<package>
+    bool has_kvm = false; // VMHypervisor.KVM.isSupported(): shellCheckExists("/dev/kvm")
+    bool has_gunyah = false; // VMHypervisor.GUNYAH.isSupported(): shellCheckExists("/dev/gunyah")
+    bool has_gzvm = false; // VMHypervisor.GENIEZONE.isSupported(): shellCheckExists("/dev/gzvm")
+    std::optional<std::string> soc_name; // HostSocName.get()
+    int app_uid = -1; // CrosvmBackendInstance.getAppUid()
+    std::optional<std::vector<int>> app_gids; // AppGroups.resolve(app_uid), only read when app_uid > 0
+    std::vector<CpuCore> cpu_cores; // CpuUtils.getCores()
+    int64_t pflash_vars_size = 0; // new File(<vars path>).length() in pflashBlockSize
+    std::string android_release; // Build.VERSION.RELEASE
+    bool strace_prebuilt_exists = false; // new File(getPrebuiltBinaryPath("strace")).exists()
+    std::optional<std::string> strace_in_path; // FileUtils.findExecute("strace", null)
+    bool optimize_sdcard = true; // context.appConfig.optBoolean(KEY_OPTIMIZE_SDCARD, true)
+    bool turnip_exists = false; // new File(DATA_DIR/usr/lib/libvulkan_freedreno.so).exists()
+    std::optional<std::string> system_vulkan_hal; // resolveSystemVulkanHal()
+    bool viosnd_dump_exists = false; // new File("/data/local/tmp/viosnd_dump").exists()
+};
+struct SerialRun {
+    std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}
+    std::optional<std::string> acm_dev_path; // ResolvedSerial.acmDevPath
+};
+struct VncRun {
+    std::optional<std::string> host; // VMScreenConfig.setVncHost before start
+    std::optional<int64_t> port; // VMInstance.resolveVncConfig setVncPort
+    std::optional<std::string> password; // VMInstance.resolveVncConfig setVncPassword
+};
+struct CrosvmRun {
+    std::optional<std::string> control_socket_path; // CrosvmBackendInstance.controlSocketPath
+    std::optional<std::string> gpu_cgroup_path; // gpuCgroupPath after prepareGpuCgroup()
+    std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved
+    std::map<std::string, VncRun> vnc; // per screen id, overrides screens.<id>.vnc
+};
+struct CrosvmLaunch {
+    std::vector<std::string> argv;
+    // NativeProcess.Builder.environment calls in order; later keys win when merged.
+    std::vector<std::pair<std::string, std::string>> env;
+    std::optional<std::string> strace_dir; // getStraceFolder(): caller recreates the directory
+    std::optional<int64_t> udmabuf_limit_mb; // applyGfxstreamEnv's size_limit_mb write, left to the caller
+    bool input_bridge = false; // isInputBridgeNeeded()
+    std::vector<std::string> touch_screens, native_input_screens; // touchscreenScreens()/nativeInputScreens()
+};
+// Expects droidvm::config::migrate_vm output. Throws std::runtime_error or
+// std::invalid_argument where the Java start would fail.
+CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, const BootPlan& boot, const HostFacts& host);
+}

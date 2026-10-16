@@ -6,6 +6,7 @@
 #include "services/network_host.h"
 #include "services/network.h"
 #include "services/vm.h"
+#include "services/legacy_events.h"
 #include "network/host_watch.h"
 
 namespace droidvm {
@@ -20,8 +21,9 @@ class RequestDispatcher {
 public:
     RequestDispatcher(SystemService& system, TaskService& tasks, NetworkConfigService* networks = nullptr,
                       NetworkHostService* host_network = nullptr, NetworkService* runtime = nullptr,
-                      network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr)
-        : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms) {}
+                      network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr, LegacyEvents* events = nullptr)
+        : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms), events_(events) {}
+    LegacyEvents* legacy_events() const { return events_; }
     bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr; }
     void maintenance() {
         if (runtime_) runtime_->schedule_reconcile(tasks_);
@@ -41,6 +43,7 @@ private:
     NetworkService* runtime_;
     network::HostIpv4Watch* host_ipv4_;
     VmService* vms_;
+    LegacyEvents* events_;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);
 };
 }
