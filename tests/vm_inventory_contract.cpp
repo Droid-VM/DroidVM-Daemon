@@ -124,12 +124,14 @@ void session_overrides_worker_abort() {
     auto target = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
     const auto baseline = target->config();
     Json::Value overrides; overrides["pseudo_unprotected"] = true;
-    check(target->start({}, overrides), "session reaches asynchronous worker");
+    target->log("stdio")->append("previous run\n");
+    check(target->start({}, overrides, true), "session reaches asynchronous worker");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (target->state() != vm::State::stopped && std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
     check(target->state() == vm::State::stopped && target->pid() == -1 && admissions >= 2, "worker aborts before VMM launch");
     check(target->config() == baseline, "STOPPED publication restores complete baseline after worker abort");
+    check(target->log("stdio")->contents().find("previous run") == std::string::npos, "admitted start clears previous run logs");
     check(bool(target->try_edit()), "completed session releases lifecycle admission");
 }
 void lease_abort_and_lifetime() {
@@ -239,6 +241,9 @@ void configured_start_adapter() {
     auto doc = view->document; auto vm = config("adapter-start"); vm["backend"] = "qemu";
     doc["vms"].append(vm); view = store.replace(admin, view->revision, doc);
     Json::Value request; request["revision"] = view->revision; request["vm_id"] = vm["id"];
+    request["clear_logs_before_start"] = true;
+    auto* log = inventory.runtime(admin, vm["id"].asString())->log("stdio");
+    log->append("retain rejected start history\n");
     auto denied = [&](const CallContext& caller, const Json::Value& input, const char* code) {
         const auto result = dispatcher.execute_background(caller, "vm_start_configured", input);
         check(result["success"] == false && result["error"]["code"] == code, "configured start structured error");
@@ -248,9 +253,14 @@ void configured_start_adapter() {
     bad = request; bad["config"] = vm; denied(admin, bad, "INVALID_ARGUMENT");
     bad = request; bad["overrides"]["pseudo_unprotected"] = true; denied(admin, bad, "INVALID_ARGUMENT");
     bad = request; bad["vm_id"] = random_id(true); denied(admin, bad, "NOT_FOUND");
+    bad = request; bad["clear_logs_before_start"] = "true"; denied(admin, bad, "INVALID_ARGUMENT");
+    bad = request; bad["boot_entry"] = std::string((64u << 10) + 1, 'x'); denied(admin, bad, "INVALID_ARGUMENT");
     check(fixture.starts == 0, "invalid requests have no runtime side effects");
     denied(admin, request, "CONFLICT");
     check(fixture.starts == 1 && store.snapshot(admin) == view, "matching revision reaches admission without rewriting configuration");
+    check(log->contents().find("retain rejected start history") != std::string::npos, "validation and shutdown refusal preserve logs even when clearing requested");
+    bad = request; bad["boot_entry"] = std::string(64u << 10, 'x'); denied(admin, bad, "CONFLICT");
+    check(fixture.starts == 2, "bounded long boot key reaches runtime admission");
     check(dispatcher.execute(session, "vm_start_configured", request)["error"]["code"] == "CONFLICT", "direct dispatch shares configured start implementation");
 }
 void persistent_inventory_commit() {

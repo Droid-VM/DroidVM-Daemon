@@ -74,7 +74,7 @@ public:
     void set_networks(Json::Value networks) { std::lock_guard lock(state_mutex_); config_["networks"] = std::move(networks); }
     // Internal session overrides: readonly_disks (slot indices), pseudo_unprotected (true).
     // Kept across guest reboots, restored after final stop or failed admission.
-    bool start(std::optional<std::string> boot_entry = {}, const Json::Value& overrides = Json::Value());
+    bool start(std::optional<std::string> boot_entry = {}, const Json::Value& overrides = Json::Value(), bool clear_logs = false);
     bool stop();
     bool reboot();
     bool suspend();
@@ -119,7 +119,7 @@ private:
     void set_state(State next);
     void fire(const std::string& event, const Json::Value& extra = Json::Value());
     void create_streams();
-    bool start_locked(bool relaunch);
+    bool start_locked(bool relaunch, bool clear_logs = false);
     bool setup_taps();
     void cleanup_taps();
     void run();

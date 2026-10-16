@@ -175,14 +175,20 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             auto snapshot = vm_config_->snapshot(caller);
             if (!vms_) throw ServiceError(ErrorCode::unavailable, "VM runtime unavailable");
             for (const auto& key : request.getMemberNames())
-                if (key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry")
+                if (key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry" && key != "clear_logs_before_start")
                     throw ServiceError(ErrorCode::invalid_argument, "Unexpected configured start field");
             const auto revision = string_field(request, "revision");
             const auto id = string_field(request, "vm_id");
             if (revision.empty() || id.empty()) throw ServiceError(ErrorCode::invalid_argument, "Missing revision or VM ID");
             if (snapshot->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
             if (snapshot->durability_uncertain) throw ServiceError(ErrorCode::commit_uncertain, "VM configuration durability is uncertain");
-            const auto boot = request.isMember("boot_entry") ? string_field(request, "boot_entry") : std::string();
+            // A boot key is an image-provided ID/title, not a UUID/revision.
+            if (request.isMember("boot_entry") && (!request["boot_entry"].isString() || request["boot_entry"].asString().size() > (64u << 10)))
+                throw ServiceError(ErrorCode::invalid_argument, "Invalid boot entry");
+            const auto boot = request.isMember("boot_entry") ? request["boot_entry"].asString() : std::string();
+            if (request.isMember("clear_logs_before_start") && !request["clear_logs_before_start"].isBool())
+                throw ServiceError(ErrorCode::invalid_argument, "Invalid clear logs option");
+            const bool clear_logs = request.get("clear_logs_before_start", false).asBool();
             for (const auto& row : snapshot->document["vms"]) if (row["id"] == id) {
                 if (request["overrides"].isObject() && request["overrides"].isMember("pseudo_unprotected")) {
                     vm::HostFacts facts;
@@ -191,7 +197,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                     if (config::java_enum(row, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "CROSVM" || !vm::resolves_to_gunyah(row, facts))
                         throw ServiceError(ErrorCode::invalid_argument, "Protection override requires crosvm with Gunyah");
                 }
-                if (!vms_->start_configured(caller, id, row, request["overrides"], boot.empty() ? std::nullopt : std::optional(boot)))
+                if (!vms_->start_configured(caller, id, row, request["overrides"], boot.empty() ? std::nullopt : std::optional(boot), clear_logs))
                     throw ServiceError(ErrorCode::conflict, "VM start was not admitted; reload state before retrying");
                 Json::Value result;
                 result["success"] = true; result["vm_id"] = id; result["revision"] = revision;

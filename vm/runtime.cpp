@@ -206,7 +206,7 @@ void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
     if (extra.isObject()) for (const auto& key : extra.getMemberNames()) data[key] = extra[key];
     context_.events->publish(data);
 }
-bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& overrides) {
+bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& overrides, bool clear_logs) {
     std::unique_lock lock(lock_);
     if (retired_) return false;
     {
@@ -240,7 +240,7 @@ bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& 
         boot_entry_ = std::move(boot_entry);
     }
     try {
-        if (start_locked(false)) return true;
+        if (start_locked(false, clear_logs)) return true;
     } catch (...) {
         std::lock_guard state(state_mutex_);
         if (session_base_) { config_.swap(*session_base_); session_base_.reset(); }
@@ -250,7 +250,7 @@ bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& 
     if (session_base_) { config_.swap(*session_base_); session_base_.reset(); }
     return false;
 }
-bool VmRuntime::start_locked(bool relaunch) {
+bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
     if (retired_ || context_.shutting_down()) return false;
     {
         std::unique_lock state(state_mutex_);
@@ -259,6 +259,8 @@ bool VmRuntime::start_locked(bool relaunch) {
         idle_.wait_for(state, 1s, [&] { return !worker_; });
         if (worker_) return false;
     }
+    // Clear only after validation and stopped admission, before new startup diagnostics.
+    if (clear_logs) this->clear_logs();
     if (!setup_taps()) return false;
     { std::lock_guard state(state_mutex_); resolve_vnc(config_); }
     try {

@@ -188,7 +188,7 @@ std::shared_ptr<vm::VmRuntime> VmService::runtime(const CallContext& caller, con
     return entry->vm;
 }
 bool VmService::start_configured(const CallContext& caller, const std::string& id,
-        const Json::Value& expected, const Json::Value& overrides, std::optional<std::string> boot_entry) {
+        const Json::Value& expected, const Json::Value& overrides, std::optional<std::string> boot_entry, bool clear_logs) {
     access(caller);
     std::shared_ptr<vm::VmRuntime> target;
     {
@@ -203,7 +203,7 @@ bool VmService::start_configured(const CallContext& caller, const std::string& i
     // Never hold inventory across lifecycle/network callbacks. If a writer won
     // after the comparison, its stopped lease retires target and start refuses.
     // If start wins, the writer cannot acquire the stopped lease and must fail.
-    try { return target->start(std::move(boot_entry), overrides); }
+    try { return target->start(std::move(boot_entry), overrides, clear_logs); }
     catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::invalid_argument, error.what()); }
 }
 std::string VmService::create(const CallContext& caller, Json::Value value) {

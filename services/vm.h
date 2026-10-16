@@ -45,7 +45,7 @@ public:
     // snapshot, never a runtime projection. No implicit rebase or file write.
     bool start_configured(const CallContext& caller, const std::string& id,
         const Json::Value& expected, const Json::Value& overrides = Json::Value(),
-        std::optional<std::string> boot_entry = {});
+        std::optional<std::string> boot_entry = {}, bool clear_logs = false);
     void stop_all(); // stopAll: refuses further starts
     // VMInstanceStore.autoUpAsync: starts auto_up VMs in store order on a thread of its own.
     void auto_up_async();
