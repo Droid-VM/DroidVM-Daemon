@@ -13,8 +13,9 @@ namespace {
 void require(bool ok, const char* operation) {
     if (!ok) throw std::system_error(errno, std::generic_category(), operation);
 }
-bool valid_name(const std::string& name) {
-    return name.size() == 35 && name.starts_with("gv-") &&
+std::string kind(const Json::Value& entry) { return entry.get("kind", "gvswitch").asString(); }
+bool valid_name(const std::string& name, const std::string& kind) {
+    return name.size() == 35 && name.starts_with(kind == "gvswitch" ? "gv-" : "dh-") &&
         name.substr(3).find_first_not_of("0123456789abcdef") == std::string::npos;
 }
 }
@@ -30,13 +31,16 @@ SwitchRuntime::SwitchRuntime(int directory, uid_t owner, Observer observer, conf
     else { document_["schema"] = 1; document_["switches"] = Json::Value(Json::arrayValue); }
     if (document_["schema"] != 1 || !document_["switches"].isArray() || document_["switches"].size() > 1024)
         throw std::runtime_error("invalid switch runtime inventory");
-    std::set<std::string> names, owners;
+    std::set<std::string> names;
+    std::set<std::pair<std::string, std::string>> owners;
     for (const auto& entry : document_["switches"]) {
-        if (!entry.isObject() || !entry["name"].isString() || !valid_name(entry["name"].asString()) ||
+        if (!entry.isObject() || (entry.isMember("kind") && !entry["kind"].isString()) ||
+            (kind(entry) != "gvswitch" && kind(entry) != "bridgedhcp") ||
+            !entry["name"].isString() || !valid_name(entry["name"].asString(), kind(entry)) ||
             !entry["owner"].isString() || entry["owner"].asString().empty() || entry["owner"].asString().size() > 128 ||
             !entry["device"].isUInt64() || !entry["inode"].isUInt64() ||
             (entry["phase"] != "reserved" && entry["phase"] != "owned" && entry["phase"] != "stopped") ||
-            !names.insert(entry["name"].asString()).second || !owners.insert(entry["owner"].asString()).second)
+            !names.insert(entry["name"].asString()).second || !owners.emplace(entry["owner"].asString(), kind(entry)).second)
             throw std::runtime_error("invalid switch runtime entry");
         if ((entry["phase"] == "reserved") != (entry["inode"].asUInt64() == 0))
             throw std::runtime_error("invalid switch directory identity phase");
@@ -59,19 +63,21 @@ void SwitchRuntime::erase(const std::string& name) {
     next["switches"].removeIndex(find(name), nullptr);
     save(std::move(next));
 }
-void SwitchRuntime::allocate(const std::string& owner, Allocation& allocation) {
+void SwitchRuntime::allocate(const std::string& owner, Allocation& allocation, Kind helper_kind) {
     if (!allocation.name.empty() || allocation.directory.get() >= 0) throw std::logic_error("switch allocation is not empty");
     if (owner.empty() || owner.size() > 128 || owner.find('\0') != std::string::npos)
         throw std::invalid_argument("invalid switch runtime owner");
-    const auto name = "gv-" + random_id(false);
+    const std::string type = helper_kind == Kind::gvswitch ? "gvswitch" : "bridgedhcp";
+    const auto name = std::string(helper_kind == Kind::gvswitch ? "gv-" : "dh-") + random_id(false);
     {
         std::lock_guard lock(mutex_);
-        for (const auto& row : document_["switches"]) if (row["owner"] == owner)
+        for (const auto& row : document_["switches"]) if (row["owner"] == owner && kind(row) == type)
             throw ServiceError(ErrorCode::conflict, "network has unresolved switch resources");
         if (document_["switches"].size() >= 1024) throw ServiceError(ErrorCode::resource_exhausted, "switch runtime inventory full");
         allocation.name = name;
         Json::Value entry;
         entry["name"] = name; entry["owner"] = owner; entry["phase"] = "reserved";
+        entry["kind"] = type;
         entry["device"] = Json::UInt64(0); entry["inode"] = Json::UInt64(0);
         auto next = document_; next["switches"].append(entry); save(std::move(next));
     }
@@ -133,6 +139,8 @@ void SwitchRuntime::cleanup(const std::string& name) {
         for (const char* file : {"s", "config.json", "config.json.bak", "config.json.corrupt",
                                 "helper.json", "helper.json.bak", "helper.json.corrupt", "helper.identity"})
             require(unlinkat(directory.get(), file, 0) == 0 || errno == ENOENT, "remove known switch file");
+        if (kind(entry) == "bridgedhcp")
+            require(unlinkat(directory.get(), "api.key", 0) == 0 || errno == ENOENT, "remove DHCP API key");
         point("switch_files_removed");
     }
     struct stat named{};

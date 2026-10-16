@@ -5,7 +5,11 @@
 #include "network/helper_config.h"
 #include "services/network_config.h"
 #include "services/network.h"
+#include "store/network_config.h"
 #include "network/gvswitch.h"
+#include "network/bridgedhcp.h"
+#include "network/linux_topology.h"
+#include "dhcp_client.h"
 #include "runtime/managed_process.h"
 #include "runtime/helper_identity.h"
 #include "common/identity.h"
@@ -19,6 +23,9 @@
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <signal.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 
 using namespace droidvm;
 using namespace droidvm::network;
@@ -363,6 +370,144 @@ std::string switch_directory(const std::string& parent) {
     }
     closedir(scan); check(!found.empty(), "real switch created private directory"); return found;
 }
+Json::Value managed_dhcp_configuration(const std::string& bridge) {
+    auto network = wire::parse(R"({"schema":2,"name":"managed DHCP","auto_up":false,"l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"198.18.120.1/24","dhcp":{"enabled":true,"offset_start":10,"offset_end":20}},"ipv6":{"cidr":"fd91:fe21:21::1/64","dhcp":{"enabled":true},"slaac":{"enabled":true}}}]}})");
+    network["id"] = random_id(true); network["bridge_name"] = bridge; return network;
+}
+void managed_dhcp_lifecycle() {
+    const auto path = work + "/managed-dhcp";
+    check(mkdir(path.c_str(), 0700) == 0, "create managed DHCP fixture");
+    Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Netbox netbox(binaries + "/netbox");
+    OwnedLinks links(directory.get(), getuid(), netbox);
+    SwitchRuntime runtime(directory.get(), getuid());
+    NetworkConfigService configs(directory.get(), getuid());
+    const auto bridge = "dh" + random_id(false).substr(0, 8);
+    auto network = managed_dhcp_configuration(bridge);
+    auto lease = configs.prepare_runtime(admin, configs.create(admin, network));
+    LinuxTopology topology(netbox, links);
+    topology.start(lease->config(), lease->bridge_mac());
+    BridgeDhcp helper(binaries + "/bridgedhcp", runtime, directory.get());
+    try {
+        BridgeDhcp absent(binaries + "/absent-dhcp", runtime, directory.get());
+        bool launch_failed = false;
+        try { absent.start(lease->config()); } catch (const std::exception&) { launch_failed = true; }
+        check(launch_failed && runtime.inventory()["switches"].empty(), "failed DHCP exec reclaims reserved runtime and identity");
+        auto pd = lease->config();
+        pd["l3"]["vlans"][0]["ipv6"]["source"] = "dhcp_pd";
+        pd["l3"]["vlans"][0]["ipv6"]["pd"]["uplink"] = bridge;
+        error(ErrorCode::unavailable, [&] { helper.start(pd); });
+        check(runtime.inventory()["switches"].empty(), "unimplemented PD ownership rejected before allocation");
+        const auto state = BridgeDhcp::state_file(lease->config());
+        check(symlinkat("/does/not/exist", directory.get(), state.c_str()) == 0, "place test state symlink");
+        error(ErrorCode::conflict, [&] { helper.start(lease->config()); });
+        check(unlinkat(directory.get(), state.c_str(), 0) == 0, "remove test state symlink");
+        check(helper.start(lease->config()) && helper.healthy(), "managed DHCP reaches verified service readiness");
+        const auto generation = helper.process_status().generation;
+        DhcpStatics statics;
+        statics.ipv4 = wire::parse(R"([{"id":"fixed","mac":"02:00:00:12:34:56","offset":17}])");
+        helper.set_statics(0, statics);
+        check(helper.status()["ifaces"][0]["statics4"][0]["id"] == "fixed", "managed static binding control updates real helper");
+        error(ErrorCode::not_found, [&] { helper.leases(22, false); });
+        const auto tap_name = bridge + "t";
+        links.tap(config::uuid(lease->config()), tap_name);
+        Fd tap(open("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK));
+        ifreq request{}; request.ifr_flags = IFF_TAP | IFF_NO_PI;
+        std::copy(tap_name.begin(), tap_name.end(), request.ifr_name);
+        check(tap.get() >= 0 && ioctl(tap.get(), TUNSETIFF, &request) == 0, "open only owned DHCP client TAP");
+        netbox.master(tap_name, bridge); netbox.state(tap_name, true);
+        const auto ip = acquire_dhcp4(tap.get());
+        auto has_lease = [&] {
+            const auto rows = helper.leases(0, false)["leases"];
+            for (const auto& row : rows) if (row["ip"] == ip && row["mac"] == "02:00:00:12:34:99") return true;
+            return false;
+        };
+        check(has_lease(), "real DHCP ACK appears in helper lease API");
+        // Graceful stop flushes durable leases; restart then an abrupt helper
+        // crash must retain the same lease without receiving another request.
+        helper.stop();
+        check(access((path + "/" + state).c_str(), F_OK) == 0, "lease state survives temporary helper directory cleanup");
+        helper.restart(); check(has_lease(), "lease restored after graceful helper restart");
+        check(helper.signal(SIGKILL), "kill only held DHCP helper pidfd");
+        helper.restart();
+        check(helper.process_status().generation > generation && has_lease(), "lease restored after helper SIGKILL");
+        check(helper.status()["ifaces"][0]["statics4"][0]["id"] == "fixed", "desired statics reapplied after restart");
+        check(helper.tools()[0]["key"] == "bridgedhcp" && helper.tools()[0]["running"] == true && helper.tool_log().isArray(), "managed helper status and bounded logs");
+        helper.stop();
+        auto disabled = lease->config();
+        disabled["l3"]["vlans"][0]["ipv4"]["dhcp"]["enabled"] = false;
+        disabled["l3"]["vlans"][0]["ipv6"]["dhcp"]["enabled"] = false;
+        disabled["l3"]["vlans"][0]["ipv6"]["slaac"]["enabled"] = false;
+        check(!helper.start(disabled), "network with no DHCP or RA needs no helper");
+        helper.restart();
+        check(!helper.healthy() && runtime.inventory()["switches"].empty(), "restart does not resurrect previous enabled configuration");
+        topology.stop();
+        check(runtime.inventory()["switches"].empty() && links.inventory()["links"].empty(), "managed DHCP releases process, files and topology");
+        unlinkat(directory.get(), state.c_str(), 0);
+    } catch (...) { helper.stop(); topology.stop(); throw; }
+    lease.reset();
+    for (const char* file : {"networks.json", "networks.json.bak", "network-links.json", "network-links.json.bak", "network-runtime.json", "network-runtime.json.bak"})
+        unlinkat(directory.get(), file, 0);
+    check(rmdir(path.c_str()) == 0, "managed DHCP fixture empty");
+}
+void managed_dhcp_daemon_recovery() {
+    const auto path = work + "/dhcp-owner-death";
+    check(mkdir(path.c_str(), 0700) == 0, "create DHCP owner death fixture");
+    for (const char* name : {"run", "files", "bin"}) check(mkdir((path + "/" + name).c_str(), 0700) == 0, "create DHCP data layout");
+    check(symlink((binaries + "/netbox").c_str(), (path + "/bin/netbox").c_str()) == 0, "reuse bundled netbox for actual daemon recovery");
+    Fd files(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const auto bridge = "dh" + random_id(false).substr(0, 8);
+    const auto network = managed_dhcp_configuration(bridge);
+    NetworkConfigService(files.get(), getuid()).create(admin, network);
+    ChildOptions orphan; orphan.argv = {"/proc/self/exe", "--orphan-dhcp", binaries, path};
+    check(Child(orphan).communicate({}, 20s).exit_code == -SIGKILL, "kill owner after managed DHCP readiness");
+    Fd run_dir(open((path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const auto entry = config::JsonFile(run_dir.get(), "network-runtime.json", getuid()).load()->value["switches"][0];
+    check(entry["kind"] == "bridgedhcp" && entry["name"].asString().starts_with("dh-"), "typed DHCP inventory survives owner death");
+    Fd helper_dir(openat(run_dir.get(), entry["name"].asCString(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const auto record = config::JsonFile(helper_dir.get(), "helper.json", getuid()).load()->value;
+    Fd process(static_cast<int>(syscall(SYS_pidfd_open, record["pid"].asInt(), 0)));
+    pollfd death{process.get(), POLLIN, 0};
+    check(process.get() >= 0 && poll(&death, 1, 0) == 0, "orphan DHCP is still alive with inherited marker");
+    write_file(path + "/fixture.apk", "isolated DHCP startup recovery");
+    ChildOptions launch; launch.argv = {daemon_executable, "--data-dir", path, "--apk", path + "/fixture.apk"};
+    Child daemon(launch);
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (access((path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0 && !daemon.poll_exit() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(10ms);
+    if (daemon.poll_exit() || access((path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0) {
+        std::cerr << daemon.communicate({}, 1s).error << std::endl;
+        throw std::runtime_error("daemon did not recover orphan DHCP before readiness");
+    }
+    check(poll(&death, 1, 0) > 0 && access(("/sys/class/net/" + bridge).c_str(), F_OK) < 0,
+        "actual daemon reclaims DHCP process before its Linux topology");
+    check(config::JsonFile(run_dir.get(), "network-runtime.json", getuid()).load()->value["switches"].empty() &&
+        config::JsonFile(run_dir.get(), "network-links.json", getuid()).load()->value["links"].empty(), "both startup inventories empty");
+    check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon exits normally");
+    for (const char* name : {"network-links.json", "network-links.json.bak", "network-runtime.json", "network-runtime.json.bak", "droidvmd.lock"}) unlinkat(run_dir.get(), name, 0);
+    for (const char* name : {"networks.json", "networks.json.bak"}) unlinkat(files.get(), name, 0);
+    unlinkat(files.get(), BridgeDhcp::state_file(network).c_str(), 0);
+    unlink((path + "/bin/netbox").c_str()); unlink((path + "/fixture.apk").c_str()); unlink((path + "/cache/daemon.log").c_str());
+    for (const char* name : {"run", "files", "bin", "cache"}) check(rmdir((path + "/" + name).c_str()) == 0, "DHCP owner fixture directory empty");
+    check(rmdir(path.c_str()) == 0, "DHCP owner fixture reclaimed");
+}
+void typed_helper_inventory() {
+    const auto path = work + "/typed-inventory";
+    check(mkdir(path.c_str(), 0700) == 0, "create typed helper inventory fixture");
+    Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    SwitchRuntime runtime(directory.get(), getuid());
+    SwitchRuntime::Allocation first, second, duplicate;
+    runtime.allocate("same-owner", first);
+    runtime.allocate("same-owner", second, SwitchRuntime::Kind::bridgedhcp);
+    error(ErrorCode::conflict, [&] { runtime.allocate("same-owner", duplicate, SwitchRuntime::Kind::bridgedhcp); });
+    auto document = runtime.inventory();
+    document["switches"][0].removeMember("kind"); // pre-upgrade gvswitch entry
+    config::JsonFile(directory.get(), "network-runtime.json", getuid()).save(document);
+    SwitchRuntime restarted(directory.get(), getuid());
+    check(restarted.recover_all().empty(), "old gvswitch and new DHCP records recover together");
+    for (const char* name : {"network-runtime.json", "network-runtime.json.bak"}) unlinkat(directory.get(), name, 0);
+    check(rmdir(path.c_str()) == 0, "typed inventory fixture empty");
+}
 void await_exit(Gvswitch& backend) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (backend.status().running && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
@@ -665,6 +810,20 @@ void real_daemon_startup_recovery() {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--orphan-dhcp") {
+        const std::string path = argv[3];
+        Fd files(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        Fd run(open((path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        NetworkConfigService configs(files.get(), getuid());
+        auto lease = configs.prepare_runtime(admin, configs.list(admin)[0]["id"].asString());
+        Netbox netbox(std::string(argv[2]) + "/netbox");
+        OwnedLinks links(run.get(), getuid(), netbox);
+        LinuxTopology topology(netbox, links); topology.start(lease->config(), lease->bridge_mac());
+        SwitchRuntime runtime(run.get(), getuid());
+        BridgeDhcp helper(std::string(argv[2]) + "/bridgedhcp", runtime, files.get());
+        check(helper.start(lease->config()), "orphan DHCP configured");
+        kill(getpid(), SIGKILL); return 99;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--recover-helper") {
         try {
             Fd directory(open(argv[2], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
@@ -686,6 +845,9 @@ int main(int argc, char** argv) {
     }
     if (argc == 3 || argc == 4) { binaries = argv[1]; work = argv[2]; if (argc == 4) daemon_executable = argv[3]; }
     if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp},
+        {"managed_dhcp_lifecycle_and_real_lease", managed_dhcp_lifecycle},
+        {"managed_dhcp_owner_death_and_daemon_recovery", managed_dhcp_daemon_recovery},
+        {"typed_helper_inventory_compatibility", typed_helper_inventory},
         {"network_autostart_queue_and_stop", network_autostart_queue_and_stop},
         {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup},
         {"real_switch_owner_sigkill", real_switch_owner_death},

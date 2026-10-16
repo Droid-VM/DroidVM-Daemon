@@ -9,12 +9,13 @@ namespace droidvm::network {
 // Owners serialize operations on one entry and drain workers before recovery.
 class SwitchRuntime {
 public:
+    enum class Kind { gvswitch, bridgedhcp };
     struct Allocation { std::string name; Fd directory; };
     using Observer = std::function<void(const char*)>;
     SwitchRuntime(int directory, uid_t owner, Observer observer = {}, config::JsonFile::Observer file_observer = {});
     // The caller retains allocation even on exception, so stop can retry any
     // reservation installed before a failed fsync or directory operation.
-    void allocate(const std::string& network_id, Allocation& allocation);
+    void allocate(const std::string& network_id, Allocation& allocation, Kind kind = Kind::gvswitch);
     void cleanup(const std::string& name);
     Json::Value recover_all(); // every failed entry retained; independent entries continue
     Json::Value inventory() const;

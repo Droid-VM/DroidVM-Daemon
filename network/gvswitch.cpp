@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gvswitch.h"
 #include "helper_config.h"
+#include "helper_ready.h"
 #include "store/json_file.h"
 #include "store/network_config.h"
 #include "common/identity.h"
@@ -49,24 +50,8 @@ void Gvswitch::start(const Json::Value& config) {
     HelperIdentity identity(allocation_.directory.get(), runtime_.owner());
     identity.arm(options);
     process_.start(options);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (!process_.status().running) throw std::runtime_error("gvswitch exited before readiness");
-        try {
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-            if (remaining.count() <= 0) break;
-            const auto response = client_->request(HttpMethod::get, "/api/v1/ports", {},
-                {std::min(remaining, std::chrono::milliseconds(200)), {}});
-            if (response.success() && wire::parse(response.body).isArray() && process_.status().running) {
-                ready_ = true; return;
-            }
-            if (!response.success()) throw std::runtime_error("gvswitch readiness API rejected request");
-        } catch (const ControlError& error) {
-            if (error.reason != ControlFailure::io && error.reason != ControlFailure::timeout) throw;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    throw std::runtime_error("gvswitch readiness deadline exceeded");
+    await_helper(process_, *client_, "/api/v1/ports", [](const Json::Value& ports) { return ports.isArray(); });
+    ready_ = true;
 }
 void Gvswitch::recover(const Json::Value& config) {
     if (healthy()) return;
