@@ -3,6 +3,8 @@
 // volumes, manifests and the plan helpers, including corrupt input.
 #include "pkg/plan.h"
 #include "pkg/writer.h"
+#include "pkg/service.h"
+#include "services/legacy_events.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
@@ -14,11 +16,76 @@
 #include <random>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <chrono>
+#include <thread>
 
 using namespace droidvm;
 using namespace droidvm::pkg;
 namespace {
 void check(bool value, const std::string& detail) { if (!value) throw std::runtime_error(detail); }
+void service_access() {
+    TaskService tasks;
+    PkgContext context;
+    context.tasks = &tasks;
+    PkgService packages(context);
+    for (const auto& caller : {CallContext{}, CallContext{"reader", true, true, false}, CallContext{"admin", true, false, true}}) {
+        for (bool importing : {false, true}) {
+            bool denied = false;
+            try {
+                if (importing) packages.vm_import(caller, Json::Value());
+                else packages.vm_export(caller, Json::Value());
+            } catch (const ServiceError& error) {
+                denied = error.code() == (caller.authenticated ? ErrorCode::permission_denied : ErrorCode::unauthenticated);
+            }
+            check(denied, "package authorization precedes path/configuration access");
+        }
+    }
+}
+void service_queue_capacity() {
+    using namespace std::chrono_literals;
+    LegacyEvents events;
+    std::atomic<bool> started{false};
+    TaskLimits limits;
+    limits.workers = 1;
+    limits.background_workers = 1;
+    TaskService tasks(limits);
+    const CallContext caller{"package-owner", true, true, true};
+    tasks.submit(caller, {"hold", "", 4, true, true}, [&](TaskControl& control) {
+        started.store(true);
+        while (!control.cancellation_requested()) std::this_thread::sleep_for(1ms);
+        return TaskCompletion::cancelled();
+    });
+    const auto deadline = TaskService::Clock::now() + 2s;
+    while (!started && TaskService::Clock::now() < deadline) std::this_thread::yield();
+    check(started, "background worker occupied");
+    PkgContext context;
+    context.tasks = &tasks;
+    context.events = &events;
+    PkgService packages(context);
+    Json::Value request;
+    request["src_path"] = "/not-opened.vmpkg";
+    request["target_dir"] = "/not-created";
+    for (int pass = 0; pass < 3; ++pass) {
+        std::vector<TaskRef> refs;
+        for (size_t i = 0; i < PkgService::max_tasks; ++i) {
+            auto response = packages.vm_import(caller, request);
+            refs.push_back({response["epoch"].asString(), response["task_id"].asString()});
+            check(tasks.get(caller, refs.back()).state == TaskState::queued, "package admitted without opening input");
+        }
+        bool rejected = false;
+        try { packages.vm_import(caller, request); }
+        catch (const RequestError& error) { rejected = std::string(error.what()) == "too many package tasks are running"; }
+        check(rejected, "eight active package slots are bounded");
+        if (pass < 2) {
+            for (const auto& ref : refs) check(tasks.cancel(caller, ref).state == TaskState::cancelled, "queued cancellation releases package slot");
+        } else {
+            packages.shutdown();
+            tasks.shutdown();
+            for (const auto& ref : refs) check(tasks.get(caller, ref).state == TaskState::cancelled, "shutdown discards queued package");
+        }
+    }
+    check(events.drain().size() == 3 * PkgService::max_tasks, "legacy terminal notification for every discarded package");
+}
 template<class F> void fails(const std::string& expected, F&& fn) {
     try { fn(); } catch (const std::exception& error) {
         check(std::string(error.what()) == expected, "expected '" + expected + "', got '" + error.what() + "'");
@@ -497,6 +564,8 @@ void file_helpers() {
 int main() {
     using Test = std::pair<const char*, std::function<void()>>;
     const std::vector<Test> tests{
+        {"service authorization", service_access},
+        {"service queue capacity and cancellation", service_queue_capacity},
         {"tar round trip", tar_round_trip}, {"tar edges", tar_edges}, {"compression round trips", compression_round_trips},
         {"compression corruption", compression_corruption}, {"header", header_contract}, {"manifest", manifest_contract},
         {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},

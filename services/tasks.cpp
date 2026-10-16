@@ -67,7 +67,7 @@ struct Record {
     size_t result_limit = 0, reservation = 0;
     bool operation_cancellable = true;
 };
-struct Job { std::shared_ptr<Record> record; TaskService::Work work; std::function<void(bool)> direct; };
+struct Job { std::shared_ptr<Record> record; TaskService::Work work; std::function<void(bool)> direct; TaskService::Discarded discarded; };
 struct Shared {
     std::mutex mutex;
     std::condition_variable ready;
@@ -77,6 +77,7 @@ struct Shared {
     TaskService::Now now;
     std::unordered_map<std::string, std::shared_ptr<Record>> records;
     std::deque<Job> queue;
+    std::deque<Job> background_queue;
     size_t reserved = 0;
     bool stopping = false;
     Shared(TaskLimits limits, TaskService::Now now, EventLimits event_limits)
@@ -134,6 +135,7 @@ TaskView view(const task_detail::Record& record) {
 }
 TaskControl::TaskControl(std::shared_ptr<task_detail::Shared> shared, std::shared_ptr<task_detail::Record> record)
     : shared_(std::move(shared)), record_(std::move(record)) {}
+TaskRef TaskControl::ref() const { return record_->view.ref; } // Immutable after admission.
 bool TaskControl::cancellation_requested() const {
     std::lock_guard lock(shared_->mutex);
     return record_->view.state == TaskState::cancelling;
@@ -164,28 +166,30 @@ struct TaskService::Impl {
     std::vector<std::thread> workers;
     std::mutex join_mutex;
     Impl(TaskLimits limits, Now now, EventLimits event_limits) : shared(std::make_shared<task_detail::Shared>(limits, std::move(now), event_limits)) {
-        if (!limits.workers || limits.workers > 64 || !limits.queued || !limits.records ||
+        if (!limits.workers || limits.workers > 64 || limits.background_workers > 64 - limits.workers || !limits.queued || !limits.records ||
             limits.max_result_bytes < 4 || limits.max_result_bytes > wire::max_payload ||
             limits.retained_bytes < task_detail::metadata_reservation + 4 ||
             limits.retention < std::chrono::milliseconds::zero() || !shared->now || event_limits.max_event_bytes < (16u << 10))
             throw ServiceError(ErrorCode::invalid_argument, "Invalid task limits");
-        workers.reserve(limits.workers);
+        workers.reserve(limits.workers + limits.background_workers);
         try {
-            for (size_t i = 0; i < limits.workers; ++i) workers.emplace_back([this] { run(); });
+            for (size_t i = 0; i < limits.workers; ++i) workers.emplace_back([this] { run(false); });
+            for (size_t i = 0; i < limits.background_workers; ++i) workers.emplace_back([this] { run(true); });
         } catch (...) {
             shutdown();
             throw;
         }
     }
-    void run() {
+    void run(bool background) {
+        auto& queue = background ? shared->background_queue : shared->queue;
         for (;;) {
             task_detail::Job job;
             {
                 std::unique_lock lock(shared->mutex);
-                shared->ready.wait(lock, [&] { return shared->stopping || !shared->queue.empty(); });
-                if (shared->queue.empty()) return;
-                job = std::move(shared->queue.front());
-                shared->queue.pop_front();
+                shared->ready.wait(lock, [&] { return shared->stopping || !queue.empty(); });
+                if (queue.empty()) return;
+                job = std::move(queue.front());
+                queue.pop_front();
                 if (job.record) {
                     job.record->view.state = TaskState::running;
                     job.record->view.cancellable = job.record->operation_cancellable;
@@ -233,11 +237,14 @@ struct TaskService::Impl {
     void shutdown() {
         std::lock_guard join_lock(join_mutex);
         std::deque<task_detail::Job> discarded;
+        std::deque<task_detail::Job> background_discarded;
         {
             std::lock_guard lock(shared->mutex);
             shared->stopping = true;
             discarded.swap(shared->queue);
+            background_discarded.swap(shared->background_queue);
             for (auto& job : discarded) if (job.record) shared->finish(*job.record, TaskState::cancelled);
+            for (auto& job : background_discarded) shared->finish(*job.record, TaskState::cancelled);
             for (auto& [id, record] : shared->records) {
                 if (record->view.state == TaskState::running && record->view.cancellable) {
                     record->view.state = TaskState::cancelling;
@@ -248,7 +255,10 @@ struct TaskService::Impl {
         }
         shared->ready.notify_all();
         for (auto& job : discarded) if (job.direct) { try { job.direct(true); } catch (...) {} }
+        for (auto* queue : {&discarded, &background_discarded})
+            for (auto& job : *queue) if (job.discarded) { try { job.discarded(job.record->view.ref); } catch (...) {} }
         discarded.clear();
+        background_discarded.clear();
         for (auto& worker : workers) if (worker.joinable()) worker.join();
     }
 };
@@ -256,17 +266,18 @@ TaskService::TaskService(TaskLimits limits, Now now, EventLimits event_limits) :
 TaskService::~TaskService() { impl_->shutdown(); }
 void TaskService::shutdown() { impl_->shutdown(); }
 const std::string& TaskService::epoch() const { return impl_->shared->epoch; }
-TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work) {
+TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work, Discarded discarded) {
     require_access(caller);
     auto& shared = *impl_->shared;
     if (spec.kind.empty() || spec.kind.size() > 64 || spec.resource.size() > 256 || !work ||
-        spec.result_bytes < 4 || spec.result_bytes > shared.limits.max_result_bytes)
+        spec.result_bytes < 4 || spec.result_bytes > shared.limits.max_result_bytes ||
+        (spec.background && !shared.limits.background_workers))
         throw ServiceError(ErrorCode::invalid_argument, "Invalid task specification");
     std::unique_lock lock(shared.mutex);
     if (shared.stopping) throw ServiceError(ErrorCode::unavailable, "Task service is stopping");
     shared.reap();
     const size_t reservation = task_detail::metadata_reservation + spec.result_bytes;
-    if (shared.queue.size() >= shared.limits.queued || shared.records.size() >= shared.limits.records ||
+    if (shared.queue.size() + shared.background_queue.size() >= shared.limits.queued || shared.records.size() >= shared.limits.records ||
         reservation > shared.limits.retained_bytes - shared.reserved)
         throw ServiceError(ErrorCode::resource_exhausted, "Task capacity exhausted");
     auto record = std::make_shared<task_detail::Record>();
@@ -282,12 +293,13 @@ TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work)
     const auto ref = record->view.ref;
     const auto [entry, inserted] = shared.records.emplace(ref.id, record);
     if (!inserted) throw ServiceError(ErrorCode::internal, "Task ID collision");
-    try { shared.queue.push_back({record, std::move(work), {}}); }
+    auto& queue = spec.background ? shared.background_queue : shared.queue;
+    try { queue.push_back({record, std::move(work), {}, std::move(discarded)}); }
     catch (...) { shared.records.erase(entry); throw; }
     shared.reserved += reservation;
     shared.changed(*record);
     lock.unlock();
-    shared.ready.notify_one();
+    shared.ready.notify_all();
     return ref;
 }
 void TaskService::post(const CallContext& caller, std::function<void(bool)> work) {
@@ -297,10 +309,10 @@ void TaskService::post(const CallContext& caller, std::function<void(bool)> work
     {
         std::lock_guard lock(shared.mutex);
         if (shared.stopping) throw ServiceError(ErrorCode::unavailable, "Task service is stopping");
-        if (shared.queue.size() >= shared.limits.queued) throw ServiceError(ErrorCode::resource_exhausted, "Worker queue is full");
-        shared.queue.push_back({{}, {}, std::move(work)});
+        if (shared.queue.size() + shared.background_queue.size() >= shared.limits.queued) throw ServiceError(ErrorCode::resource_exhausted, "Worker queue is full");
+        shared.queue.push_back({{}, {}, std::move(work), {}});
     }
-    shared.ready.notify_one();
+    shared.ready.notify_all();
 }
 TaskView TaskService::get(const CallContext& caller, const TaskRef& ref) {
     require_access(caller);
@@ -312,14 +324,22 @@ TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
     require_access(caller);
     auto& shared = *impl_->shared;
     Work discarded;
-    std::lock_guard lock(shared.mutex);
+    Discarded notify_discarded;
+    std::unique_lock lock(shared.mutex);
     auto& record = find(shared, caller, ref);
     if (task_terminal(record.view.state) || record.view.state == TaskState::cancelling) return view(record);
     // Queued work has no side effects and is always cancellable.
     if (record.view.state == TaskState::queued) {
-        auto found = std::find_if(shared.queue.begin(), shared.queue.end(), [&](const auto& job) { return job.record.get() == &record; });
+        auto* queue = &shared.queue;
+        auto found = std::find_if(queue->begin(), queue->end(), [&](const auto& job) { return job.record.get() == &record; });
+        if (found == queue->end()) {
+            queue = &shared.background_queue;
+            found = std::find_if(queue->begin(), queue->end(), [&](const auto& job) { return job.record.get() == &record; });
+        }
+        if (found == queue->end()) throw ServiceError(ErrorCode::internal, "Queued task has no work");
         discarded = std::move(found->work);
-        shared.queue.erase(found);
+        notify_discarded = std::move(found->discarded);
+        queue->erase(found);
         shared.finish(record, TaskState::cancelled);
     } else {
         if (!record.view.cancellable) throw ServiceError(ErrorCode::not_cancellable, "Task has entered a non-cancellable operation");
@@ -327,7 +347,10 @@ TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
         record.view.cancellable = false;
         shared.changed(record);
     }
-    return view(record);
+    auto result = view(record);
+    lock.unlock();
+    if (notify_discarded) { try { notify_discarded(ref); } catch (...) {} }
+    return result;
 }
 SnapshotPage TaskService::snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);

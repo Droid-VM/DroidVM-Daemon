@@ -10,6 +10,51 @@ using namespace droidvm;
 using namespace droidvm::test;
 using namespace std::chrono_literals;
 namespace {
+void background_control_and_cancellation() {
+    TaskLimits limits;
+    limits.workers = 1;
+    limits.background_workers = 1;
+    limits.queued = 1;
+    TaskService service(limits);
+    auto bulk = spec();
+    bulk.background = true;
+    Gate started, release, direct_done;
+    auto running = service.submit(owner, bulk, [&](TaskControl& control) {
+        check(control.ref().epoch == service.epoch(), "worker has immutable task reference");
+        started.release(); release.wait();
+        check(control.cancellation_requested(), "background cancel delivered");
+        return TaskCompletion::cancelled();
+    });
+    started.wait();
+    service.post(owner, [&](bool discarded) { check(!discarded, "RPC dispatched"); direct_done.release(); });
+    direct_done.wait();
+    std::atomic<int> callbacks{0}, effects{0};
+    auto pending = service.submit(owner, bulk, [&](TaskControl&) { ++effects; return TaskCompletion::success(); },
+        [&](const TaskRef& ref) {
+            check(service.get(owner, ref).state == TaskState::cancelled, "discard callback can reenter registry");
+            ++callbacks;
+        });
+    error(ErrorCode::resource_exhausted, [&] { service.submit(owner, bulk, ok); });
+    check(service.cancel(owner, pending).state == TaskState::cancelled && callbacks == 1 && effects == 0,
+          "background queued cancellation calls hook without running work");
+    check(service.cancel(owner, pending).state == TaskState::cancelled && callbacks == 1, "discard callback exactly once");
+    auto shutdown_pending = service.submit(owner, bulk, ok, [&](const TaskRef& ref) {
+        check(service.get(owner, ref).state == TaskState::cancelled, "shutdown hook outside state lock");
+        ++callbacks;
+    });
+    service.cancel(owner, running);
+    // Shutdown must drop the pending job before the running worker is released.
+    std::thread stopping([&] { service.shutdown(); });
+    const auto deadline = TaskService::Clock::now() + 2s;
+    while (callbacks != 2 && TaskService::Clock::now() < deadline) std::this_thread::yield();
+    const bool discarded = callbacks == 2;
+    release.release(); stopping.join();
+    check(discarded && service.get(owner, shutdown_pending).state == TaskState::cancelled, "shutdown drains background queue");
+    check(service.get(owner, running).state == TaskState::cancelled, "shutdown joins background cleanup");
+    TaskService disabled;
+    error(ErrorCode::invalid_argument, [&] { disabled.submit(owner, bulk, ok); });
+}
+
 void identity_and_access() {
     TaskService service, restarted;
     check(service.epoch().size() == 36 && service.epoch() != restarted.epoch(), "unique epoch");
@@ -276,6 +321,7 @@ void bounded_workers_and_shutdown() {
 }
 int main() {
     return run({
+            std::pair{"background_control_cancellation_shutdown", &background_control_and_cancellation},
             std::pair{"identity_access_epoch", &identity_and_access},
             std::pair{"bounded_queue_cancellation_cleanup", &queue_and_cleanup},
             std::pair{"retention_reserved_capacity", &retention_and_reservation},

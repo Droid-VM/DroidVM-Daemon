@@ -161,7 +161,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     if (packages_ && package_command(command)) {
         // ExportHandler/ImportHandler: RequestException texts, else "internal error".
         try {
-            const auto response = command == "vm_export" ? packages_->vm_export(request) : packages_->vm_import(request);
+            const auto response = command == "vm_export" ? packages_->vm_export(caller, request) : packages_->vm_import(caller, request);
             for (const auto& key : response.getMemberNames()) result[key] = response[key];
             result["success"] = true;
         } catch (const pkg::RequestError& error) { result["message"] = error.what(); }
@@ -531,6 +531,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["commands"].append("display_attach");
                 result["native_display_binder"] = true;
                 result["service_api_minor"] = 10;
+            }
+            if (packages_) {
+                result["package_tasks"] = true;
+                result["service_api_minor"] = 11;
             }
         }
         return result;

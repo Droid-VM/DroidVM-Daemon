@@ -40,11 +40,14 @@ struct TaskSpec {
     std::string kind, resource;
     size_t result_bytes = 64u << 10;
     bool cancellable = true;
+    bool background = false;
 };
 struct TaskLimits {
     size_t workers = 2, queued = 64, records = 256;
     size_t retained_bytes = 16u << 20, max_result_bytes = 64u << 10;
     std::chrono::milliseconds retention = std::chrono::minutes(30);
+    // Long operations use a separate pool without a second task/event registry.
+    size_t background_workers = 0;
 };
 struct TaskCompletion {
     TaskState state;
@@ -62,6 +65,7 @@ public:
     TaskControl(const TaskControl&) = delete;
     TaskControl& operator=(const TaskControl&) = delete;
     bool cancellation_requested() const;
+    TaskRef ref() const;
     // The same lock arbitrates cancellation and entry to an irreversible commit.
     // False means cancellation won: clean up and return cancelled(), not success.
     bool enter_commit();
@@ -77,12 +81,15 @@ public:
     using Clock = std::chrono::steady_clock;
     using Now = std::function<Clock::time_point()>;
     using Work = std::function<TaskCompletion(TaskControl&)>;
+    using Discarded = std::function<void(const TaskRef&)>;
     explicit TaskService(TaskLimits limits = {}, Now now = [] { return Clock::now(); }, EventLimits event_limits = {});
     ~TaskService();
     TaskService(const TaskService&) = delete;
     TaskService& operator=(const TaskService&) = delete;
     const std::string& epoch() const;
-    TaskRef submit(const CallContext& caller, TaskSpec spec, Work work);
+    // discarded runs outside the state lock only if queued work never starts;
+    // it must not introduce domain side effects or wait for this pool to stop.
+    TaskRef submit(const CallContext& caller, TaskSpec spec, Work work, Discarded discarded = {});
     // Short synchronous RPC work shares this bounded worker queue without
     // retaining task records. true means shutdown discarded it before execution.
     // The caller must separately bound captured input and completion storage.

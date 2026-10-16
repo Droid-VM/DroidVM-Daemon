@@ -20,6 +20,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr auto progress_interval = std::chrono::milliseconds(500);
 const CallContext internal{"vm-package", true, true, true};
+void require_package_access(const CallContext& caller) {
+    if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
+    if (!caller.administrator || !caller.manage_tasks || caller.principal.empty())
+        throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+}
 
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -103,9 +108,12 @@ class ExportTask {
 public:
     ExportTask(const PkgContext& context, std::shared_ptr<std::atomic<bool>> stopping, const Json::Value& request);
     const std::string& id() const { return id_; }
-    void run();
+    TaskCompletion run(TaskControl& control);
+    void cancelled(const TaskRef& ref) { id_ = ref.id; Json::Value data; data["message"] = "task cancelled"; emit(data, "error"); }
 private:
-    const PkgContext& context_;
+    PkgContext context_;
+    TaskControl* control_ = nullptr;
+    uint64_t bytes_ = 0;
     std::shared_ptr<std::atomic<bool>> stopping_;
     std::string id_ = random_uuid(), vm_id_, dest_;
     int64_t volume_size_ = 0;
@@ -218,10 +226,18 @@ void ExportTask::collect_networks(const Json::Value& source) {
         manifest_.networks.push_back(std::move(network));
     }
 }
-void ExportTask::run() {
+TaskCompletion ExportTask::run(TaskControl& control) {
+    control_ = &control;
+    id_ = control.ref().id;
     Json::Value data;
     data["total"] = total_;
     try {
+        // Existing exports overwrite the selected file and numbered volumes.
+        // Cancellation must win before that irreversible operation starts.
+        if (!control.enter_commit()) {
+            cancelled(control.ref());
+            return TaskCompletion::cancelled();
+        }
         PackageSpec spec;
         spec.dest = dest_;
         spec.volume_size = volume_size_;
@@ -233,11 +249,13 @@ void ExportTask::run() {
         data["done"] = total_;
         if (final_volumes_ > 0) { data["volume_index"] = final_volumes_; data["volume_total"] = final_volumes_; }
         emit(data, "done");
+        return TaskCompletion::success(data);
     } catch (const std::exception& error) {
         context_.log("WARN", "VMExportTask: Export task " + id_ + " failed: " + error.what());
         data["done"] = 0;
         if (*error.what()) data["message"] = error.what();
         emit(data, "error");
+        return TaskCompletion::failure(ErrorCode::io_error, error.what());
     }
 }
 void ExportTask::pack(TarWriter& tar) {
@@ -280,6 +298,7 @@ void ExportTask::write_file(TarWriter& tar, const std::string& item, const std::
         while (const auto count = in.read(buffer.data(), buffer.size())) {
             check_stopping(*stopping_);
             out.write(buffer.data(), count);
+            bytes_ += count;
             written += static_cast<int64_t>(count);
             const auto now = Clock::now();
             if (now - last >= progress_interval) {
@@ -294,6 +313,7 @@ void ExportTask::write_file(TarWriter& tar, const std::string& item, const std::
     });
 }
 void ExportTask::emit(Json::Value data, const char* phase) const {
+    if (control_) control_->progress({phase, "bytes", bytes_, {}});
     data["event"] = "vm_export_status";
     data["task_id"] = id_;
     data["phase"] = phase;
@@ -309,9 +329,16 @@ class ImportTask {
 public:
     ImportTask(const PkgContext& context, std::shared_ptr<std::atomic<bool>> stopping, const Json::Value& request);
     const std::string& id() const { return id_; }
-    void run();
+    TaskCompletion run(TaskControl& control);
+    void cancelled(const TaskRef& ref) { id_ = ref.id; Json::Value data; data["message"] = "task cancelled"; emit(data, "error"); }
 private:
-    const PkgContext& context_;
+    PkgContext context_;
+    TaskControl* control_ = nullptr;
+    uint64_t bytes_ = 0;
+    void check_cancel() const {
+        check_stopping(*stopping_);
+        if (control_ && control_->cancellation_requested()) throw Error("task cancelled");
+    }
     std::shared_ptr<std::atomic<bool>> stopping_;
     std::string id_ = random_uuid(), source_, target_;
     NetworkAction fallback_;
@@ -336,7 +363,7 @@ private:
     void resolve_lease(Json::Value& nic, Family family);
     std::string unique_vm_name(const std::string& name) const;
     std::string create_vm_dir(const std::string& name) const;
-    void discard();
+    bool discard();
     void emit(Json::Value data, const char* phase) const;
 };
 ImportTask::ImportTask(const PkgContext& context, std::shared_ptr<std::atomic<bool>> stopping, const Json::Value& request)
@@ -351,12 +378,18 @@ ImportTask::ImportTask(const PkgContext& context, std::shared_ptr<std::atomic<bo
     fallback_ = opt_string(request, "network_mode", "auto") == "skip" ? NetworkAction::skip : NetworkAction::create;
 }
 Images ImportTask::images() const {
-    return Images(path_join(data_root(context_), "usr/bin/qemu-img"), [stopping = stopping_] { return stopping->load(); });
+    return Images(path_join(data_root(context_), "usr/bin/qemu-img"), [this] { return stopping_->load() || (control_ && control_->cancellation_requested()); });
 }
-void ImportTask::run() {
+TaskCompletion ImportTask::run(TaskControl& control) {
+    control_ = &control;
+    id_ = control.ref().id;
     Json::Value data;
     try {
+        check_cancel();
         unpack();
+        // Network creation and VM registration are observable shared state.
+        // Finish cancellable extraction/cleanup before entering this commit.
+        if (!control.enter_commit()) throw Error("task cancelled");
         auto networks = import_networks();
         resolve_leases();
         std::string id;
@@ -376,13 +409,21 @@ void ImportTask::run() {
         for (const auto index : boots_) boots.append(manifest_.boots[index].json());
         data["networks"] = std::move(networks);
         emit(data, "done");
+        Json::Value result;
+        result["vm_id"] = id;
+        result["done"] = total_;
+        result["total"] = total_;
+        return TaskCompletion::success(std::move(result));
     } catch (const std::exception& error) {
         context_.log("WARN", "VMImportTask: Import task " + id_ + " failed: " + error.what());
-        discard();
+        const bool cleaned = discard();
         data["done"] = 0;
         data["total"] = total_;
         if (*error.what()) data["message"] = error.what();
         emit(data, "error");
+        if (!cleaned) return TaskCompletion::failure(ErrorCode::io_error, "Failed to clean up imported files");
+        if (control.cancellation_requested()) return TaskCompletion::cancelled();
+        return TaskCompletion::failure(ErrorCode::io_error, error.what());
     }
 }
 void ImportTask::unpack() {
@@ -426,12 +467,21 @@ void ImportTask::extract(PackageInput& input) {
     data["done"] = 0;
     data["total"] = total_;
     emit(data, "pack");
-    TarReader(input.data()).for_each([&](const std::string& entry, int, int64_t size, Source& content) { on_entry(entry, size, content); });
-    drain(input.data());
+    // Include ignored tar entries and trailing data in cancellation checks.
+    class CheckedSource final : public Source {
+    public:
+        CheckedSource(Source& source, std::function<void()> check) : source_(source), check_(std::move(check)) {}
+        size_t read(char* data, size_t size) override { check_(); return source_.read(data, size); }
+    private:
+        Source& source_;
+        std::function<void()> check_;
+    } checked(input.data(), [this] { check_cancel(); });
+    TarReader(checked).for_each([&](const std::string& entry, int, int64_t size, Source& content) { on_entry(entry, size, content); });
+    drain(checked);
     input.validate_data_consumed();
 }
 void ImportTask::on_entry(const std::string& name, int64_t size, Source& content) {
-    check_stopping(*stopping_);
+    check_cancel();
     if (auto* disk = manifest_.find_disk(name)) {
         const auto target = unique_file(vm_dir_, component(disk->name, "disk.img"));
         copy(content, target, size, static_cast<int>(disks_.size()));
@@ -462,10 +512,11 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
         int64_t remaining = size, written = 0;
         auto last = Clock::now();
         while (remaining > 0) {
-            check_stopping(*stopping_);
+            check_cancel();
             const auto count = in.read(buffer.data(), static_cast<size_t>(std::min<int64_t>(remaining, static_cast<int64_t>(buffer.size()))));
             if (!count) throw Error("entry " + file_name(out) + ": short read");
             sink.write(buffer.data(), count);
+            bytes_ += count;
             remaining -= static_cast<int64_t>(count);
             written += static_cast<int64_t>(count);
             const auto now = Clock::now();
@@ -625,15 +676,16 @@ std::string ImportTask::create_vm_dir(const std::string& name) const {
     if (!make_dirs(dir)) throw Error("Cannot create " + dir);
     return dir;
 }
-void ImportTask::discard() {
+bool ImportTask::discard() {
     // Everything a failed import wrote is inside the one folder it created.
-    if (vm_dir_.empty() || registered_) return;
-    const auto dir = std::exchange(vm_dir_, std::string());
-    try { delete_tree(dir); } catch (const std::exception& error) {
-        context_.log("WARN", "VMImportTask: Failed to clean up " + dir + ": " + error.what());
+    if (vm_dir_.empty() || registered_) return true;
+    try { delete_tree(vm_dir_); vm_dir_.clear(); return true; } catch (const std::exception& error) {
+        context_.log("WARN", "VMImportTask: Failed to clean up " + vm_dir_ + ": " + error.what());
+        return false;
     }
 }
 void ImportTask::emit(Json::Value data, const char* phase) const {
+    if (control_) control_->progress({phase, "bytes", bytes_, {}});
     data["event"] = "vm_import_status";
     data["task_id"] = id_;
     data["phase"] = phase;
@@ -644,24 +696,29 @@ void ImportTask::emit(Json::Value data, const char* phase) const {
 }
 }
 
-PkgService::PkgService(PkgContext context) : context_(std::move(context)) {}
-PkgService::~PkgService() { shutdown(); }
-void PkgService::launch(std::function<void()> body) {
-    std::lock_guard lock(mutex_);
-    if (stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
-    for (auto it = running_.begin(); it != running_.end();) {
-        if (it->finished->load()) { it->thread.join(); it = running_.erase(it); }
-        else ++it;
-    }
-    if (running_.size() >= max_tasks) throw RequestError("too many package tasks are running");
-    auto finished = std::make_shared<std::atomic<bool>>(false);
-    std::thread thread([body = std::move(body), finished] {
-        try { body(); } catch (...) {}
-        finished->store(true);
-    });
-    running_.push_back({std::move(thread), std::move(finished)});
+PkgService::PkgService(PkgContext context) : context_(std::move(context)) {
+    if (!context_.tasks) throw std::invalid_argument("Package task service is required");
 }
-Json::Value PkgService::vm_export(const Json::Value& request) {
+PkgService::~PkgService() { shutdown(); }
+TaskRef PkgService::launch(const CallContext& caller, const char* kind, TaskService::Work body, TaskService::Discarded discarded) {
+    if (stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
+    struct Slot {
+        std::shared_ptr<std::atomic<size_t>> active;
+        bool held = false;
+        ~Slot() { if (held) active->fetch_sub(1); }
+    };
+    auto slot = std::make_shared<Slot>();
+    slot->active = active_;
+    auto count = active_->load();
+    do { if (count >= max_tasks) throw RequestError("too many package tasks are running"); }
+    while (!active_->compare_exchange_weak(count, count + 1));
+    slot->held = true;
+    return context_.tasks->submit(caller, {kind, "package", 4096, true, true},
+        [slot, body = std::move(body)](TaskControl& control) { return body(control); },
+        [slot, discarded = std::move(discarded)](const TaskRef& ref) { discarded(ref); });
+}
+Json::Value PkgService::vm_export(const CallContext& caller, const Json::Value& request) {
+    require_package_access(caller);
     if (!has(request, "vm_id")) throw RequestError("missing vm_id");
     if (opt_string(request, "dest_path", "").empty()) throw RequestError("missing dest_path");
     const auto volume_size = opt_long(request, "volume_size", 0);
@@ -671,27 +728,26 @@ Json::Value PkgService::vm_export(const Json::Value& request) {
     // A chain that cannot be walked is the whole answer for the caller.
     try { task = std::make_shared<ExportTask>(context_, stopping_, request); }
     catch (const Error& error) { throw RequestError(error.what()); }
-    launch([task] { task->run(); });
+    const auto ref = launch(caller, "vm_export", [task](TaskControl& control) { return task->run(control); },
+                           [task](const TaskRef& ref) { task->cancelled(ref); });
     Json::Value result;
-    result["task_id"] = task->id();
+    result["task_id"] = ref.id;
+    result["epoch"] = ref.epoch;
     return result;
 }
-Json::Value PkgService::vm_import(const Json::Value& request) {
+Json::Value PkgService::vm_import(const CallContext& caller, const Json::Value& request) {
+    require_package_access(caller);
     if (opt_string(request, "src_path", "").empty()) throw RequestError("missing src_path");
     if (opt_string(request, "target_dir", "").empty()) throw RequestError("missing target_dir");
     auto task = std::make_shared<ImportTask>(context_, stopping_, request);
-    launch([task] { task->run(); });
+    const auto ref = launch(caller, "vm_import", [task](TaskControl& control) { return task->run(control); },
+                           [task](const TaskRef& ref) { task->cancelled(ref); });
     Json::Value result;
-    result["task_id"] = task->id();
+    result["task_id"] = ref.id;
+    result["epoch"] = ref.epoch;
     return result;
 }
 void PkgService::shutdown() {
     stopping_->store(true);
-    std::list<Running> running;
-    {
-        std::lock_guard lock(mutex_);
-        running.swap(running_);
-    }
-    for (auto& task : running) if (task.thread.joinable()) task.thread.join();
 }
 }

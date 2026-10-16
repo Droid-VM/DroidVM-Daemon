@@ -218,6 +218,9 @@ int main(int argc, char** argv) {
             std::unique_ptr<UsbVmStore> usb_vms;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
+            droidvm::TaskLimits task_limits;
+            task_limits.background_workers = 2;
+            droidvm::TaskService tasks(task_limits); // joins before legacy events and domain services disappear
             std::unique_ptr<droidvm::pkg::PkgService> packages; // reaches vms, networks and the events
 #ifdef DROIDVM_PLATFORM_SERVICES
             droidvm::platform::AudioTable audio_table;
@@ -369,13 +372,13 @@ int main(int argc, char** argv) {
                 package_context.vms = vms.get();
                 package_context.networks = networks.get();
                 package_context.events = &legacy_events;
+                package_context.tasks = &tasks;
                 package_context.data_dir = context.data_dir;
                 package_context.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
                 packages = std::make_unique<droidvm::pkg::PkgService>(std::move(package_context));
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
-            droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
@@ -415,8 +418,8 @@ int main(int argc, char** argv) {
                 result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             }, report_failure);
             // Task teardown completes while both the instance lock and log are held.
-            cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure);
             cleanup.attempt("packages", [&] { if (packages) packages->shutdown(); }, report_failure);
+            cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure);
             // VMs leave before USB/networks: their taps and devices go with them.
             cleanup.attempt("VMs", [&] { if (vms) vms->stop_all(); }, report_failure);
             cleanup.attempt("USB", [&] { if (usb) usb->shutdown(); }, report_failure);
