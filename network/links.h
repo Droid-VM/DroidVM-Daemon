@@ -18,6 +18,9 @@ public:
     void tap(const std::string& owner, const std::string& name);
     void vlan(const std::string& owner, const std::string& parent, const std::string& name, int vid);
     void require_owned(const std::string& owner, const std::string& name) const;
+    // A checked copy for dependent resource journals, not a transferable lease.
+    Json::Value identity(const std::string& owner, const std::string& name) const;
+    Json::Value scope() const; // boot and network namespace, immutable
     void remove(const std::string& owner, const std::string& name);
     // Reverse creation order; attempt every independent record even on error.
     // Failures remain in inventory, rather than falsely reporting STOPPED.

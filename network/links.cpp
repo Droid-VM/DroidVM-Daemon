@@ -144,10 +144,14 @@ bool OwnedLinks::matches(const Json::Value& record, bool allow_pending) const {
     return locate(record, allow_pending).directory.get() >= 0;
 }
 void OwnedLinks::require_owned(const std::string& owner, const std::string& name) const {
+    identity(owner, name);
+}
+Json::Value OwnedLinks::identity(const std::string& owner, const std::string& name) const {
     std::lock_guard guard(mutex_);
     const auto& record = document_["links"][find(owner, name)];
     if (record.isMember("staging_name") || !matches(record, false))
         throw ServiceError(ErrorCode::conflict, "network link identity changed or incomplete: " + name);
+    return record;
 }
 void OwnedLinks::create(const std::string& owner, const std::string& name, const char* kind,
                         const std::string& parent, int vid) {
@@ -305,6 +309,12 @@ Json::Value OwnedLinks::cleanup_locked(const std::string* owner) {
     return errors;
 }
 Json::Value OwnedLinks::inventory() const { std::lock_guard guard(mutex_); return document_; }
+Json::Value OwnedLinks::scope() const {
+    Json::Value result; result["boot"] = boot_;
+    result["namespace_device"] = Json::UInt64(namespace_device_);
+    result["namespace_inode"] = Json::UInt64(namespace_inode_);
+    return result;
+}
 std::string OwnedLinks::vlan_code(int vid) {
     if (vid < 0 || vid > 4094) throw ServiceError(ErrorCode::invalid_argument, "invalid VLAN id");
     constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

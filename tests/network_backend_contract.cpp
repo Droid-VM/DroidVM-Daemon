@@ -2,6 +2,10 @@
 #include "contracts.h"
 #include "network/links.h"
 #include "network/linux_topology.h"
+#include "network/policy_rules.h"
+#include "network/netlink.h"
+#include <linux/fib_rules.h>
+#include <arpa/inet.h>
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "services/network_host.h"
@@ -36,9 +40,12 @@ struct Case {
     // invocation can retry only verifiably owned resources.
     void finish() {
         OwnedLinks links(directory.get(), getuid(), netbox);
+        OwnedRules rules(directory.get(), getuid(), links);
+        check(rules.recover_all().empty() && rules.inventory()["rules"].empty(), "cleanup registered policy rules before links");
         check(links.cleanup("test").empty(), "cleanup test-owned links");
         check(links.inventory()["links"].empty(), "no unresolved resource records");
-        for (const char* file : {"network-links.json", "network-links.json.bak", "network-links.json.corrupt"})
+        for (const char* file : {"network-links.json", "network-links.json.bak", "network-links.json.corrupt",
+                                "network-rules.json", "network-rules.json.bak", "network-rules.json.corrupt"})
             unlinkat(directory.get(), file, 0);
         check(rmdir(path.c_str()) == 0, "remove empty test directory");
     }
@@ -498,6 +505,243 @@ void link_inventory_rejects_stale_backup() {
     check(links.recover_all().empty(), "restore known latest fixture inventory and recover");
     test.finish();
 }
+PolicyRule test_rule(const std::string& name, bool ipv6, uint32_t table = 123456) {
+    PolicyRule result; result.input = name; result.ipv6 = ipv6; result.lookup = result.plain = true;
+    result.table = table; result.priority = OwnedRules::priority_base; result.protocol = OwnedRules::protocol;
+    result.mark = 12345; result.mask = 0;
+    return result;
+}
+PolicyRule installed_rule(const std::string& name, bool ipv6) {
+    for (const auto& rule : policy_rules(ipv6)) if (rule.input == name && rule.priority == OwnedRules::priority_base && rule.protocol == OwnedRules::protocol)
+        return rule;
+    throw std::runtime_error("missing installed policy fixture rule");
+}
+std::vector<std::pair<uint32_t, uint32_t>> observed_rules(Case& test, bool ipv6) {
+    // The existing Rust tool independently decodes the kernel, rather than
+    // trusting the new adapter's encoder and decoder to agree with each other.
+    std::vector<std::pair<uint32_t, uint32_t>> result;
+    for (const auto& row : test.netbox.rules(ipv6)) if (row["iif"] == test.name)
+        result.emplace_back(row["priority"].asUInt(), row["table"].asUInt());
+    return result;
+}
+void variant_rule(const PolicyRule& rule, bool marked, bool add) {
+    NetlinkMessage<fib_rule_hdr> request;
+    request.header.nlmsg_type = add ? RTM_NEWRULE : RTM_DELRULE;
+    if (add) request.header.nlmsg_flags |= NLM_F_CREATE; // deliberately allow a duplicate fixture
+    request.payload.family = rule.ipv6 ? AF_INET6 : AF_INET; request.payload.action = FR_ACT_TO_TBL;
+    request.attribute(FRA_IIFNAME, rule.input.c_str(), rule.input.size() + 1);
+    request.attribute(FRA_TABLE, &rule.table, sizeof(rule.table));
+    request.attribute(FRA_PRIORITY, &rule.priority, sizeof(rule.priority));
+    request.attribute(FRA_PROTOCOL, &rule.protocol, sizeof(rule.protocol));
+    const uint32_t mark = marked ? (rule.mark.value_or(0) == 1 ? 2 : 1) : rule.mark.value_or(0), mask = marked ? 1 : 0;
+    request.attribute(FRA_FWMARK, &mark, sizeof(mark));
+    request.attribute(FRA_FWMASK, &mask, sizeof(mask));
+    netlink_exchange(request.header);
+}
+void routing_table_policy() {
+    std::vector<PolicyRule> input;
+    auto row = test_rule("lo", false, 1001); row.mark.reset(); row.mask = 0x20000; input.push_back(row);
+    row.table = 1002; row.mark = 0; row.mask = 0xffff; input.push_back(row);
+    input.push_back(row); // stable first-occurrence deduplication
+    row.table = 1003; row.mark = 0x10003; input.push_back(row);
+    row.table = 1004; row.mark.reset(); row.mask.reset(); input.push_back(row); // oif-only rule
+    row.table = 1005; row.mask = 0xffff; row.input = "wlan0"; input.push_back(row);
+    row.table = 1006; row.input = "lo"; row.lookup = false; input.push_back(row);
+    check(local_app_tables(input) == std::vector<uint32_t>({1001, 1002}), "VPN before default, marked and oif-only rules excluded");
+    for (bool ipv6 : {false, true}) {
+        const auto native = policy_rules(ipv6);
+        Netbox netbox(executable);
+        std::vector<uint32_t> expected; std::set<uint32_t> seen;
+        for (const auto& item : netbox.rules(ipv6)) if (item["lookup"] == true && item["iif"] == "lo" &&
+            !item["fwmask"].isNull() && (item["fwmark"].isNull() || item["fwmark"].asUInt() == 0)) {
+            const auto table = item["table"].asUInt(); if (table && seen.insert(table).second) expected.push_back(table);
+        }
+        check(local_app_tables(native) == expected, "live default-app tables match independent netbox snapshot");
+    }
+}
+void real_policy_chains() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name);
+    size_t mutations = 0;
+    OwnedRules rules(test.directory.get(), getuid(), links, [&](const char*) { ++mutations; });
+    for (bool ipv6 : {false, true}) {
+        rules.reconcile("test", test.name, ipv6, {123456, 123457});
+        check(observed_rules(test, ipv6) == std::vector<std::pair<uint32_t, uint32_t>>({{9000, 123456}, {9001, 123457}}), "ordered dual-stack policy chain installed");
+        const auto before = mutations;
+        rules.reconcile("test", test.name, ipv6, {123456, 123457});
+        check(mutations == before, "unchanged chain does not mutate kernel or inventory");
+        OwnedRules reloaded(test.directory.get(), getuid(), links, [&](const char*) { ++mutations; });
+        reloaded.reconcile("test", test.name, ipv6, {123456, 123457});
+        check(mutations == before, "reloaded numeric identity compares by value without needless rewrites");
+        rules.reconcile("test", test.name, ipv6, {123458});
+        check(observed_rules(test, ipv6) == std::vector<std::pair<uint32_t, uint32_t>>({{9000, 123458}}), "upstream table change reconciles chain");
+        rules.reconcile("test", test.name, ipv6, {});
+        check(observed_rules(test, ipv6).empty(), "upstream loss removes only registered chain");
+    }
+    error(ErrorCode::invalid_argument, [&] { rules.reconcile("test", test.name, false, {1, 1}); });
+    error(ErrorCode::invalid_argument, [&] { rules.reconcile("test", test.name, false, {0}); });
+    error(ErrorCode::conflict, [&] { rules.reconcile("foreign", test.name, false, {1}); });
+    // Rules survive interface deletion in the detached state. They must be
+    // reclaimed even if the link journal has already been retired.
+    rules.reconcile("test", test.name, false, {123456});
+    rules.reconcile("test", test.name, true, {123456});
+    links.remove("test", test.name);
+    check(!observed_rules(test, false).empty() && !observed_rules(test, true).empty(), "kernel retains detached rules");
+    check(rules.recover_all().empty() && rules.inventory()["rules"].empty(), "detached rules reclaimed after missing original link");
+    test.finish();
+}
+void ownership_cookie_routing() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name); test.netbox.state(test.name, true);
+    OwnedRules rules(test.directory.get(), getuid(), links);
+    const uint32_t index = if_nametoindex(test.name.c_str()), table = 1700000000u + index;
+    for (const bool ipv6 : {false, true}) {
+        // Change forwarding only on our isolated bridge, never the phone's
+        // global forwarding settings or a physical uplink.
+        const auto sysctl = std::string("/proc/sys/net/") + (ipv6 ? "ipv6" : "ipv4") + "/conf/" + test.name + "/forwarding";
+        { std::ofstream setting(sysctl); setting << "1"; setting.flush(); check(setting.good(), "enable fixture bridge forwarding"); }
+        const auto family = ipv6 ? AF_INET6 : AF_INET;
+        std::array<unsigned char, 16> network{}, source{}, destination{};
+        check(inet_pton(family, ipv6 ? "fd91:fe21:ff00::" : "198.19.222.0", network.data()) == 1 &&
+            inet_pton(family, ipv6 ? "fd91:fe21:ff00::2" : "198.19.222.2", source.data()) == 1 &&
+            inet_pton(family, ipv6 ? "fd91:fe21:ff00::3" : "198.19.222.3", destination.data()) == 1, "parse route lookup fixture addresses");
+        const size_t bytes = ipv6 ? 16 : 4;
+        NetlinkMessage<rtmsg> route;
+        route.header.nlmsg_type = RTM_NEWROUTE; route.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+        route.payload.rtm_family = family; route.payload.rtm_dst_len = ipv6 ? 64 : 24;
+        route.payload.rtm_protocol = RTPROT_STATIC; route.payload.rtm_type = RTN_UNICAST; route.payload.rtm_scope = RT_SCOPE_LINK;
+        route.attribute(RTA_DST, network.data(), bytes); route.attribute(RTA_TABLE, &table, sizeof(table));
+        route.attribute(RTA_OIF, &index, sizeof(index)); netlink_exchange(route.header);
+        rules.reconcile("test", test.name, ipv6, {table});
+        const auto installed = installed_rule(test.name, ipv6);
+        check(installed.mark.value_or(0) && installed.mask.value_or(0) == 0, "ownership cookie has an explicit match-all mask");
+        for (const uint32_t mark : {0u, 1u, UINT32_MAX}) {
+            NetlinkMessage<rtmsg> query;
+            query.header.nlmsg_type = RTM_GETROUTE; query.header.nlmsg_flags = NLM_F_REQUEST;
+            query.payload.rtm_family = family; query.payload.rtm_dst_len = query.payload.rtm_src_len = ipv6 ? 128 : 32;
+            query.payload.rtm_flags = RTM_F_FIB_MATCH | RTM_F_LOOKUP_TABLE;
+            query.attribute(RTA_DST, destination.data(), bytes); query.attribute(RTA_SRC, source.data(), bytes);
+            query.attribute(RTA_IIF, &index, sizeof(index)); query.attribute(RTA_MARK, &mark, sizeof(mark));
+            const auto responses = netlink_exchange(query.header, RTM_NEWROUTE);
+            check(responses.size() == 1, "kernel returns one FIB result");
+            const auto* header = reinterpret_cast<const nlmsghdr*>(responses[0].data());
+            check(header->nlmsg_len >= NLMSG_LENGTH(sizeof(rtmsg)), "kernel FIB result has route header");
+            const auto* result = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
+            uint32_t selected = result->rtm_table, output = 0;
+            auto length = RTM_PAYLOAD(header);
+            for (const auto* a = RTM_RTA(result); RTA_OK(a, length); a = RTA_NEXT(a, length)) {
+                if (a->rta_type == RTA_TABLE && RTA_PAYLOAD(a) == sizeof(selected)) memcpy(&selected, RTA_DATA(a), sizeof(selected));
+                if (a->rta_type == RTA_OIF && RTA_PAYLOAD(a) == sizeof(output)) memcpy(&output, RTA_DATA(a), sizeof(output));
+            }
+            if (selected != table || output != index) throw std::runtime_error("cookie FIB lookup family=" + std::to_string(family) +
+                " mark=" + std::to_string(mark) + " table=" + std::to_string(selected) + "/" + std::to_string(table) +
+                " oif=" + std::to_string(output) + "/" + std::to_string(index));
+        }
+        check(rules.cleanup("test").empty(), "cookie rule cleanup after real FIB queries");
+    }
+    // The private-table routes are kernel dependents of this owned bridge.
+    // No broad table flush is needed or allowed.
+    test.finish();
+}
+void policy_conflicts_and_races() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name);
+    OwnedRules rules(test.directory.get(), getuid(), links);
+    test.netbox.rule(test.name, 123456, 9000, false, true);
+    error(ErrorCode::conflict, [&] { rules.reconcile("test", test.name, false, {123456}); });
+    check(rules.inventory()["rules"].empty() && observed_rules(test, false).size() == 1, "preexisting unmarked rule is never adopted");
+    test.netbox.rule(test.name, 123456, 9000, false, false);
+    rules.reconcile("test", test.name, false, {123456});
+    auto owned = installed_rule(test.name, false);
+    change_policy_rule(owned, false);
+    auto foreign = owned; foreign.protocol = 187;
+    change_policy_rule(foreign, true);
+    check(rules.cleanup("test").size() == 1 && rules.inventory()["rules"].size() == 1, "replacement refuses cleanup and retains evidence");
+    links.bridge("independent", test.name + "i");
+    rules.reconcile("independent", test.name + "i", false, {123457});
+    check(rules.recover_all().size() == 1 && rules.inventory()["rules"].size() == 1, "recovery attempts independent chain after a conflict");
+    links.remove("independent", test.name + "i");
+    change_policy_rule(foreign, false);
+    check(rules.cleanup("test").empty(), "absent rule permits retry");
+    rules.reconcile("test", test.name, false, {123456});
+    change_policy_rule(owned, false); variant_rule(owned, true, true);
+    check(rules.cleanup("test").size() == 1 && observed_rules(test, false).size() == 1, "same-protocol rule with fwmark selector is not the registered rule");
+    variant_rule(owned, true, false); check(rules.cleanup("test").empty(), "marked replacement fixture retired explicitly");
+    rules.reconcile("test", test.name, false, {123456});
+    variant_rule(owned, false, true);
+    check(rules.cleanup("test").size() == 1 && observed_rules(test, false).size() == 2, "ambiguous identical duplicates are preserved");
+    change_policy_rule(owned, false);
+    check(rules.cleanup("test").empty(), "duplicate removal permits original registered rule recovery");
+    // Unknown rows with our protocol are still not ours without a journal.
+    foreign = owned; foreign.priority = 9050;
+    change_policy_rule(foreign, true);
+    rules.reconcile("test", test.name, false, {123456});
+    check(rules.cleanup("test").empty() && observed_rules(test, false).size() == 1, "unregistered same-protocol rule survives cleanup");
+    change_policy_rule(foreign, false);
+    bool replace = false, marked_replacement = false;
+    OwnedRules race(test.directory.get(), getuid(), links, [&](const char* stage) {
+        if (replace && std::string_view(stage) == "before_rule_delete") {
+            replace = false; change_policy_rule(owned, false);
+            if (marked_replacement) variant_rule(owned, true, true);
+            else { auto replacement = owned; replacement.protocol = 187; change_policy_rule(replacement, true); }
+        }
+    });
+    race.reconcile("test", test.name, false, {123456});
+    replace = true;
+    check(race.cleanup("test").empty() && observed_rules(test, false).size() == 1, "kernel deletion protocol prevents replacement race deletion");
+    foreign = owned; foreign.protocol = 187; change_policy_rule(foreign, false);
+    race.reconcile("test", test.name, false, {123456});
+    replace = marked_replacement = true;
+    check(race.cleanup("test").empty() && observed_rules(test, false).size() == 1, "explicit delete selectors preserve same-protocol marked replacement race");
+    variant_rule(owned, true, false);
+    // A new same-name link must not authorize deletion of the previous link's
+    // rules, whether this kernel reattaches them or leaves them detached.
+    race.reconcile("test", test.name, false, {123456});
+    links.remove("test", test.name); links.bridge("test", test.name);
+    check(race.cleanup("test").size() == 1, "same-name recreated link is not original rule owner");
+    change_policy_rule(owned, false);
+    check(race.cleanup("test").empty(), "explicit fixture removal permits journal retirement");
+    test.finish();
+}
+void policy_journal_failures() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox); links.bridge("test", test.name);
+    bool fail = true;
+    OwnedRules rules(test.directory.get(), getuid(), links, {}, [&](const char* stage) {
+        if (fail && std::string_view(stage) == "before_install") throw std::runtime_error("policy write injection");
+    });
+    bool threw = false;
+    try { rules.reconcile("test", test.name, false, {123456}); } catch (const config::CommitError&) { threw = true; }
+    check(threw && observed_rules(test, false).empty(), "intent write failure has no kernel side effect");
+    fail = false; rules.reconcile("test", test.name, false, {123456});
+    const auto latest = rules.inventory();
+    auto different = latest; different["rules"][0]["link"]["namespace_inode"] = Json::UInt64(1);
+    config::JsonFile(test.directory.get(), "network-rules.json", getuid()).save(different);
+    OwnedRules wrong_namespace(test.directory.get(), getuid(), links);
+    check(wrong_namespace.recover_all().size() == 1 && observed_rules(test, false).size() == 1, "foreign namespace inventory never mutates current rules");
+    config::JsonFile(test.directory.get(), "network-rules.json", getuid()).save(latest);
+    { std::ofstream backup(test.path + "/network-rules.json.bak", std::ios::trunc); backup << R"({"schema":1,"rules":[]})"; }
+    { std::ofstream primary(test.path + "/network-rules.json", std::ios::trunc); primary << "{broken"; }
+    error(ErrorCode::io_error, [&] { OwnedRules rejected(test.directory.get(), getuid(), links); });
+    check(observed_rules(test, false).size() == 1, "damaged primary never forgets live rules via stale backup");
+    config::JsonFile(test.directory.get(), "network-rules.json", getuid()).save(latest);
+    fail = true;
+    check(rules.cleanup("test").size() == 1 && rules.inventory()["rules"].size() == 1 && observed_rules(test, false).empty(), "deletion journal failure retains retry evidence");
+    fail = false; check(rules.recover_all().empty(), "deletion retry retires already absent rule");
+    test.finish();
+}
+void policy_crash_recovery() {
+    for (const bool ipv6 : {false, true}) for (const char* stage : {"rule_intent_saved", "rule_created", "rule_identity_saved",
+            "before_rule_delete", "rule_deleted", "rule_record_removed"}) {
+        Case test;
+        ChildOptions child;
+        child.argv = {"/proc/self/exe", "--rules-crash", executable, test.path, test.name, stage, ipv6 ? "6" : "4"};
+        check(Child(child).communicate({}, 10s).exit_code == -SIGKILL, "policy rule child reached real SIGKILL boundary");
+        OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+        OwnedRules recovered(test.directory.get(), getuid(), links);
+        check(recovered.recover_all().empty() && recovered.inventory()["rules"].empty() && observed_rules(test, ipv6).empty(), "restart reclaims pending, installed or deleted rule");
+        test.finish();
+    }
+}
 void daemon_linux_topology_recovery() {
     for (const bool obstruct : {false, true}) {
         Case test;
@@ -507,10 +751,26 @@ void daemon_linux_topology_recovery() {
         ChildOptions fixture;
         fixture.argv = {"/proc/self/exe", "--topology-crash", executable, test.path + "/run", test.name, "topology_ready"};
         check(Child(fixture).communicate({}, 20s).exit_code == -SIGKILL, "leave topology from killed owner for actual daemon recovery");
+        {
+            Fd run(open((test.path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            OwnedLinks links(run.get(), getuid(), test.netbox);
+            OwnedRules rules(run.get(), getuid(), links);
+            const auto id = links.inventory()["links"][0]["owner"].asString();
+            rules.reconcile(id, test.name, false, {123456});
+            rules.reconcile(id, test.name, true, {123456});
+        }
         const auto foreign = test.name + "t";
         ChildOptions launch;
         launch.argv = {daemon_executable, "--data-dir", test.path, "--apk", test.path + "/fixture.apk"};
         if (obstruct) {
+            const auto owned = installed_rule(test.name, false);
+            auto replacement = owned; replacement.protocol = 187;
+            change_policy_rule(owned, false); change_policy_rule(replacement, true);
+            const auto rules_rejected = Child(launch).communicate({}, 15s);
+            check(rules_rejected.exit_code == 1 && rules_rejected.error.find("Network rule recovery incomplete") != std::string::npos &&
+                access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0 && exists(test.name),
+                "daemon refuses readiness and preserves topology after policy identity conflict");
+            change_policy_rule(replacement, false); change_policy_rule(owned, true);
             test.netbox.add_tap(foreign); test.netbox.master(foreign, test.name);
             const auto rejected = Child(launch).communicate({}, 15s);
             check(rejected.exit_code == 1 && rejected.error.find("Network link recovery incomplete") != std::string::npos &&
@@ -530,8 +790,11 @@ void daemon_linux_topology_recovery() {
         Fd run(open((test.path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         check(!exists(test.name) && config::JsonFile(run.get(), "network-links.json", getuid()).load()->value["links"].empty(),
             "actual daemon reclaims topology before publishing readiness");
+        check(config::JsonFile(run.get(), "network-rules.json", getuid()).load()->value["rules"].empty() &&
+            observed_rules(test, false).empty() && observed_rules(test, true).empty(), "actual daemon reclaims both policy families before links and readiness");
         check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon stops normally");
-        for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
+        for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/network-rules.json", "run/network-rules.json.bak",
+                                "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
             unlink((test.path + "/" + name).c_str());
         for (const char* name : {"run", "bin", "cache", "files"}) check(rmdir((test.path + "/" + name).c_str()) == 0, "remove isolated daemon topology directory");
         test.finish();
@@ -585,6 +848,23 @@ int fake(int argc, char** argv) {
 }
 int main(int argc, char** argv) {
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
+    if (argc == 5 && std::string_view(argv[1]) == "--policy-only") {
+        executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
+        return run({{"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
+            {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
+            {"policy_conflicts_replacement_and_races", policy_conflicts_and_races}, {"policy_journal_failures", policy_journal_failures},
+            {"twelve_policy_sigkill_boundaries", policy_crash_recovery}});
+    }
+    if (argc == 7 && std::string_view(argv[1]) == "--rules-crash") {
+        Netbox netbox(argv[2]);
+        Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        OwnedLinks links(directory.get(), getuid(), netbox); links.bridge("test", argv[4]);
+        OwnedRules rules(directory.get(), getuid(), links, [&](const char* stage) {
+            if (std::string_view(stage) == argv[5]) { kill(getpid(), SIGKILL); _exit(73); }
+        });
+        rules.reconcile("test", argv[4], std::string_view(argv[6]) == "6", {123456});
+        rules.cleanup("test"); return 74;
+    }
     if (argc == 6 && std::string_view(argv[1]) == "--topology-crash") {
         Netbox netbox(argv[2]);
         Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -608,6 +888,9 @@ int main(int argc, char** argv) {
         Netbox netbox(argv[2]);
         Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         OwnedLinks links(directory.get(), getuid(), netbox);
+        OwnedRules rules(directory.get(), getuid(), links);
+        const auto rule_errors = rules.recover_all();
+        if (!rule_errors.empty()) { std::cout << wire::stringify(rule_errors) << std::endl; return 1; }
         const auto errors = links.cleanup("test");
         std::cout << wire::stringify(errors) << std::endl;
         return errors.empty() ? 0 : 1;
@@ -632,6 +915,10 @@ int main(int argc, char** argv) {
     executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
     return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
         {"host_address_filtering", host_address_filtering}, {"uplink_snapshot_policy", uplink_snapshot_policy}, {"real_host_discovery", real_host_discovery},
+        {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
+        {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
+        {"policy_conflicts_replacement_and_races", policy_conflicts_and_races}, {"policy_journal_failures", policy_journal_failures},
+        {"twelve_policy_sigkill_boundaries", policy_crash_recovery},
         {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
         {"setup_failure_and_journal_retry", failures_and_journal}, {"twenty_five_sigkill_boundaries", crash_recovery},
         {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor},
