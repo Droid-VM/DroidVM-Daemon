@@ -31,7 +31,8 @@ EventJournal::EventJournal(EventLimits limits, Now now, uint64_t initial_sequenc
         limits.event_bytes < limits.max_event_bytes + 512 || limits.event_age <= Clock::duration::zero() ||
         !limits.subscriptions || limits.subscription_age <= Clock::duration::zero() ||
         !limits.snapshots || limits.max_snapshot_bytes < limits.max_event_bytes + 512 ||
-        limits.snapshot_bytes < limits.max_snapshot_bytes || limits.snapshot_age <= Clock::duration::zero() || !now_)
+        limits.snapshot_bytes < limits.max_snapshot_bytes || limits.snapshot_age <= Clock::duration::zero() ||
+        !limits.max_snapshot_item_bytes || limits.max_snapshot_item_bytes > (1u << 20) - 64 || !now_)
         throw ServiceError(ErrorCode::invalid_argument, "Invalid event limits");
 }
 void EventJournal::available() const {
@@ -67,7 +68,7 @@ void EventJournal::prune() {
         } else ++it;
     }
 }
-void EventJournal::publish(std::string_view kind, std::string_view resource, std::string_view owner, const Json::Value& data) noexcept {
+void EventJournal::publish(std::string_view kind, std::string_view resource, std::string_view owner, const Json::Value& data, bool administrator_only) noexcept {
     if (!advance()) return;
     try {
         if (kind.empty() || kind.size() > 64 || resource.size() > 256 || owner.empty() || owner.size() > 128)
@@ -81,7 +82,7 @@ void EventJournal::publish(std::string_view kind, std::string_view resource, std
         auto encoded = wire::stringify_bounded(value, limits_.max_event_bytes);
         // Compact reserved serialization storage; account actual retained capacity.
         std::string compact(encoded.data(), encoded.size());
-        EventItem item{sequence_, std::string(owner), std::move(compact)};
+        EventItem item{sequence_, std::string(owner), std::move(compact), administrator_only};
         const auto bytes = item.encoded.capacity() + item.owner.capacity() + 256;
         events_.push_back({std::move(item), now_(), bytes});
         event_bytes_ += bytes;
@@ -125,7 +126,7 @@ EventBatch EventJournal::poll(const EventScope& scope, const std::string& id, si
     for (const auto& cached : events_) {
         const auto& item = cached.item;
         if (item.sequence <= subscription.sequence) continue;
-        if (scope.administrator || item.owner == scope.principal) {
+        if (scope.administrator || (!item.administrator_only && item.owner == scope.principal)) {
             const auto size = item.encoded.size() + 64;
             if (batch.events.size() == max_events || size > max_bytes - bytes) break;
             batch.events.push_back(item);
@@ -155,7 +156,7 @@ std::string EventJournal::snapshot(const EventScope& scope, std::vector<std::str
         throw ServiceError(ErrorCode::resource_exhausted, "Snapshot container exceeds reserved capacity");
     bytes += items.capacity() * sizeof(std::string);
     for (const auto& item : items) {
-        if (item.size() > limits_.max_event_bytes || item.capacity() + 32 > limits_.max_snapshot_bytes - bytes)
+        if (item.size() > limits_.max_snapshot_item_bytes || item.capacity() + 32 > limits_.max_snapshot_bytes - bytes)
             throw ServiceError(ErrorCode::resource_exhausted, "Snapshot exceeds reserved capacity");
         bytes += item.capacity() + 32;
     }
@@ -181,7 +182,10 @@ SnapshotPage EventJournal::page(const EventScope& scope, const std::string& id, 
     size_t bytes = 0;
     for (; offset < snapshot.items.size(); ++offset) {
         const auto& item = snapshot.items[offset];
-        if (item.size() + 64 > max_bytes - bytes) break;
+        if (item.size() + 64 > max_bytes - bytes) {
+            if (page.items.empty()) throw ServiceError(ErrorCode::resource_exhausted, "Snapshot row exceeds page budget; increase max_bytes");
+            break;
+        }
         page.items.push_back(item);
         bytes += item.size() + 64;
     }

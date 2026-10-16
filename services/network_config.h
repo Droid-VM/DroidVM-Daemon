@@ -8,6 +8,7 @@
 #include <set>
 
 namespace droidvm {
+class TaskService;
 // Hold from startup preparation through successful backend cleanup. Releasing
 // this guard only permits edits; it does not stop processes or remove resources.
 class NetworkRuntimeLease {
@@ -29,7 +30,8 @@ private:
 // network side effects. Runtime activation/deletion will compose this service.
 class NetworkConfigService {
 public:
-    explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {});
+    explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, TaskService* events = nullptr);
+    bool has_events() const { return events_ != nullptr; }
     Json::Value list(const CallContext& caller) const;
     Json::Value get(const CallContext& caller, const std::string& id) const;
     bool exists(const CallContext& caller, const std::string& id) const;
@@ -50,8 +52,10 @@ private:
         size_t inactive = 0;
         bool recovered = false;
         bool durability_uncertain = false;
+        Json::Value active{Json::arrayValue};
     };
     config::JsonFile file_;
+    TaskService* events_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     std::shared_ptr<const State> state_;
@@ -60,6 +64,7 @@ private:
     static std::shared_ptr<State> decode(Json::Value document, bool recovered);
     std::string change(const CallContext& caller, Json::Value value, bool update);
     void install(std::shared_ptr<State> next);
+    void publish(std::shared_ptr<State> next);
     void require_stopped(const std::string& id) const;
 };
 }

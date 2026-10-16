@@ -17,6 +17,7 @@ struct ClientSession {
     Caller caller;
     std::string subscription;
     uint64_t cursor = 0;
+    bool resource_events = false;
 };
 // Existing system/legacy shapes stay in their adapter; new task commands expose
 // structured errors and decimal cursors without changing old command results.

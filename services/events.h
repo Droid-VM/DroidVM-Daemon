@@ -27,12 +27,15 @@ struct EventLimits {
     std::chrono::milliseconds subscription_age = std::chrono::minutes(5);
     size_t snapshots = 8, snapshot_bytes = 32u << 20, max_snapshot_bytes = 16u << 20;
     std::chrono::milliseconds snapshot_age = std::chrono::seconds(30);
+    // Configuration rows can exceed an event; still fit one maximum-size page.
+    size_t max_snapshot_item_bytes = (1u << 20) - 64;
 };
 struct EventItem {
     uint64_t sequence;
     std::string owner;
     // Encoded once with decimal-string seq. Only explicit subscribers receive it.
     std::string encoded;
+    bool administrator_only = false;
 };
 struct EventBatch {
     EventCursor covered;
@@ -62,7 +65,7 @@ public:
     const EventLimits& limits() const { return limits_; }
     // Publication cannot undo a committed domain operation. Allocation/encoding
     // failure creates a replay gap instead of silently losing a state change.
-    void publish(std::string_view kind, std::string_view resource, std::string_view owner, const Json::Value& data) noexcept;
+    void publish(std::string_view kind, std::string_view resource, std::string_view owner, const Json::Value& data, bool administrator_only = false) noexcept;
     void missed() noexcept;
     std::string subscribe(const EventScope& scope, const EventCursor& cursor);
     EventBatch poll(const EventScope& scope, const std::string& subscription, size_t max_events = 64, size_t max_bytes = 256u << 10);

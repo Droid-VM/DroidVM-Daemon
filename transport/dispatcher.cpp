@@ -14,7 +14,9 @@
 namespace droidvm {
 namespace {
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
-                              "task_snapshot_release", "task_subscribe", "task_unsubscribe"};
+                              "task_snapshot_release", "task_subscribe", "task_unsubscribe",
+                              "network_config_snapshot", "resource_snapshot_page", "resource_snapshot_release",
+                              "resource_subscribe", "resource_unsubscribe"};
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
 bool host_command(const std::string& command) {
@@ -536,6 +538,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["package_tasks"] = true;
                 result["service_api_minor"] = 11;
             }
+            if (networks_ && networks_->has_events()) {
+                result["network_config_events"] = "invalidation-v1";
+                result["service_api_minor"] = 12;
+            }
         }
         return result;
     }
@@ -551,20 +557,23 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (task.state == TaskState::succeeded) result["task"]["result"] = task.result;
         } else if (command == "task_snapshot") {
             return snapshot_json(tasks_.snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
-        } else if (command == "task_snapshot_page") {
+        } else if (command == "network_config_snapshot") {
+            return snapshot_json(tasks_.network_config_snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
+        } else if (command == "task_snapshot_page" || command == "resource_snapshot_page") {
             return snapshot_json(tasks_.snapshot_page(caller, string_field(request, "snapshot_id"),
                 size_field(request, "offset", 0), size_field(request, "max_bytes", 256u << 10)));
-        } else if (command == "task_snapshot_release") {
+        } else if (command == "task_snapshot_release" || command == "resource_snapshot_release") {
             tasks_.release_snapshot(caller, string_field(request, "snapshot_id"));
-        } else if (command == "task_subscribe") {
+        } else if (command == "task_subscribe" || command == "resource_subscribe") {
             if (!session.subscription.empty()) throw ServiceError(ErrorCode::invalid_argument, "Unsubscribe before changing streams");
             auto cursor = EventCursor::parse(string_field(request, "epoch"), string_field(request, "cursor"));
             auto id = tasks_.subscribe(caller, cursor);
             session.subscription = std::move(id);
             session.cursor = cursor.sequence;
+            session.resource_events = command == "resource_subscribe";
             result["epoch"] = cursor.epoch;
             result["cursor"] = std::to_string(cursor.sequence);
-        } else if (command == "task_unsubscribe") disconnected(session);
+        } else if (command == "task_unsubscribe" || command == "resource_unsubscribe") disconnected(session);
         return result;
     } catch (const ServiceError& error) { return failure(error); }
 }
@@ -575,18 +584,22 @@ std::optional<Json::Value> RequestDispatcher::events(ClientSession& session) {
         if (batch.covered.sequence == session.cursor) return {};
         Json::Value result;
         result["type"] = "event";
-        result["event"] = "task_events";
+        result["event"] = session.resource_events ? "resource_events" : "task_events";
         result["epoch"] = batch.covered.epoch;
         result["cursor"] = std::to_string(batch.covered.sequence);
         auto& items = result["events"] = Json::Value(Json::arrayValue);
-        for (const auto& item : batch.events) items.append(wire::parse(item.encoded));
+        for (const auto& item : batch.events) {
+            auto event = wire::parse(item.encoded);
+            if (session.resource_events || event["kind"].asString().starts_with("task.")) items.append(std::move(event));
+        }
         session.cursor = batch.covered.sequence;
         return result;
     } catch (const ServiceError& error) {
+        const bool resources = session.resource_events;
         disconnected(session);
         auto result = failure(error);
         result["type"] = "event";
-        result["event"] = "task_stream_error";
+        result["event"] = resources ? "resource_stream_error" : "task_stream_error";
         return result;
     }
 }

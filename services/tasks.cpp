@@ -76,6 +76,7 @@ struct Shared {
     TaskLimits limits;
     TaskService::Now now;
     std::unordered_map<std::string, std::shared_ptr<Record>> records;
+    std::shared_ptr<const Json::Value> network_config;
     std::deque<Job> queue;
     std::deque<Job> background_queue;
     size_t reserved = 0;
@@ -351,6 +352,38 @@ TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
     lock.unlock();
     if (notify_discarded) { try { notify_discarded(ref); } catch (...) {} }
     return result;
+}
+void TaskService::publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept {
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.network_config = std::move(rows);
+    // Invalidation rather than inline configuration: large configs must never
+    // overflow the bounded event history. Subscribers fetch a fresh fixed view.
+    shared.events.publish("network.config.invalidated", "networks", "system", Json::Value(), true);
+}
+SnapshotPage TaskService::network_config_snapshot(const CallContext& caller, size_t max_bytes) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    if (!shared.network_config) throw ServiceError(ErrorCode::unavailable, "Network configuration view unavailable");
+    std::vector<std::string> items;
+    size_t bytes = 256 + caller.principal.size();
+    for (const auto& row : *shared.network_config) {
+        std::string item;
+        try { item = wire::stringify_bounded(row, shared.events.limits().max_snapshot_item_bytes); }
+        catch (const std::length_error&) { throw ServiceError(ErrorCode::resource_exhausted, "Network configuration exceeds snapshot row limit"); }
+        item = std::string(item.data(), item.size());
+        if (bytes > shared.events.limits().max_snapshot_bytes ||
+            item.capacity() + 64 > shared.events.limits().max_snapshot_bytes - bytes)
+            throw ServiceError(ErrorCode::resource_exhausted, "Network snapshot capacity exhausted");
+        bytes += item.capacity() + 64;
+        items.push_back(std::move(item));
+    }
+    const EventScope scope{caller.principal, caller.administrator};
+    auto id = shared.events.snapshot(scope, std::move(items));
+    try { return shared.events.page(scope, id, 0, max_bytes); }
+    catch (...) { shared.events.release_snapshot(scope, id); throw; }
 }
 SnapshotPage TaskService::snapshot(const CallContext& caller, size_t max_bytes) {
     require_access(caller);

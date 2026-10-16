@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
                 }
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
-                networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
+                networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer, &tasks);
                 host_network = std::make_unique<droidvm::NetworkHostService>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
                 const auto binaries = std::filesystem::absolute(data_directory) / "bin";

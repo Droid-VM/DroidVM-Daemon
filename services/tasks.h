@@ -97,6 +97,11 @@ public:
     TaskView get(const CallContext& caller, const TaskRef& ref);
     TaskView cancel(const CallContext& caller, const TaskRef& ref);
     SnapshotPage snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
+    // Trusted domain publication only: immutable active configuration rows,
+    // bounded by NetworkConfigService's storage quota. No callbacks/domain locks
+    // are acquired under the journal lock. Caller serializes domain commits.
+    void publish_network_config(std::shared_ptr<const Json::Value> rows) noexcept;
+    SnapshotPage network_config_snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
     SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
     void release_snapshot(const CallContext& caller, const std::string& id);
     std::string subscribe(const CallContext& caller, const EventCursor& cursor);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "network_config.h"
+#include "tasks.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include <regex>
@@ -98,13 +99,14 @@ std::shared_ptr<NetworkConfigService::State> NetworkConfigService::decode(Json::
         if (!result->ids.emplace(id, i).second || !names.insert(name.asString()).second)
             throw ServiceError(ErrorCode::conflict, "Duplicate stored network ID or name");
         row = std::move(*migrated);
+        result->active.append(row);
     }
     result->document = std::move(document);
     result->recovered = recovered;
     return result;
 }
-NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer)
-    : file_(directory, "networks.json", owner, std::move(observer)), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
+NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, TaskService* events)
+    : file_(directory, "networks.json", owner, std::move(observer)), events_(events), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
     auto loaded = file_.load();
     Json::Value empty;
     empty["networks"] = Json::Value(Json::arrayValue);
@@ -112,7 +114,7 @@ NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::J
     // A previous process could have died after rename and before directory
     // fsync. Verify durability on first runtime preparation after reopening.
     initial->durability_uncertain = loaded.has_value();
-    state_ = std::move(initial);
+    publish(std::move(initial));
 }
 std::shared_ptr<const NetworkConfigService::State> NetworkConfigService::state() const {
     std::lock_guard guard(state_mutex_);
@@ -273,12 +275,18 @@ void NetworkConfigService::install(std::shared_ptr<State> next) {
     catch (const config::CommitError& error) {
         if (error.installed) {
             next->durability_uncertain = true;
-            std::lock_guard guard(state_mutex_);
-            state_ = next;
+            publish(next);
         }
         throw ServiceError(error.installed ? ErrorCode::commit_uncertain : ErrorCode::io_error,
             error.installed ? "Configuration installed; durability could not be confirmed" : "Configuration could not be saved");
     } catch (const std::exception&) { throw ServiceError(ErrorCode::io_error, "Configuration could not be saved"); }
-    { std::lock_guard guard(state_mutex_); state_ = std::move(next); }
+    publish(std::move(next));
+}
+void NetworkConfigService::publish(std::shared_ptr<State> next) {
+    // Writer -> state -> journal. Journal reads only the immutable projection;
+    // it never calls back into this service. Pre-rename failures publish nothing.
+    std::lock_guard guard(state_mutex_);
+    state_ = std::move(next);
+    if (events_) events_->publish_network_config(std::shared_ptr<const Json::Value>(state_, &state_->active));
 }
 }

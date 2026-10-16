@@ -140,6 +140,118 @@ void commit_visibility_and_failure() {
     NetworkConfigService restart(temp.directory.get(), getuid());
     check(restart.get(admin, id)["name"] == "installed", "restart agrees after uncertain durability");
 }
+void configuration_event_handoff() {
+    Temporary temp;
+    TaskService tasks;
+    std::string fail_stage;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fail_stage == stage) throw std::runtime_error("injected failure");
+    }, &tasks);
+    auto before = tasks.network_config_snapshot(admin);
+    check(before.total == 0 && before.cursor.epoch == tasks.epoch(), "network shares task epoch");
+    auto value = network("event handoff");
+    auto id = service.create(admin, value);
+    auto subscription = tasks.subscribe(admin, before.cursor);
+    auto changed = tasks.poll(admin, subscription);
+    check(changed.events.size() == 1 && wire::parse(changed.events[0].encoded)["kind"] == "network.config.invalidated",
+        "commit between snapshot and subscribe is replayed");
+    auto current = tasks.network_config_snapshot(admin);
+    check(current.total == 1 && wire::parse(current.items[0]) == service.get(admin, id), "snapshot agrees with committed configuration");
+    check(tasks.snapshot_page(admin, before.id, 0).total == 0, "old empty view remains fixed");
+    tasks.release_snapshot(admin, before.id);
+    value["name"] = "not installed"; fail_stage = "before_write";
+    error(ErrorCode::io_error, [&] { service.update(admin, value); });
+    check(tasks.poll(admin, subscription).events.empty(), "failed save emits no event");
+    value["name"] = "installed uncertain"; fail_stage = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.update(admin, value); });
+    check(tasks.poll(admin, subscription).events.size() == 1, "installed uncertain commit emits invalidation");
+    auto uncertain = tasks.network_config_snapshot(admin);
+    check(wire::parse(uncertain.items[0])["name"] == "installed uncertain", "uncertain commit updates snapshot");
+    check(wire::parse(tasks.snapshot_page(admin, current.id, 0).items[0])["name"] == "event handoff", "old view survives update");
+    tasks.release_snapshot(admin, uncertain.id);
+    fail_stage.clear();
+    auto lease = service.prepare_runtime(admin, id);
+    check(tasks.poll(admin, subscription).events.size() == 1, "runtime identity persistence invalidates configuration");
+    lease.reset();
+    service.remove(admin, id);
+    check(tasks.poll(admin, subscription).events.size() == 1, "delete invalidates configuration");
+    auto empty = tasks.network_config_snapshot(admin);
+    check(empty.total == 0, "delete removed projected row");
+    tasks.release_snapshot(admin, empty.id);
+    error(ErrorCode::permission_denied, [&] { tasks.network_config_snapshot(owner); });
+    error(ErrorCode::unauthenticated, [&] { tasks.network_config_snapshot({}); });
+    error(ErrorCode::permission_denied, [&] { tasks.snapshot_page(owner, current.id, 0); });
+    CallContext system{"system", true, true, false};
+    auto hidden = tasks.subscribe(system, current.cursor);
+    check(tasks.poll(system, hidden).events.empty(), "admin events hidden even from matching principal name");
+    tasks.unsubscribe(system, hidden);
+    TaskService restart;
+    NetworkConfigService reopened(temp.directory.get(), getuid(), {}, &restart);
+    error(ErrorCode::resync_required, [&] { restart.subscribe(admin, current.cursor); });
+    tasks.release_snapshot(admin, current.id);
+    tasks.unsubscribe(admin, subscription);
+}
+void configuration_snapshot_races_and_limits() {
+    Temporary temp;
+    TaskService tasks;
+    Gate saving, proceed;
+    bool block = false;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (block && std::string_view(stage) == "before_install") { saving.release(); proceed.wait(); }
+    }, &tasks);
+    auto value = network("before");
+    const auto id = service.create(admin, value);
+    block = true;
+    value["name"] = "after";
+    auto writer = std::async(std::launch::async, [&] { service.update(admin, value); });
+    saving.wait();
+    auto reading = std::async(std::launch::async, [&] { return tasks.network_config_snapshot(admin); });
+    const auto ready = reading.wait_for(500ms) == std::future_status::ready;
+    proceed.release(); writer.get(); block = false;
+    auto snapshot = reading.get();
+    check(ready && wire::parse(snapshot.items[0])["name"] == "before", "disk write never holds journal lock");
+    auto subscription = tasks.subscribe(admin, snapshot.cursor);
+    check(tasks.poll(admin, subscription).events.size() == 1, "blocked disk commit replayed after earlier snapshot");
+    tasks.unsubscribe(admin, subscription);
+    tasks.release_snapshot(admin, snapshot.id);
+    for (int i = 0; i < 32; ++i) {
+        value["name"] = "race " + std::to_string(i);
+        auto write = std::async(std::launch::async, [&] { service.update(admin, value); });
+        auto view = tasks.network_config_snapshot(admin);
+        auto sub = tasks.subscribe(admin, view.cursor);
+        write.get();
+        auto tail = tasks.poll(admin, sub);
+        check(wire::parse(view.items[0]) == service.get(admin, id) || !tail.events.empty(), "racing commit appears in snapshot or invalidation");
+        tasks.unsubscribe(admin, sub);
+        tasks.release_snapshot(admin, view.id);
+    }
+    value["extension"] = std::string(20000, 'x');
+    service.update(admin, value);
+    // A too-small first page must fail and release the cache slot, never loop
+    // forever with next_offset equal to the requested offset.
+    for (int i = 0; i < 10; ++i)
+        error(ErrorCode::resource_exhausted, [&] { tasks.network_config_snapshot(admin, (16u << 10) + 64); });
+    auto large = tasks.network_config_snapshot(admin);
+    check(wire::parse(large.items[0]) == service.get(admin, id), "configuration larger than event limit remains readable");
+    tasks.release_snapshot(admin, large.id);
+    auto second = network("second page"), third = network("third page");
+    second["extension"] = third["extension"] = std::string(20000, 'y');
+    service.create(admin, second); service.create(admin, third);
+    auto pages = tasks.network_config_snapshot(admin, 24000);
+    check(pages.total == 3 && pages.items.size() == 1 && pages.next == 1, "configuration snapshot paginates");
+    service.remove(admin, second["id"].asString());
+    auto page2 = tasks.snapshot_page(admin, pages.id, 1, 24000);
+    auto page3 = tasks.snapshot_page(admin, pages.id, 2, 24000);
+    check(page2.cursor.sequence == pages.cursor.sequence && page3.cursor.sequence == pages.cursor.sequence &&
+        wire::parse(page2.items[0])["id"] == second["id"] && wire::parse(page3.items[0])["id"] == third["id"] &&
+        page2.next == 2 && !page3.next, "all pages retain deleted rows and original cursor");
+    tasks.release_snapshot(admin, pages.id);
+    std::vector<std::string> held;
+    for (int i = 0; i < 8; ++i) held.push_back(i % 2 ? tasks.snapshot(admin).id : tasks.network_config_snapshot(admin).id);
+    error(ErrorCode::resource_exhausted, [&] { tasks.snapshot(admin); });
+    error(ErrorCode::resource_exhausted, [&] { tasks.network_config_snapshot(admin); });
+    for (const auto& cache : held) tasks.release_snapshot(admin, cache);
+}
 void shared_worker_queue() {
     TaskLimits limits; limits.workers = 1; limits.queued = 1;
     TaskService tasks(limits);
@@ -361,6 +473,8 @@ int main(int argc, char** argv) {
     }
     return run({{"migration_opaque_identity_permissions", migration_retention_identity}, {"nested_extensions_vlan_identity_null", extension_merge_and_null},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
+        {"network_snapshot_replay_failure_permissions", configuration_event_handoff},
+        {"network_snapshot_races_shared_limits", configuration_snapshot_races_and_limits},
         {"shared_bounded_worker_shutdown", shared_worker_queue}, {"runtime_identity_and_edit_guard", runtime_identity_and_edit_guard},
         {"runtime_tables_concurrent_and_opaque", runtime_tables_concurrent_and_opaque},
         {"runtime_durable_failures_and_racing_edit", runtime_durable_failures_and_racing_edit},
