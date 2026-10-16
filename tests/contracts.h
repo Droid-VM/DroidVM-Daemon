@@ -41,13 +41,17 @@ inline TaskView finished(TaskService& service, const TaskRef& ref, const CallCon
 }
 inline TaskSpec spec(size_t result_bytes = 256) { return {"contract", "vm:one", result_bytes, true}; }
 inline TaskCompletion ok(TaskControl&) { return TaskCompletion::success(); }
-inline int run(std::initializer_list<std::pair<const char*, void(*)()>> tests) {
+using Check = std::pair<const char*, void(*)()>;
+template<class Tests> int run_checks(const Tests& tests) {
     Json::Value report;
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
+    auto& timings = report["timings_ms"] = Json::Value(Json::objectValue);
     try {
         for (auto [name, test] : tests) {
             report["current"] = name;
+            const auto started = std::chrono::steady_clock::now();
             test();
+            timings[name] = Json::Int64(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
             checks.append(name);
         }
         report.removeMember("current");
@@ -59,4 +63,5 @@ inline int run(std::initializer_list<std::pair<const char*, void(*)()>> tests) {
     std::cout << wire::stringify(report, true) << std::endl;
     return report["passed"].asBool() ? 0 : 1;
 }
+inline int run(std::initializer_list<Check> tests) { return run_checks(tests); }
 }

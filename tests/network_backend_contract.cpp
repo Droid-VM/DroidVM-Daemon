@@ -1214,15 +1214,14 @@ int main(int argc, char** argv) {
         links.remove("test", argv[4]);
         return 74;
     }
-    if (argc != 4) return 64;
-    executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
-    return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
+    // The full set exceeds one adb shell budget; the driver runs both parts
+    // separately and requires their union, balanced by measured duration.
+    const std::vector<Check> checks{{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
         {"host_address_filtering", host_address_filtering}, {"uplink_snapshot_policy", uplink_snapshot_policy}, {"real_host_discovery", real_host_discovery},
         {"isolated_forwarding_and_real_dual_stack_packets", forwarding_contract},
         {"isolated_firewall_ownership_recovery_and_packets", firewall_contract},
         {"isolated_linux_firewall_policy", linux_firewall_contract},
         {"isolated_linux_firewall_coordinator", linux_firewall_coordinator_contract},
-        {"isolated_linux_port_forwards", linux_firewall_forward_contract},
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
         {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
@@ -1236,5 +1235,14 @@ int main(int argc, char** argv) {
         {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor},
         {"real_linux_topology", real_linux_topology}, {"linux_topology_failure_and_recovery", linux_topology_failure_and_recovery},
         {"linux_topology_sigkill_boundaries", linux_topology_crash_recovery}, {"link_inventory_rejects_stale_backup", link_inventory_rejects_stale_backup},
-        {"actual_daemon_linux_topology_recovery", daemon_linux_topology_recovery}});
+        {"actual_daemon_linux_topology_recovery", daemon_linux_topology_recovery},
+        {"isolated_linux_port_forwards", linux_firewall_forward_contract}};
+    constexpr size_t split = 10;
+    std::string_view part = "all";
+    if (argc == 5 && (std::string_view(argv[1]) == "--part-a" || std::string_view(argv[1]) == "--part-b")) { part = argv[1]; ++argv; --argc; }
+    if (argc != 4) return 64;
+    executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
+    if (part == "all") return run_checks(checks);
+    const auto middle = checks.begin() + split;
+    return run_checks(part == "--part-a" ? std::vector<Check>(checks.begin(), middle) : std::vector<Check>(middle, checks.end()));
 }
