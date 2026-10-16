@@ -1115,7 +1115,9 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string_view(argv[1]) == "--firewall-orphan") return firewall_namespace_child(argv[2], argv[3], argv[4], true);
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4]);
+    if (argc == 4 && std::string_view(argv[1]) == "--noflush" && std::string_view(argv[0]).ends_with("/restore")) return firewall_delayed_restore(argv[0]);
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-crash") return firewall_crash_child(argv[2], std::string_view(argv[3]) == "6", argv[4]);
     if (argc == 4 && std::string_view(argv[1]) == "--forwarding-namespace") return forwarding_namespace_child(argv[2], argv[3]);
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);

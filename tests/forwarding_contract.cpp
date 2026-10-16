@@ -253,6 +253,19 @@ void firewall_packet_contract(const std::string& netbox, const std::string& work
     check(!path.packet(false, 30) && !path.packet(true, 31), "exact ACCEPT removal leaves independent DROP rules active");
     check(owner.cleanup("packets").empty(), "packet firewall inventory cleanup");
     check(path.packet(false, 32) && path.packet(true, 33), "cleanup restores baseline forwarding behavior");
+    for (const bool ipv6 : {false, true}) {
+        FirewallRule drop; drop.ipv6 = ipv6; drop.input = "fwin"; drop.output = "fwout"; drop.target = "DROP";
+        auto accept = drop; accept.target = "ACCEPT";
+        const uint16_t sequence = ipv6 ? 50 : 40;
+        owner.replace_table("batch", ipv6, "filter", {{"drop", drop}, {"accept", accept}});
+        check(!path.packet(ipv6, sequence), "atomic ordered policy enforces DROP before ACCEPT");
+        owner.replace_table("batch", ipv6, "filter", {{"accept", accept}, {"drop", drop}});
+        check(path.packet(ipv6, sequence + 1), "atomic reorder changes actual forwarding verdict");
+        owner.replace_table("batch", ipv6, "filter", {{"drop", drop}});
+        check(!path.packet(ipv6, sequence + 2), "atomic policy tightening removes previous acceptance");
+        owner.replace_table("batch", ipv6, "filter", {});
+        check(path.packet(ipv6, sequence + 3), "empty atomic revision restores original data path");
+    }
     for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
     check(rmdir(place.c_str()) == 0, "packet firewall fixture empty");
 }
