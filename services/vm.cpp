@@ -55,6 +55,7 @@ VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) 
         const auto& value = config::member(app_config_, "optimize_sdcard");
         return value.isBool() ? value.asBool() : true;
     };
+    context_.app_config = [this] { return app_config(); };
 }
 VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
     try {
@@ -302,8 +303,12 @@ Json::Value VmService::boot_scan(const CallContext& caller, const std::string& i
 void VmService::set_app_config(const CallContext& caller, Json::Value value) {
     access(caller);
     if (!value.isObject()) throw std::invalid_argument("config is not an object");
-    std::lock_guard lock(app_mutex_);
-    app_config_ = std::move(value);
+    {
+        std::lock_guard lock(app_mutex_);
+        app_config_ = value;
+    }
+    // The ACM pool is standing state driven by this config; failures only log.
+    if (context_.acm) context_.acm->apply_config(value);
 }
 Json::Value VmService::app_config() const {
     std::lock_guard lock(app_mutex_);

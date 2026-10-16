@@ -4,6 +4,7 @@
 #include "vm/console.h"
 #include "vm/input_bridge.h"
 #include "vm/hugepage.h"
+#include "vm/usb_acm.h"
 #include "network/switch_runtime.h"
 #include "runtime/child.h"
 #include <json/json.h>
@@ -25,6 +26,7 @@ struct RuntimeContext {
     network::SwitchRuntime* identities = nullptr; // recoverable VM process identities
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;
+    AcmPool* acm = nullptr; // null: USB_ACM ports degrade to a sink
     HugepagePool hugepages;
     uid_t owner = 0; // app uid owning logs and data
     std::string data_dir; // HostFacts.data_dir; empty = compile-time /data/data/<package>
@@ -32,6 +34,7 @@ struct RuntimeContext {
     std::string lbx;
     std::function<bool()> shutting_down = [] { return false; };
     std::function<bool()> optimize_sdcard = [] { return true; };
+    std::function<Json::Value()> app_config = [] { return Json::Value(Json::objectValue); }; // ServerContext.appConfig
     // NetworkInstance.attachNic/detachNic; attach throws with the legacy text.
     std::function<void(const std::string& network, const Json::Value& nic, const std::string& tap)> attach_nic, detach_nic;
     std::function<void(const std::string&)> warn = [](const std::string&) {}; // daemon log
@@ -88,6 +91,7 @@ private:
     bool qemu_ = false; // control_socket_ is a QMP socket
     std::vector<std::string> sockets_; // QEMU chardev sockets removed at cleanup
     std::vector<Serial> serials_;
+    std::vector<std::string> acm_owners_; // ResolvedSerial.acmDevPath holders
     InputBridge input_;
     network::SwitchRuntime::Allocation identity_;
     std::atomic<bool> stopped_by_user_{false}, reboot_requested_{false}, reading_{true};

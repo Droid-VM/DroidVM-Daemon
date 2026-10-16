@@ -379,16 +379,42 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     mkdir(context_.run_dir.c_str(), 0700);
     if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) == "QEMU") return launch_qemu(config, plan, failure);
     CrosvmRun run;
+    const auto& ports = config::member(config, "serial_ports");
+    auto backend_of = [](const Json::Value& port) { return config::java_enum(port, "backend", "SINK", {"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"}); };
+    auto stream_of = [](const Json::Value& port) { // VMSerialConfig.getStreamName
+        const auto hardware = config::java_enum(port, "hardware", "SERIAL", {"SERIAL", "SBSA", "VIRTIO_CONSOLE"});
+        const auto num = std::to_string(std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(port, "num", 1))));
+        return (hardware == "SBSA" ? "sbsa" : hardware == "VIRTIO_CONSOLE" ? "vcon" : "serial") + num;
+    };
+    // USB_ACM ports attach their configured pool slot outside the state lock: a
+    // pool build waits on the USB stack. A refused slot fails the start; a broken
+    // gadget degrades the port to a sink.
+    std::vector<std::optional<std::string>> acm;
+    if (ports.isArray()) for (const auto& port : ports) {
+        acm.emplace_back();
+        if (!context_.acm || backend_of(port) != "USB_ACM") continue;
+        const auto owner = id_ + "/" + stream_of(port);
+        try {
+            acm.back() = context_.acm->acquire(std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(port, "usb_slot", 0))),
+                                               owner, context_.app_config());
+            std::lock_guard lock(state_mutex_);
+            acm_owners_.push_back(owner);
+        } catch (const AcmSlotUnavailable& error) {
+            failure = std::string("serial setup failed: ") + error.what();
+            return false;
+        } catch (const std::exception& error) {
+            context_.warn("USB ACM for " + stream_of(port) + " unavailable; port degrades to sink: " + error.what());
+        }
+    }
     {
         std::lock_guard lock(state_mutex_);
         serials_.clear();
-        const auto& ports = config::member(config, "serial_ports");
-        if (ports.isArray()) for (const auto& port : ports) {
+        if (ports.isArray()) for (Json::ArrayIndex index = 0; index < ports.size(); ++index) {
+            const auto& port = ports[index];
             SerialRun resolved;
-            if (config::java_enum(port, "backend", "SINK", {"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"}) == "APP_CONSOLE") {
-                const auto hardware = config::java_enum(port, "hardware", "SERIAL", {"SERIAL", "SBSA", "VIRTIO_CONSOLE"});
-                const auto num = std::to_string(std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(port, "num", 1))));
-                const auto name = (hardware == "SBSA" ? "sbsa" : hardware == "VIRTIO_CONSOLE" ? "vcon" : "serial") + num;
+            resolved.acm_dev_path = acm[index];
+            if (backend_of(port) == "APP_CONSOLE") {
+                const auto name = stream_of(port);
                 int out[2], in[2];
                 if (logs_.contains(name) && pipe2(out, O_CLOEXEC) == 0) {
                     if (pipe2(in, O_CLOEXEC) == 0) {
@@ -398,7 +424,6 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
                     } else { close(out[0]); close(out[1]); }
                 }
             }
-            // USB ACM slots belong to the peripheral pool (P5): degrade to a sink.
             run.serials.push_back(std::move(resolved));
         }
         control_socket_ = context_.run_dir + "/" + config::string(config, "name") + ".sock";
@@ -550,6 +575,9 @@ void VmRuntime::reap_and_cleanup() {
 }
 void VmRuntime::cleanup_backend() {
     input_.release();
+    std::vector<std::string> acm;
+    { std::lock_guard lock(state_mutex_); acm.swap(acm_owners_); }
+    for (const auto& owner : acm) context_.acm->release(owner);
     std::lock_guard lock(state_mutex_);
     if (control_socket_) { unlink(control_socket_->c_str()); control_socket_.reset(); }
     for (const auto& path : sockets_) unlink(path.c_str());

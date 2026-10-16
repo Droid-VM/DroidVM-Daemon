@@ -210,6 +210,7 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
             // Outlives vms: their state hooks reach it until the last VM stops.
             std::unique_ptr<droidvm::input::KeyboardGrab> keyboard;
+            std::unique_ptr<droidvm::vm::AcmPool> acm; // outlives vms: they release slots on exit
             std::unique_ptr<droidvm::usb::UsbService> usb;
             std::unique_ptr<droidvm::usb::CrosvmCli> usb_control;
             std::unique_ptr<UsbVmStore> usb_vms;
@@ -251,6 +252,13 @@ int main(int argc, char** argv) {
                 context.cache_dir = (data / "cache").string();
                 context.run_dir = (data / "run").string();
                 context.lbx = (data / "bin/lbx").string();
+                // The USB gadget is global host state: only the app's own data directory owns the pool.
+                if (same) {
+                    droidvm::vm::AcmOptions options;
+                    options.log = [&](const char* level, const std::string& text) { if (log) log->write(level, "UsbAcmPool: " + text); };
+                    acm = std::make_unique<droidvm::vm::AcmPool>(std::move(options));
+                    context.acm = acm.get();
+                }
                 const droidvm::CallContext internal{"vm-runtime", true, true, true};
                 context.attach_nic = [&, internal](const std::string& network, const Json::Value& nic, const std::string& tap) {
                     Json::Value config;
