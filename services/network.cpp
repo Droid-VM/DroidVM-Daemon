@@ -206,6 +206,12 @@ bool NetworkService::pd_action(const CallContext& caller, const std::string& id,
     std::unique_lock operation(target->operation, std::chrono::seconds(5));
     return operation.owns_lock() && target->backend && target->backend->pd_action(vlan, release);
 }
+bool NetworkService::manual(const CallContext& caller, const std::string& id, bool address, const std::string& value, bool add) {
+    auto target = slot(caller, id);
+    std::unique_lock operation(target->operation, std::chrono::seconds(5));
+    if (!operation.owns_lock() || !target->backend) return false;
+    return address ? target->backend->manual_address(value, add) : target->backend->manual_port(value, add);
+}
 void NetworkService::schedule_reconcile(TaskService& workers) {
     std::string id;
     bool autostart = false;

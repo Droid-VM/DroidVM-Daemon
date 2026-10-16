@@ -74,7 +74,8 @@ bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
 constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log",
-    "network_delete", "network_pd_renew", "network_pd_release"};
+    "network_delete", "network_pd_renew", "network_pd_release", "network_add_address", "network_remove_address",
+    "network_add_interface", "network_remove_interface"};
 bool runtime_command(const std::string& command) {
     return std::find(runtime_commands.begin(), runtime_commands.end(), command) != runtime_commands.end();
 }
@@ -179,6 +180,23 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                     catch (const ServiceError&) { result["message"] = "Failed to stop network: " + id; return result; }
                 }
                 networks_->remove(caller, id);
+                result["success"] = true; return result;
+            }
+            if (command.ends_with("_address") || command.ends_with("_interface")) {
+                const bool address = command.ends_with("_address"), add = command.starts_with("network_add_");
+                auto value = legacy_id(request, address ? "address" : "interface");
+                if (value.empty()) { result["message"] = address ? "missing address" : "missing interface"; return result; }
+                if (address) {
+                    // IPNetwork.parse: IPv4 first, then IPv6; the stored form is address/prefix.
+                    std::optional<config::NetworkPrefix> prefix;
+                    for (const bool v6 : {false, true}) if (!prefix) try { prefix = config::NetworkPrefix::parse(value, v6); } catch (const std::exception&) {}
+                    if (!prefix) { result["message"] = "invalid address: Invalid IP network: " + value; return result; }
+                    value = prefix->address() + "/" + std::to_string(prefix->prefix());
+                }
+                if (!networks_->exists(caller, id)) { result["message"] = "network " + id + " not found"; return result; }
+                if (!runtime_->manual(caller, id, address, value, add)) {
+                    result["message"] = std::string("failed to ") + (add ? "add " : "remove ") + (address ? "address" : "interface"); return result;
+                }
                 result["success"] = true; return result;
             }
             if (command == "network_pd_renew" || command == "network_pd_release") {

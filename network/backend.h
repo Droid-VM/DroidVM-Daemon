@@ -38,6 +38,10 @@ public:
     }
     // BridgeBackend.renewPd/releasePd: false when unsupported or refused.
     virtual bool pd_action(int, bool) { return false; }
+    // network_add/remove_address and _interface: Linux bridges only. A manual
+    // port is an owned record released with the network, never a foreign one.
+    virtual bool manual_address(const std::string&, bool) { return false; }
+    virtual bool manual_port(const std::string&, bool) { return false; }
 };
 // NetworkConfig.getVlans: L3 networks only, object rows.
 inline std::vector<const Json::Value*> l3_vlans(const Json::Value& network) {

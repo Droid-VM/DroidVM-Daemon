@@ -10,6 +10,7 @@
 #include "pbridge.h"
 #include <functional>
 #include <memory>
+#include <set>
 
 namespace droidvm::network {
 // Linux L3 data path composed from owned topology, the shared firewall
@@ -49,6 +50,8 @@ public:
     Json::Value forward_failures() const override;
     void live_details(Json::Value& data) const override;
     bool pd_action(int vlan, bool release) override;
+    bool manual_address(const std::string& cidr, bool add) override;
+    bool manual_port(const std::string& name, bool add) override;
 private:
     Resources resources_;
     LinuxTopology topology_;
@@ -65,6 +68,8 @@ private:
     std::map<std::string, Json::Value> attached_; // TAP -> sanitized NIC
     std::map<std::string, std::vector<std::string>> failures_; // legacy forward_failures
     std::map<std::string, bool> mac_security_; // TAP -> locked port active
+    std::set<std::string> manual_ports_; // network_add_interface ports
+    std::string manual_owner(const std::string& name) const { return firewall_owner_ + "/manual/" + name; }
     bool retain_taps_ = false; // recover keeps VM TAPs (crosvm holds them open)
     std::string tap_owner(const std::string& tap) const { return firewall_owner_ + "/" + tap; }
     void plug(const std::string& tap, const Json::Value& nic);

@@ -385,6 +385,30 @@ void LinuxBridge::live_details(Json::Value& data) const {
     if (!l3_ && !uplink_.empty()) data["resolved_uplink"] = uplink_;
     if (!mac_security_.empty()) for (const auto& [tap, active] : mac_security_) data["mac_security_active"][tap] = active;
 }
+bool LinuxBridge::manual_address(const std::string& cidr, bool add) {
+    if (!running_) return false;
+    const auto bridge = config::string(config_, "bridge_name");
+    try { resources_.links.require_owned(firewall_owner_, bridge); resources_.netbox.address(bridge, cidr, add); return true; }
+    catch (const std::exception&) { return false; }
+}
+bool LinuxBridge::manual_port(const std::string& name, bool add) {
+    if (!add) {
+        // Legacy nomaster'ed any interface; only ports this network enslaved leave here.
+        if (!manual_ports_.contains(name)) return false;
+        try { resources_.ports.release(manual_owner(name)); } catch (const std::exception&) { return false; }
+        manual_ports_.erase(name);
+        return true;
+    }
+    if (!running_ || manual_ports_.contains(name) || attached_.contains(name)) return false;
+    try {
+        Netbox::interface_name(name);
+        const auto bridge = config::string(config_, "bridge_name");
+        if (name == bridge || name == uplink_) return false;
+        resources_.ports.attach(manual_owner(name), name, bridge);
+        manual_ports_.insert(name);
+        return true;
+    } catch (const std::exception&) { return false; }
+}
 bool LinuxBridge::pd_action(int vlan, bool release) {
     return running_ && dhcp_needed_ && dhcp_.healthy() && dhcp_.pd_action(vlan, release);
 }
@@ -405,6 +429,7 @@ void LinuxBridge::stop() {
         release_tap(tap);
     });
     if (!retain_taps_) { attached_.clear(); mac_security_.clear(); }
+    for (const auto& name : std::set(manual_ports_)) attempt([&] { resources_.ports.release(manual_owner(name)); manual_ports_.erase(name); });
     // Detach a foreign uplink first: it quiesces external traffic and must
     // leave before the bridge can be released.
     if (!l3_ && !firewall_owner_.empty()) attempt([&] { resources_.ports.release(firewall_owner_); });
