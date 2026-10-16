@@ -30,7 +30,8 @@ private:
 // network side effects. Runtime activation/deletion will compose this service.
 class NetworkConfigService {
 public:
-    explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, TaskService* events = nullptr);
+    explicit NetworkConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {},
+        TaskService* events = nullptr, bool claim_ownership = false);
     bool has_events() const { return events_ != nullptr; }
     Json::Value list(const CallContext& caller) const;
     Json::Value get(const CallContext& caller, const std::string& id) const;

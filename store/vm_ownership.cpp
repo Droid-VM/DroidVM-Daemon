@@ -11,12 +11,11 @@
 
 namespace droidvm::config {
 namespace {
-constexpr const char* name = "vms.config-owner";
 constexpr std::string_view marker = "native-v1\n";
 void require(bool ok, const char* operation) {
     if (!ok) throw std::runtime_error(std::string(operation) + ": " + strerror(errno));
 }
-void gate(int directory, uid_t owner, bool claim) {
+void gate(int directory, uid_t owner, bool claim, const char* name) {
     Fd fd(openat(directory, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600));
     struct stat info{};
     require(fd.get() >= 0 && fstat(fd.get(), &info) == 0 && S_ISREG(info.st_mode) && info.st_nlink == 1,
@@ -52,6 +51,8 @@ void gate(int directory, uid_t owner, bool claim) {
     require(fsync(fd.get()) == 0 && fsync(directory) == 0, "sync VM configuration ownership");
 }
 }
-void claim_vm_config(int directory, uid_t owner) { gate(directory, owner, true); }
-void require_legacy_vm_config(int directory, uid_t owner) { gate(directory, owner, false); }
+void claim_vm_config(int directory, uid_t owner) { gate(directory, owner, true, "vms.config-owner"); }
+void require_legacy_vm_config(int directory, uid_t owner) { gate(directory, owner, false, "vms.config-owner"); }
+void claim_network_config(int directory, uid_t owner) { gate(directory, owner, true, "networks.config-owner"); }
+void require_legacy_network_config(int directory, uid_t owner) { gate(directory, owner, false, "networks.config-owner"); }
 }

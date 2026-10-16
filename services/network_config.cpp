@@ -2,6 +2,7 @@
 #include "network_config.h"
 #include "tasks.h"
 #include "store/network_config.h"
+#include "store/vm_ownership.h"
 #include "common/identity.h"
 #include <regex>
 #include <set>
@@ -105,8 +106,10 @@ std::shared_ptr<NetworkConfigService::State> NetworkConfigService::decode(Json::
     result->recovered = recovered;
     return result;
 }
-NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, TaskService* events)
+NetworkConfigService::NetworkConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, TaskService* events, bool claim_ownership)
     : file_(directory, "networks.json", owner, std::move(observer)), events_(events), runtime_(std::make_shared<NetworkRuntimeLease::Registry>()) {
+    // Opt-in until every legacy writer and upgrade path has migrated.
+    if (claim_ownership) config::claim_network_config(directory, owner);
     auto loaded = file_.load();
     Json::Value empty;
     empty["networks"] = Json::Value(Json::arrayValue);

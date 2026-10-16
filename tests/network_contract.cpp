@@ -2,6 +2,7 @@
 #include "contracts.h"
 #include "services/network_config.h"
 #include "store/network_config.h"
+#include "store/vm_ownership.h"
 #include "common/identity.h"
 #include <atomic>
 #include <dirent.h>
@@ -95,6 +96,21 @@ void extension_merge_and_null() {
     result = service.get(admin, id);
     check(result.isMember("extension") && result["extension"].isNull() && result["l3"]["future_section"].asBool() && !result["l3"].isMember("vlans"),
           "explicit null and removal of known fields remain distinct");
+}
+void persistent_network_ownership() {
+    Temporary temp;
+    config::require_legacy_network_config(temp.directory.get(), getuid());
+    {
+        NetworkConfigService service(temp.directory.get(), getuid(), {}, nullptr, true);
+        service.create(admin, network("owned"));
+    }
+    bool refused = false;
+    try { config::require_legacy_network_config(temp.directory.get(), getuid()); }
+    catch (const std::exception&) { refused = true; }
+    check(refused, "network ownership survives service exit and rejects legacy");
+    config::require_legacy_vm_config(temp.directory.get(), getuid());
+    NetworkConfigService reopened(temp.directory.get(), getuid(), {}, nullptr, true);
+    check(reopened.list(admin).size() == 1, "native reopen preserves owned network");
 }
 void conditional_updates() {
     Temporary temp;
@@ -519,6 +535,7 @@ int main(int argc, char** argv) {
     }
     return run({{"migration_opaque_identity_permissions", migration_retention_identity}, {"nested_extensions_vlan_identity_null", extension_merge_and_null},
         {"conditional_update_failures_and_runtime", conditional_updates},
+        {"persistent_network_ownership", persistent_network_ownership},
         {"twelve_conditional_update_writers", conditional_update_race},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
         {"network_snapshot_replay_failure_permissions", configuration_event_handoff},

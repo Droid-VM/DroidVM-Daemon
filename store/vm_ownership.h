@@ -8,4 +8,6 @@ namespace droidvm::config {
 // one-way transition with legacy App writes and records ownership across exits.
 void claim_vm_config(int directory, uid_t owner);
 void require_legacy_vm_config(int directory, uid_t owner);
+void claim_network_config(int directory, uid_t owner);
+void require_legacy_network_config(int directory, uid_t owner);
 }
