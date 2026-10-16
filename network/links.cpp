@@ -315,6 +315,21 @@ Json::Value OwnedLinks::scope() const {
     result["namespace_inode"] = Json::UInt64(namespace_inode_);
     return result;
 }
+bool same_scope(const Json::Value& a, const Json::Value& b) {
+    return a["boot"] == b["boot"] && a["namespace_device"].asUInt64() == b["namespace_device"].asUInt64() &&
+        a["namespace_inode"].asUInt64() == b["namespace_inode"].asUInt64();
+}
+bool same_link(const Json::Value& a, const Json::Value& b) {
+    return same_scope(a, b) && a["index"].asUInt() == b["index"].asUInt() && a["tag"] == b["tag"] &&
+        a["owner"] == b["owner"] && a["name"] == b["name"];
+}
+uint32_t link_cookie(const Json::Value& identity) {
+    const auto tag = identity["tag"].asString();
+    if (tag.size() != 40 || !tag.starts_with("droidvm:") || tag.substr(8).find_first_not_of("0123456789abcdef") != std::string::npos)
+        throw ServiceError(ErrorCode::io_error, "invalid dependent resource link tag");
+    uint32_t value = 0; std::from_chars(tag.data() + 8, tag.data() + 16, value, 16);
+    return value ? value : 1;
+}
 std::string OwnedLinks::vlan_code(int vid) {
     if (vid < 0 || vid > 4094) throw ServiceError(ErrorCode::invalid_argument, "invalid VLAN id");
     constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

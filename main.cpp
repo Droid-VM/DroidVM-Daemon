@@ -7,6 +7,7 @@
 #include "network/gvswitch.h"
 #include "network/links.h"
 #include "network/policy_rules.h"
+#include "network/routes.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::network::Netbox> netbox;
             std::unique_ptr<droidvm::network::OwnedLinks> owned_links;
             std::unique_ptr<droidvm::network::OwnedRules> owned_rules;
+            std::unique_ptr<droidvm::network::OwnedRoutes> owned_routes;
             if (layout) {
                 netbox = std::make_unique<droidvm::network::Netbox>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
@@ -97,6 +99,9 @@ int main(int argc, char** argv) {
                 owned_rules = std::make_unique<droidvm::network::OwnedRules>(instance->directory_fd(), layout->owner(), *owned_links);
                 const auto rule_failures = owned_rules->recover_all();
                 if (!rule_failures.empty()) throw std::runtime_error("Network rule recovery incomplete: " + droidvm::wire::stringify(rule_failures));
+                owned_routes = std::make_unique<droidvm::network::OwnedRoutes>(instance->directory_fd(), layout->owner(), *owned_links);
+                const auto route_failures = owned_routes->recover_all();
+                if (!route_failures.empty()) throw std::runtime_error("Network route recovery incomplete: " + droidvm::wire::stringify(route_failures));
                 const auto failures = owned_links->recover_all();
                 if (!failures.empty()) throw std::runtime_error("Network link recovery incomplete: " + droidvm::wire::stringify(failures));
             }

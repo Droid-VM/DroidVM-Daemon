@@ -5,6 +5,11 @@
 #include <mutex>
 
 namespace droidvm::network {
+// Shared comparisons for dependent resource inventories; JSON reload can
+// change integer storage types, so numeric identity is compared by value.
+bool same_scope(const Json::Value& a, const Json::Value& b);
+bool same_link(const Json::Value& a, const Json::Value& b);
+uint32_t link_cookie(const Json::Value& identity);
 // A durable inventory of links created by this daemon. The caller holds the
 // daemon instance lock for this object's lifetime and serializes each network's
 // operations. No destructor side effects: cleanup failures must be reported.

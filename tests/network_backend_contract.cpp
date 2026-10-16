@@ -3,6 +3,7 @@
 #include "network/links.h"
 #include "network/linux_topology.h"
 #include "network/policy_rules.h"
+#include "network/routes.h"
 #include "network/netlink.h"
 #include <linux/fib_rules.h>
 #include <arpa/inet.h>
@@ -42,10 +43,13 @@ struct Case {
         OwnedLinks links(directory.get(), getuid(), netbox);
         OwnedRules rules(directory.get(), getuid(), links);
         check(rules.recover_all().empty() && rules.inventory()["rules"].empty(), "cleanup registered policy rules before links");
+        OwnedRoutes route_owner(directory.get(), getuid(), links);
+        check(route_owner.recover_all().empty() && route_owner.inventory()["routes"].empty(), "cleanup registered routes before links");
         check(links.cleanup("test").empty(), "cleanup test-owned links");
         check(links.inventory()["links"].empty(), "no unresolved resource records");
         for (const char* file : {"network-links.json", "network-links.json.bak", "network-links.json.corrupt",
-                                "network-rules.json", "network-rules.json.bak", "network-rules.json.corrupt"})
+                                "network-rules.json", "network-rules.json.bak", "network-rules.json.corrupt",
+                                "network-routes.json", "network-routes.json.bak", "network-routes.json.corrupt"})
             unlinkat(directory.get(), file, 0);
         check(rmdir(path.c_str()) == 0, "remove empty test directory");
     }
@@ -594,6 +598,7 @@ void ownership_cookie_routing() {
     Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
     links.bridge("test", test.name); test.netbox.state(test.name, true);
     OwnedRules rules(test.directory.get(), getuid(), links);
+    OwnedRoutes route_owner(test.directory.get(), getuid(), links);
     const uint32_t index = if_nametoindex(test.name.c_str()), table = 1700000000u + index;
     for (const bool ipv6 : {false, true}) {
         // Change forwarding only on our isolated bridge, never the phone's
@@ -606,12 +611,7 @@ void ownership_cookie_routing() {
             inet_pton(family, ipv6 ? "fd91:fe21:ff00::2" : "198.19.222.2", source.data()) == 1 &&
             inet_pton(family, ipv6 ? "fd91:fe21:ff00::3" : "198.19.222.3", destination.data()) == 1, "parse route lookup fixture addresses");
         const size_t bytes = ipv6 ? 16 : 4;
-        NetlinkMessage<rtmsg> route;
-        route.header.nlmsg_type = RTM_NEWROUTE; route.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
-        route.payload.rtm_family = family; route.payload.rtm_dst_len = ipv6 ? 64 : 24;
-        route.payload.rtm_protocol = RTPROT_STATIC; route.payload.rtm_type = RTN_UNICAST; route.payload.rtm_scope = RT_SCOPE_LINK;
-        route.attribute(RTA_DST, network.data(), bytes); route.attribute(RTA_TABLE, &table, sizeof(table));
-        route.attribute(RTA_OIF, &index, sizeof(index)); netlink_exchange(route.header);
+        route_owner.reconcile("test", test.name, ipv6, {ipv6 ? "fd91:fe21:ff00::1/64" : "198.19.222.1/24"}, {table});
         rules.reconcile("test", test.name, ipv6, {table});
         const auto installed = installed_rule(test.name, ipv6);
         check(installed.mark.value_or(0) && installed.mask.value_or(0) == 0, "ownership cookie has an explicit match-all mask");
@@ -638,6 +638,7 @@ void ownership_cookie_routing() {
                 " oif=" + std::to_string(output) + "/" + std::to_string(index));
         }
         check(rules.cleanup("test").empty(), "cookie rule cleanup after real FIB queries");
+        check(route_owner.cleanup("test").empty(), "owned return route cleanup after real FIB queries");
     }
     // The private-table routes are kernel dependents of this owned bridge.
     // No broad table flush is needed or allowed.
@@ -742,6 +743,129 @@ void policy_crash_recovery() {
         test.finish();
     }
 }
+std::string route_prefix(bool ipv6) { return ipv6 ? "fd91:fe21:ee00::/64" : "198.19.221.0/24"; }
+Route installed_route(const std::string& name, bool ipv6, uint32_t table = 123456) {
+    for (const auto& route : routes(ipv6)) if (route.output == if_nametoindex(name.c_str()) && route.table == table && route.prefix == route_prefix(ipv6))
+        return route;
+    throw std::runtime_error("missing installed return route");
+}
+size_t private_routes(Case& test, bool ipv6) {
+    size_t count = 0;
+    for (const auto& route : routes(ipv6)) if (route.output == if_nametoindex(test.name.c_str()) && route.table == 123456) ++count;
+    return count;
+}
+void real_return_routes() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name); test.netbox.state(test.name, true);
+    size_t mutations = 0;
+    OwnedRoutes owned(test.directory.get(), getuid(), links, [&](const char*) { ++mutations; });
+    for (const bool ipv6 : {false, true}) {
+        const auto address = ipv6 ? "fd91:fe21:ee00::1/64" : "198.19.221.1/24";
+        test.netbox.address(test.name, address, true);
+        uint32_t connected_table = 0;
+        for (const auto& route : routes(ipv6)) if (route.protocol == RTPROT_KERNEL && route.prefix == route_prefix(ipv6) &&
+            route.output == if_nametoindex(test.name.c_str())) connected_table = route.table;
+        check(connected_table && connected_table != 123456, "locate actual kernel connected table; Android IPv6 may use ifindex+1000");
+        owned.reconcile("test", test.name, ipv6, {address, route_prefix(ipv6)}, {connected_table, 123456, 123456});
+        check(private_routes(test, ipv6) == 1 && installed_route(test.name, ipv6).metric == link_cookie(links.identity("test", test.name)), "normalized return subnet has durable metric identity");
+        check(owned.inventory()["routes"].size() == 1, "existing kernel connected route is reused without adoption");
+        const auto before = mutations;
+        OwnedRoutes loaded(test.directory.get(), getuid(), links, [&](const char*) { ++mutations; });
+        loaded.reconcile("test", test.name, ipv6, {address}, {connected_table, 123456});
+        check(before == mutations, "reload and repeated reconcile leave correct routes unchanged");
+        const auto secondary = ipv6 ? "fd91:fe21:ee01::7/64" : "198.19.220.7/24";
+        owned.reconcile("test", test.name, ipv6, {address, secondary}, {connected_table, 123456});
+        check(owned.inventory()["routes"].size() == 3 && private_routes(test, ipv6) == 2, "primary and secondary subnets populate requested tables");
+        owned.reconcile("test", test.name, ipv6, {address}, {123456});
+        check(owned.inventory()["routes"].size() == 1 && private_routes(test, ipv6) == 1, "obsolete table and subnet routes retired");
+        check(owned.cleanup("test").empty() && private_routes(test, ipv6) == 0, "return routes removed on stop");
+        bool connected = false;
+        for (const auto& route : routes(ipv6)) if (route.table == connected_table && route.prefix == route_prefix(ipv6) && route.output == if_nametoindex(test.name.c_str()))
+            connected = route.protocol == RTPROT_KERNEL;
+        check(connected, "cleanup preserves the kernel-connected route");
+    }
+    std::vector<PolicyRule> rules;
+    auto rule = test_rule("lo", false, 1001); rules.push_back(rule); rules.push_back(rule);
+    rule.table = RT_TABLE_LOCAL; rules.push_back(rule); rule.lookup = false; rule.table = 1002; rules.push_back(rule);
+    check(referenced_route_tables(rules) == std::vector<uint32_t>({1001, RT_TABLE_LOCAL}), "all lookup tables are selected in stable first occurrence order");
+    test.finish();
+}
+void return_route_conflicts() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name); test.netbox.state(test.name, true);
+    OwnedRoutes owned(test.directory.get(), getuid(), links);
+    for (const bool ipv6 : {false, true}) {
+        owned.reconcile("test", test.name, ipv6, {route_prefix(ipv6)}, {123456});
+        const auto original = installed_route(test.name, ipv6);
+        change_route(original, false);
+        auto foreign = original; foreign.protocol = 187; foreign.metric = original.metric == UINT32_MAX ? 1 : original.metric + 1;
+        change_route(foreign, true);
+        check(owned.cleanup("test").size() == 1 && private_routes(test, ipv6) == 1, "replaced route retained with unresolved inventory");
+        error(ErrorCode::conflict, [&] { owned.reconcile("test", test.name, ipv6, {route_prefix(ipv6)}, {123456}); });
+        change_route(foreign, false); check(owned.recover_all().empty(), "absent replacement allows retirement");
+        change_route(original, true);
+        error(ErrorCode::conflict, [&] { owned.reconcile("test", test.name, ipv6, {route_prefix(ipv6)}, {123456}); });
+        check(owned.inventory()["routes"].empty(), "same-signature unregistered route is never adopted");
+        change_route(original, false);
+        bool replace = false;
+        OwnedRoutes race(test.directory.get(), getuid(), links, [&](const char* stage) {
+            if (replace && std::string_view(stage) == "before_route_delete") {
+                replace = false; change_route(original, false); change_route(foreign, true);
+            }
+        });
+        race.reconcile("test", test.name, ipv6, {route_prefix(ipv6)}, {123456});
+        replace = true;
+        check(race.cleanup("test").empty() && private_routes(test, ipv6) == 1, "exact kernel delete preserves metric/protocol replacement race");
+        change_route(foreign, false);
+        bool collide = true;
+        OwnedRoutes creation_race(test.directory.get(), getuid(), links, [&](const char* stage) {
+            if (collide && std::string_view(stage) == "route_intent_saved") { collide = false; change_route(foreign, true); }
+        });
+        error(ErrorCode::conflict, [&] { creation_race.reconcile("test", test.name, ipv6, {route_prefix(ipv6)}, {123456}); });
+        check(private_routes(test, ipv6) == 2 && creation_race.inventory()["routes"].size() == 1, "concurrent foreign route is detected after exclusive metric-key creation");
+        check(creation_race.cleanup("test").empty() && private_routes(test, ipv6) == 1, "failed setup removes only its own route despite a competing prefix");
+        change_route(foreign, false);
+    }
+    test.finish();
+}
+void return_route_journal_failures() {
+    Case test; OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    links.bridge("test", test.name); test.netbox.state(test.name, true);
+    bool fail = true;
+    OwnedRoutes owned(test.directory.get(), getuid(), links, {}, [&](const char* stage) {
+        if (fail && std::string_view(stage) == "before_install") throw std::runtime_error("route write injection");
+    });
+    bool rejected = false;
+    try { owned.reconcile("test", test.name, false, {route_prefix(false)}, {123456}); } catch (const config::CommitError&) { rejected = true; }
+    check(rejected && private_routes(test, false) == 0, "route intent failure prevents kernel mutation");
+    fail = false; owned.reconcile("test", test.name, false, {route_prefix(false)}, {123456});
+    const auto latest = owned.inventory();
+    auto changed = latest; changed["routes"][0]["link"]["namespace_inode"] = Json::UInt64(1);
+    config::JsonFile(test.directory.get(), "network-routes.json", getuid()).save(changed);
+    OwnedRoutes wrong_namespace(test.directory.get(), getuid(), links);
+    check(wrong_namespace.recover_all().size() == 1 && private_routes(test, false) == 1, "foreign namespace cannot delete route");
+    config::JsonFile(test.directory.get(), "network-routes.json", getuid()).save(latest);
+    { std::ofstream backup(test.path + "/network-routes.json.bak", std::ios::trunc); backup << R"({"schema":1,"routes":[]})"; }
+    { std::ofstream primary(test.path + "/network-routes.json", std::ios::trunc); primary << "{broken"; }
+    error(ErrorCode::io_error, [&] { OwnedRoutes invalid(test.directory.get(), getuid(), links); });
+    config::JsonFile(test.directory.get(), "network-routes.json", getuid()).save(latest);
+    fail = true;
+    check(owned.cleanup("test").size() == 1 && private_routes(test, false) == 0 && owned.inventory()["routes"].size() == 1, "failed deletion journal preserves retry evidence");
+    fail = false; check(owned.recover_all().empty(), "retry retires already deleted route");
+    test.finish();
+}
+void return_route_crash_recovery() {
+    for (const bool ipv6 : {false, true}) for (const char* stage : {"route_intent_saved", "route_created", "route_identity_saved",
+            "before_route_delete", "route_deleted", "route_record_removed"}) {
+        Case test; ChildOptions child;
+        child.argv = {"/proc/self/exe", "--routes-crash", executable, test.path, test.name, stage, ipv6 ? "6" : "4"};
+        check(Child(child).communicate({}, 10s).exit_code == -SIGKILL, "return route child reached SIGKILL boundary");
+        OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+        OwnedRoutes recovered(test.directory.get(), getuid(), links);
+        check(recovered.recover_all().empty() && recovered.inventory()["routes"].empty() && private_routes(test, ipv6) == 0, "restart reclaims pending or installed route");
+        test.finish();
+    }
+}
 void daemon_linux_topology_recovery() {
     for (const bool obstruct : {false, true}) {
         Case test;
@@ -758,6 +882,9 @@ void daemon_linux_topology_recovery() {
             const auto id = links.inventory()["links"][0]["owner"].asString();
             rules.reconcile(id, test.name, false, {123456});
             rules.reconcile(id, test.name, true, {123456});
+            OwnedRoutes route_owner(run.get(), getuid(), links);
+            route_owner.reconcile(id, test.name, false, {route_prefix(false)}, {123456});
+            route_owner.reconcile(id, test.name, true, {route_prefix(true)}, {123456});
         }
         const auto foreign = test.name + "t";
         ChildOptions launch;
@@ -771,6 +898,14 @@ void daemon_linux_topology_recovery() {
                 access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0 && exists(test.name),
                 "daemon refuses readiness and preserves topology after policy identity conflict");
             change_policy_rule(replacement, false); change_policy_rule(owned, true);
+            const auto original_route = installed_route(test.name, false);
+            auto foreign_route = original_route; foreign_route.protocol = 187;
+            change_route(original_route, false); change_route(foreign_route, true);
+            const auto routes_rejected = Child(launch).communicate({}, 15s);
+            check(routes_rejected.exit_code == 1 && routes_rejected.error.find("Network route recovery incomplete") != std::string::npos &&
+                access((test.path + "/run/droidvmd-port.txt").c_str(), F_OK) < 0 && exists(test.name),
+                "daemon refuses readiness and preserves topology on route ownership conflict");
+            change_route(foreign_route, false); change_route(original_route, true);
             test.netbox.add_tap(foreign); test.netbox.master(foreign, test.name);
             const auto rejected = Child(launch).communicate({}, 15s);
             check(rejected.exit_code == 1 && rejected.error.find("Network link recovery incomplete") != std::string::npos &&
@@ -792,8 +927,10 @@ void daemon_linux_topology_recovery() {
             "actual daemon reclaims topology before publishing readiness");
         check(config::JsonFile(run.get(), "network-rules.json", getuid()).load()->value["rules"].empty() &&
             observed_rules(test, false).empty() && observed_rules(test, true).empty(), "actual daemon reclaims both policy families before links and readiness");
+        check(config::JsonFile(run.get(), "network-routes.json", getuid()).load()->value["routes"].empty(), "actual daemon retires return routes before links and readiness");
         check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon stops normally");
         for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/network-rules.json", "run/network-rules.json.bak",
+                                "run/network-routes.json", "run/network-routes.json.bak",
                                 "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
             unlink((test.path + "/" + name).c_str());
         for (const char* name : {"run", "bin", "cache", "files"}) check(rmdir((test.path + "/" + name).c_str()) == 0, "remove isolated daemon topology directory");
@@ -848,6 +985,21 @@ int fake(int argc, char** argv) {
 }
 int main(int argc, char** argv) {
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
+    if (argc == 5 && std::string_view(argv[1]) == "--routes-only") {
+        executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
+        return run({{"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
+            {"return_route_journal_failures", return_route_journal_failures}, {"twelve_return_route_sigkill_boundaries", return_route_crash_recovery},
+            {"owned_route_and_rule_kernel_lookup", ownership_cookie_routing}, {"actual_daemon_linux_topology_recovery", daemon_linux_topology_recovery}});
+    }
+    if (argc == 7 && std::string_view(argv[1]) == "--routes-crash") {
+        Netbox netbox(argv[2]); Fd directory(open(argv[3], O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        OwnedLinks links(directory.get(), getuid(), netbox); links.bridge("test", argv[4]); netbox.state(argv[4], true);
+        OwnedRoutes owned(directory.get(), getuid(), links, [&](const char* stage) {
+            if (std::string_view(stage) == argv[5]) { kill(getpid(), SIGKILL); _exit(73); }
+        });
+        const bool ipv6 = std::string_view(argv[6]) == "6";
+        owned.reconcile("test", argv[4], ipv6, {route_prefix(ipv6)}, {123456}); owned.cleanup("test"); return 74;
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--policy-only") {
         executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
         return run({{"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
@@ -891,7 +1043,10 @@ int main(int argc, char** argv) {
         OwnedRules rules(directory.get(), getuid(), links);
         const auto rule_errors = rules.recover_all();
         if (!rule_errors.empty()) { std::cout << wire::stringify(rule_errors) << std::endl; return 1; }
-        const auto errors = links.cleanup("test");
+        OwnedRoutes route_owner(directory.get(), getuid(), links);
+        const auto route_errors = route_owner.recover_all();
+        if (!route_errors.empty()) { std::cout << wire::stringify(route_errors) << std::endl; return 1; }
+        const auto errors = links.recover_all();
         std::cout << wire::stringify(errors) << std::endl;
         return errors.empty() ? 0 : 1;
     }
@@ -917,6 +1072,8 @@ int main(int argc, char** argv) {
         {"host_address_filtering", host_address_filtering}, {"uplink_snapshot_policy", uplink_snapshot_policy}, {"real_host_discovery", real_host_discovery},
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
+        {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
+        {"return_route_journal_failures", return_route_journal_failures}, {"twelve_return_route_sigkill_boundaries", return_route_crash_recovery},
         {"policy_conflicts_replacement_and_races", policy_conflicts_and_races}, {"policy_journal_failures", policy_journal_failures},
         {"twelve_policy_sigkill_boundaries", policy_crash_recovery},
         {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},

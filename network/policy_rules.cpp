@@ -3,7 +3,6 @@
 #include "netlink.h"
 #include "services/context.h"
 #include <algorithm>
-#include <charconv>
 #include <linux/fib_rules.h>
 #include <net/if.h>
 #include <set>
@@ -24,23 +23,13 @@ bool exact(const PolicyRule& a, const PolicyRule& b) {
     return key(a, b) && a.lookup && a.plain && a.table == b.table && a.protocol == b.protocol &&
         a.mark == b.mark && a.mask.value_or(0) == b.mask.value_or(0);
 }
-bool same_scope(const Json::Value& a, const Json::Value& b) {
-    return a["boot"] == b["boot"] && a["namespace_device"].asUInt64() == b["namespace_device"].asUInt64() &&
-        a["namespace_inode"].asUInt64() == b["namespace_inode"].asUInt64();
-}
-bool same_link(const Json::Value& a, const Json::Value& b) {
-    return same_scope(a, b) && a["index"].asUInt() == b["index"].asUInt() && a["tag"] == b["tag"] &&
-        a["owner"] == b["owner"] && a["name"] == b["name"];
-}
 PolicyRule from_record(const Json::Value& row) {
     PolicyRule rule; rule.ipv6 = row["ipv6"].asBool(); rule.lookup = rule.plain = true;
     rule.priority = row["priority"].asUInt(); rule.table = row["table"].asUInt();
     rule.protocol = OwnedRules::protocol; rule.input = row["link"]["name"].asString();
     // A nonzero mark with an explicitly ZERO mask matches all packet marks.
     // It gives DELRULE a nonzero ownership selector without changing routing.
-    const auto tag = row["link"]["tag"].asString();
-    uint32_t cookie = 0; std::from_chars(tag.data() + 8, tag.data() + 16, cookie, 16);
-    rule.mark = cookie ? cookie : 1; rule.mask = 0;
+    rule.mark = link_cookie(row["link"]); rule.mask = 0;
     return rule;
 }
 }
