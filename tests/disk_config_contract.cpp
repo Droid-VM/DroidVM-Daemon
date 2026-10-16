@@ -254,8 +254,8 @@ void disk_read_adapter_and_binding() {
     check(!dispatcher.execute(session, "capabilities", {}).isMember("disk_config_snapshot"), "unbound daemon advertises no disk API");
     dispatcher.set_disk_config(&service);
     auto caps = dispatcher.execute(session, "capabilities", {});
-    check(caps["service_api_minor"] == 22 && caps["disk_config_snapshot"] == "base64-json-chunks-v1"
-        && !caps.isMember("disk_config_upload"), "disk adapter advertises reads without claiming write support");
+    check(caps["service_api_minor"] == 23 && caps["disk_config_snapshot"] == "base64-json-chunks-v1"
+        && caps["disk_config_upload"] == "revisioned-chunks-v1", "disk adapter advertises revisioned registry transport");
     ClientSession unauthenticated;
     check(dispatcher.execute(unauthenticated, "disk_config_snapshot", {})["error"]["code"] == "UNAUTHENTICATED", "disk read requires authentication");
     auto status = dispatcher.execute(session, "disk_config_status", {});
@@ -264,11 +264,84 @@ void disk_read_adapter_and_binding() {
     check(page["success"] == true && page["items"][0]["revision"] == status["revision"], "adapter uses versioned fixed document");
     Json::Value release; release["snapshot_id"] = page["snapshot_id"];
     check(dispatcher.execute(session, "resource_snapshot_release", release)["success"] == true, "disk snapshot uses shared release command");
+    Json::Value begin; begin["revision"] = status["revision"]; begin["bytes"] = 12;
+    auto bad = begin; bad["typo"] = true;
+    check(dispatcher.background("disk_config_upload_commit"), "disk upload commit runs on workers");
+    check(dispatcher.execute_background(admin, "disk_config_upload_begin", bad)["error"]["code"] == "INVALID_ARGUMENT", "strict disk upload fields");
+    check(dispatcher.execute_background({}, "disk_config_upload_begin", begin)["error"]["code"] == "UNAUTHENTICATED", "upload authorization");
+    auto upload = dispatcher.execute_background(admin, "disk_config_upload_begin", begin);
+    check(upload["success"] == true, "disk upload begin");
+    dispatcher.set_disk_config(&service); // Idempotent binding retains the shared manager.
+    Json::Value chunk; chunk["upload_id"] = upload["upload_id"]; chunk["offset"] = 0; chunk["data"] = "eyJkaXNrcyI6W119";
+    check(dispatcher.execute_background(admin, "disk_config_upload_append", chunk)["received"] == 12, "disk upload strict base64 adapter");
+    Json::Value commit; commit["upload_id"] = upload["upload_id"];
+    check(dispatcher.execute_background(admin, "disk_config_upload_commit", commit)["persisted"] == true, "disk upload acknowledgement reports durable version");
+    check(dispatcher.execute_background(admin, "disk_config_upload_commit", commit)["error"]["code"] == "NOT_FOUND", "disk upload consumed once");
     TaskService different;
     RequestDispatcher wrong(system, different);
     refused = false;
     try { wrong.set_disk_config(&service); } catch (const std::invalid_argument&) { refused = true; }
     check(refused, "adapter rejects events from another service");
+}
+void disk_upload_capacity_and_domains() {
+    Temporary temp;
+    DiskConfigService disks(temp.directory.get(), getuid());
+    VmConfigService vms(temp.directory.get(), getuid());
+    NetworkConfigService networks(temp.directory.get(), getuid());
+    ConfigUploads::Clock::time_point now{};
+    ConfigUploads uploads(&vms, &networks, [&] { return now; }, {}, &disks);
+    auto base = disks.snapshot(admin);
+    auto wanted = document(); wanted["blob"] = "";
+    wanted["blob"] = std::string(DiskConfigService::max_bytes - config::encode_json(wanted).size(), 'x');
+    const auto bytes = config::encode_json(wanted);
+    auto disk = uploads.begin_disk(admin, base->revision, bytes.size());
+    auto vm = uploads.begin(admin, vms.snapshot(admin)->revision, VmConfigService::max_bytes);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_network(admin, 8u << 20); });
+    auto network = uploads.begin_network(admin, 2);
+    auto fourth = uploads.begin_disk(admin, base->revision, 2);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_disk(admin, base->revision, 2); });
+    error(ErrorCode::not_found, [&] { uploads.append_network(admin, disk, 0, "{}"); });
+    error(ErrorCode::permission_denied, [&] { uploads.abort_disk({"another-admin", true, true, true}, disk); });
+    uploads.abort(admin, vm); uploads.abort_network(admin, network); uploads.abort_disk(admin, fourth);
+    for (size_t offset = 0; offset < bytes.size(); offset += ConfigUploads::chunk_bytes) {
+        auto chunk = std::string_view(bytes).substr(offset, ConfigUploads::chunk_bytes);
+        const auto received = uploads.append_disk(admin, disk, offset, chunk);
+        check(uploads.append_disk(admin, disk, offset, chunk) == received, "disk duplicate chunk is idempotent");
+    }
+    auto saved = uploads.commit_disk(admin, disk);
+    check(saved->document == wanted, "full eight MiB disk upload uses shared staging");
+    error(ErrorCode::not_found, [&] { uploads.commit_disk(admin, disk); });
+    disk = uploads.begin_disk(admin, saved->revision, 2);
+    now += ConfigUploads::lifetime;
+    error(ErrorCode::not_found, [&] { uploads.append_disk(admin, disk, 0, "{}"); });
+}
+void disk_upload_conflicts_and_failures() {
+    Temporary temp;
+    std::string fault;
+    DiskConfigService disks(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fault == stage) throw std::runtime_error("disk upload fault");
+    });
+    ConfigUploads uploads(nullptr, nullptr, [] { return ConfigUploads::Clock::now(); }, {}, &disks);
+    auto stage = [&](const std::string& revision, const std::string& bytes) {
+        auto id = uploads.begin_disk(admin, revision, bytes.size());
+        uploads.append_disk(admin, id, 0, bytes); return id;
+    };
+    auto wanted = document(); auto base = disks.snapshot(admin);
+    auto stale = stage(base->revision, config::encode_json(wanted));
+    base = disks.replace(admin, base->revision, wanted);
+    error(ErrorCode::conflict, [&] { uploads.commit_disk(admin, stale); });
+    error(ErrorCode::not_found, [&] { uploads.commit_disk(admin, stale); });
+    auto invalid = stage(base->revision, "{\"disks\":[],\"disks\":[]}");
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_disk(admin, invalid); });
+    check(disks.snapshot(admin)->revision == base->revision, "invalid upload does not publish");
+    for (const auto* boundary : {"before_install", "installed"}) {
+        wanted["fault"] = boundary; fault = boundary;
+        auto id = stage(base->revision, config::encode_json(wanted));
+        const bool installed = fault == "installed";
+        error(installed ? ErrorCode::commit_uncertain : ErrorCode::io_error, [&] { uploads.commit_disk(admin, id); });
+        error(ErrorCode::not_found, [&] { uploads.commit_disk(admin, id); });
+        check((disks.snapshot(admin)->revision != base->revision) == installed, "upload preserves correct installed outcome");
+    }
 }
 }
 int main() {
@@ -278,5 +351,7 @@ int main() {
         {"disk_registry_twelve_writers_and_drain", concurrent_writers_and_drain},
         {"disk_registry_full_capacity_semantic_corruption", full_capacity_and_semantic_corruption},
         {"disk_registry_snapshot_events_recovery", snapshot_publication_and_recovery},
-        {"disk_registry_read_adapter_binding", disk_read_adapter_and_binding}});
+        {"disk_registry_read_adapter_binding", disk_read_adapter_and_binding},
+        {"disk_upload_full_capacity_shared_domains", disk_upload_capacity_and_domains},
+        {"disk_upload_conflict_strict_parse_failures", disk_upload_conflicts_and_failures}});
 }

@@ -100,7 +100,7 @@ add_library(droidvm_vm_config STATIC services/vm_config.cpp services/vm_config_u
 add_library(droidvm_disk_config STATIC services/disk_config.cpp)
 target_link_libraries(droidvm_disk_config PUBLIC droidvm_config droidvm_tasks)
 target_compile_options(droidvm_disk_config PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(droidvm_vm_config PUBLIC droidvm_config droidvm_tasks droidvm_network_config)
+target_link_libraries(droidvm_vm_config PUBLIC droidvm_config droidvm_tasks droidvm_network_config droidvm_disk_config)
 target_compile_options(droidvm_vm_config PRIVATE -Wall -Wextra -Werror)
 add_library(droidvm_network_backend STATIC network/netbox.cpp network/netlink.cpp network/links.cpp network/link_attributes.cpp network/policy_rules.cpp network/routes.cpp network/control_http.cpp network/helper_config.cpp network/helper_ready.cpp network/gvswitch.cpp network/bridgedhcp.cpp network/pd_state.cpp network/switch_runtime.cpp network/linux_topology.cpp network/linux_plan.cpp network/linux_routing.cpp network/linux_firewall.cpp network/linux_bridge.cpp network/pd_ownership.cpp network/ports.cpp network/pbridge.cpp network/host_watch.cpp network/forwarding.cpp network/firewall.cpp network/host_discovery.cpp services/network.cpp services/network_host.cpp services/vm.cpp services/configuration.cpp services/legacy_events.cpp vm/runtime.cpp)
 target_link_libraries(droidvm_network_backend PUBLIC droidvm_network_config droidvm_vm_config droidvm_disk_config droidvm_managed_process droidvm_helper_identity droidvm_vm)

@@ -47,6 +47,33 @@ std::string ConfigUploads::begin_network(const CallContext& caller, size_t bytes
         throw ServiceError(ErrorCode::invalid_argument, "Invalid network import size");
     return begin_impl(caller, "", bytes, Kind::network);
 }
+std::string ConfigUploads::begin_disk(const CallContext& caller, const std::string& revision, size_t bytes) {
+    access(caller);
+    if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk configuration is unavailable");
+    if (revision.empty() || revision.size() > 128 || !bytes || bytes > DiskConfigService::max_bytes)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid disk upload revision or size");
+    if (disks_->snapshot(caller)->revision != revision)
+        throw ServiceError(ErrorCode::conflict, "Disk registry changed; reload before saving");
+    return begin_impl(caller, revision, bytes, Kind::disk);
+}
+size_t ConfigUploads::append_disk(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+    return append_impl(caller, id, offset, bytes, Kind::disk);
+}
+DiskConfigService::Snapshot ConfigUploads::commit_disk(const CallContext& caller, const std::string& id) {
+    DiskConfigService::Snapshot result;
+    consume(caller, id, Kind::disk, [&](const std::string& revision, std::string_view bytes) {
+        if (disks_->snapshot(caller)->revision != revision)
+            throw ServiceError(ErrorCode::conflict, "Disk registry changed; reload before saving");
+        Json::Value document;
+        try { document = config::parse_json(bytes); }
+        catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid uploaded disk registry JSON"); }
+        result = disks_->replace(caller, revision, std::move(document));
+    });
+    return result;
+}
+void ConfigUploads::abort_disk(const CallContext& caller, const std::string& id) {
+    abort_impl(caller, id, Kind::disk);
+}
 std::string ConfigUploads::begin_delete(const CallContext& caller, const std::string& revision, size_t bytes) {
     access(caller);
     if (!deletion_ || !store_) throw ServiceError(ErrorCode::unavailable, "Coordinated network deletion is unavailable");

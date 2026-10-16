@@ -50,15 +50,19 @@ public:
         if (!service || service->events() != &tasks_ || (disk_config_ && disk_config_ != service))
             throw std::invalid_argument("Disk registry adapter participants do not match");
         disk_config_ = service;
+        if (!vm_uploads_) vm_uploads_ = std::make_unique<ConfigUploads>(vm_config_, networks_);
+        vm_uploads_->bind_disks(service);
     }
     // Startup binding only; service outlives dispatcher and in-flight workers.
     void set_vm_config(VmConfigService* service) {
         if (configuration_ && service != &configuration_->vms()) throw std::invalid_argument("Cannot replace coordinated VM configuration");
         if (configuration_) return;
-        vm_uploads_ = service || networks_ ? std::make_unique<ConfigUploads>(service, networks_) : nullptr;
+        if (vm_config_ == service && vm_uploads_) return;
+        vm_uploads_ = service || networks_ || disk_config_ ? std::make_unique<ConfigUploads>(service, networks_,
+            [] { return ConfigUploads::Clock::now(); }, ConfigUploads::DeleteNetwork{}, disk_config_) : nullptr;
         vm_config_ = service;
     }
-    // Startup only. One staging manager shares all quotas across three domains.
+    // Startup only. One staging manager shares all configuration upload quotas.
     void set_configuration(ConfigurationService* service) {
         if (!service || configuration_ || networks_ != &service->networks() || vms_ != &service->inventory() || &tasks_ != &service->events())
             throw std::invalid_argument("Configuration adapter participants do not match");
@@ -66,7 +70,7 @@ public:
         vm_uploads_ = std::make_unique<ConfigUploads>(vm_config_, networks_, [] { return ConfigUploads::Clock::now(); },
             [service, lifecycle = runtime_](const CallContext& caller, const std::string& revision, const Json::Value& expected) {
                 return service->remove_network(caller, revision, expected, lifecycle);
-            });
+            }, disk_config_);
         configuration_ = service;
     }
     bool background(const std::string& command) const;

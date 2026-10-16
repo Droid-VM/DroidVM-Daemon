@@ -21,6 +21,8 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists",
     "network_config_get", "network_config_update"};
 constexpr std::array vm_upload_commands{"vm_config_upload_begin", "vm_config_upload_append", "vm_config_upload_commit", "vm_config_upload_abort"};
+constexpr std::array disk_upload_commands{"disk_config_upload_begin", "disk_config_upload_append", "disk_config_upload_commit", "disk_config_upload_abort"};
+bool disk_upload_command(const std::string& command) { return std::find(disk_upload_commands.begin(), disk_upload_commands.end(), command) != disk_upload_commands.end(); }
 constexpr std::array network_upload_commands{"network_config_import_begin", "network_config_import_append", "network_config_import_commit", "network_config_import_abort"};
 constexpr std::array delete_upload_commands{"network_config_delete_begin", "network_config_delete_append", "network_config_delete_commit", "network_config_delete_abort"};
 bool delete_upload_command(const std::string& command) { return std::find(delete_upload_commands.begin(), delete_upload_commands.end(), command) != delete_upload_commands.end(); }
@@ -171,6 +173,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
+    if (disk_config_ && disk_upload_command(command)) return true;
     if (configuration_ && configuration_command(command)) return true;
     if (networks_ && network_upload_command(command)) return true;
     return (vm_config_ && (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
@@ -254,25 +257,38 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         catch (...) { return failure(ServiceError(ErrorCode::internal, "VM start outcome is unknown; reload state before retrying")); }
     }
     const bool network_upload = networks_ && network_upload_command(command);
-    if (vm_uploads_ && (network_upload || (vm_config_ && vm_upload_command(command)))) {
+    const bool disk_upload = disk_config_ && disk_upload_command(command);
+    if (vm_uploads_ && (disk_upload || network_upload || (vm_config_ && vm_upload_command(command)))) {
         try {
             if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
             if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
             if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Upload request must be an object");
+            if (disk_upload) {
+                const bool begin = command == "disk_config_upload_begin", append = command == "disk_config_upload_append";
+                for (const auto& key : request.getMemberNames()) {
+                    if (key == "type" || key == "command" || key == "request_id") continue;
+                    if ((begin && (key == "revision" || key == "bytes")) || (!begin && key == "upload_id")
+                        || (append && (key == "offset" || key == "data"))) continue;
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected disk upload field");
+                }
+            }
             Json::Value result; result["success"] = true;
-            if (command == "vm_config_upload_begin" || command == "network_config_import_begin") {
-                result["upload_id"] = network_upload ? vm_uploads_->begin_network(caller, size_field(request, "bytes", 0))
+            if (command == "vm_config_upload_begin" || command == "network_config_import_begin" || command == "disk_config_upload_begin") {
+                result["upload_id"] = disk_upload ? vm_uploads_->begin_disk(caller, string_field(request, "revision"), size_field(request, "bytes", 0))
+                    : network_upload ? vm_uploads_->begin_network(caller, size_field(request, "bytes", 0))
                     : vm_uploads_->begin(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
                 result["chunk_bytes"] = Json::UInt64(VmConfigUploads::chunk_bytes);
                 result["expires_in_seconds"] = 120;
             } else {
                 const auto id = string_field(request, "upload_id");
                 if (command == "vm_config_upload_commit") return config_status(vm_uploads_->commit(caller, id));
+                if (command == "disk_config_upload_commit") return config_status(vm_uploads_->commit_disk(caller, id), "disks");
                 if (command == "network_config_import_commit") {
                     result["network_ids"] = vm_uploads_->commit_network(caller, id);
                     return result;
                 }
                 if (command == "vm_config_upload_abort") vm_uploads_->abort(caller, id);
+                else if (command == "disk_config_upload_abort") vm_uploads_->abort_disk(caller, id);
                 else if (command == "network_config_import_abort") vm_uploads_->abort_network(caller, id);
                 else {
                     if (!request["data"].isString() || !request.isMember("offset"))
@@ -280,7 +296,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                     std::string bytes;
                     try { bytes = wire::decode_base64(request["data"].asString(), VmConfigUploads::chunk_bytes); }
                     catch (const std::exception&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid base64 upload chunk"); }
-                    result["received"] = Json::UInt64(network_upload
+                    result["received"] = Json::UInt64(disk_upload ? vm_uploads_->append_disk(caller, id, size_field(request, "offset", 0), bytes) : network_upload
                         ? vm_uploads_->append_network(caller, id, size_field(request, "offset", 0), bytes)
                         : vm_uploads_->append(caller, id, size_field(request, "offset", 0), bytes));
                 }
@@ -634,7 +650,7 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
         && !(configuration_ && configuration_command(command))
-        && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot"))) {
+        && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot" || disk_upload_command(command)))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
             result["service_api_minor"] = 1;
@@ -748,7 +764,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["disk_config_persistence"] = true;
                 result["disk_config_snapshot"] = "base64-json-chunks-v1";
                 result["disk_config_events"] = "invalidation-v1";
-                result["service_api_minor"] = 22;
+                for (const auto* name : disk_upload_commands) result["commands"].append(name);
+                result["disk_config_upload"] = "revisioned-chunks-v1";
+                result["service_api_minor"] = 23;
             }
         }
         return result;
@@ -759,6 +777,8 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         Json::Value result;
         result["success"] = true;
         if (configuration_ && configuration_command(command)) {
+            return execute_background(caller, command, request);
+        } else if (disk_config_ && disk_upload_command(command)) {
             return execute_background(caller, command, request);
         } else if (command == "disk_config_status") {
             return config_status(disk_config_->snapshot(caller), "disks");

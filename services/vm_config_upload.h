@@ -2,6 +2,7 @@
 #pragma once
 #include "vm_config.h"
 #include "network_config.h"
+#include "disk_config.h"
 #include <chrono>
 #include <map>
 #include <vector>
@@ -21,8 +22,17 @@ public:
     static constexpr auto lifetime = std::chrono::minutes(2);
     explicit ConfigUploads(VmConfigService& store, Now now = [] { return Clock::now(); })
         : ConfigUploads(&store, nullptr, std::move(now)) {}
-    ConfigUploads(VmConfigService* store, NetworkConfigService* networks, Now now = [] { return Clock::now(); }, DeleteNetwork deletion = {})
-        : store_(store), networks_(networks), now_(std::move(now)), deletion_(std::move(deletion)) {}
+    ConfigUploads(VmConfigService* store, NetworkConfigService* networks, Now now = [] { return Clock::now(); }, DeleteNetwork deletion = {}, DiskConfigService* disks = nullptr)
+        : store_(store), networks_(networks), disks_(disks), now_(std::move(now)), deletion_(std::move(deletion)) {}
+    // Startup binding; preserve the single quota manager and any existing domain.
+    void bind_disks(DiskConfigService* disks) {
+        if (!disks || (disks_ && disks_ != disks)) throw std::invalid_argument("Cannot replace disk upload participant");
+        disks_ = disks;
+    }
+    std::string begin_disk(const CallContext& caller, const std::string& revision, size_t bytes);
+    size_t append_disk(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes);
+    DiskConfigService::Snapshot commit_disk(const CallContext& caller, const std::string& id);
+    void abort_disk(const CallContext& caller, const std::string& id);
     std::string begin(const CallContext& caller, const std::string& revision, size_t bytes);
     // Exact contiguous byte offsets; repeated identical chunks are idempotent.
     size_t append(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes);
@@ -37,7 +47,7 @@ public:
     DeletedNetwork commit_delete(const CallContext& caller, const std::string& id);
     void abort_delete(const CallContext& caller, const std::string& id);
 private:
-    enum class Kind { vm, network, network_delete };
+    enum class Kind { vm, network, network_delete, disk };
     struct Upload {
         std::string principal, revision;
         std::vector<char> data;
@@ -48,6 +58,7 @@ private:
     };
     VmConfigService* store_;
     NetworkConfigService* networks_;
+    DiskConfigService* disks_;
     Now now_;
     DeleteNetwork deletion_;
     std::mutex mutex_;
