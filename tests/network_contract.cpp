@@ -96,6 +96,52 @@ void extension_merge_and_null() {
     check(result.isMember("extension") && result["extension"].isNull() && result["l3"]["future_section"].asBool() && !result["l3"].isMember("vlans"),
           "explicit null and removal of known fields remain distinct");
 }
+void conditional_updates() {
+    Temporary temp;
+    std::string fail;
+    NetworkConfigService service(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (fail == stage) throw std::runtime_error("injected write failure");
+    });
+    const auto id = service.create(admin, network("original"));
+    const auto observed = service.get(admin, id);
+    auto edited = observed; edited["name"] = "edited";
+    error(ErrorCode::unauthenticated, [&] { service.update_if_matches({}, observed, edited); });
+    error(ErrorCode::permission_denied, [&] { service.update_if_matches(owner, observed, edited); });
+    error(ErrorCode::invalid_argument, [&] { service.update_if_matches(admin, {}, edited); });
+    auto projected = observed; projected["state"] = "stopped";
+    error(ErrorCode::conflict, [&] { service.update_if_matches(admin, projected, edited); });
+    service.create(admin, network("unrelated"));
+    fail = "before_install";
+    error(ErrorCode::io_error, [&] { service.update_if_matches(admin, observed, edited); });
+    check(service.get(admin, id) == observed, "pre-install failure retains expected configuration");
+    fail = "installed";
+    error(ErrorCode::commit_uncertain, [&] { service.update_if_matches(admin, observed, edited); });
+    check(service.get(admin, id) == edited, "uncertain installed write publishes new configuration");
+    fail.clear();
+    error(ErrorCode::conflict, [&] { service.update_if_matches(admin, observed, edited); });
+    const auto lease = service.prepare_runtime(admin, id);
+    auto current = service.get(admin, id);
+    error(ErrorCode::conflict, [&] { service.update_if_matches(admin, current, current); });
+}
+void conditional_update_race() {
+    Temporary temp;
+    NetworkConfigService service(temp.directory.get(), getuid());
+    const auto id = service.create(admin, network("before"));
+    const auto observed = service.get(admin, id);
+    std::atomic<int> updated{0}, conflicts{0}, failures{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 12; ++i) threads.emplace_back([&, i] {
+        auto edited = observed; edited["name"] = "writer-" + std::to_string(i);
+        try { service.update_if_matches(admin, observed, edited); ++updated; }
+        catch (const ServiceError& error) { if (error.code() == ErrorCode::conflict) ++conflicts; else ++failures; }
+        catch (...) { ++failures; }
+    });
+    for (auto& thread : threads) thread.join();
+    check(updated == 1 && conflicts == 11 && failures == 0, "one conditional update wins under the writer lock");
+    auto current = service.get(admin, id);
+    service.remove(admin, id);
+    error(ErrorCode::not_found, [&] { service.update_if_matches(admin, current, current); });
+}
 void concurrent_creation() {
     Temporary temp;
     NetworkConfigService service(temp.directory.get(), getuid());
@@ -472,6 +518,8 @@ int main(int argc, char** argv) {
         catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
     }
     return run({{"migration_opaque_identity_permissions", migration_retention_identity}, {"nested_extensions_vlan_identity_null", extension_merge_and_null},
+        {"conditional_update_failures_and_runtime", conditional_updates},
+        {"twelve_conditional_update_writers", conditional_update_race},
         {"twelve_concurrent_duplicate_creates", concurrent_creation}, {"read_snapshot_io_failure_commit_uncertain", commit_visibility_and_failure},
         {"network_snapshot_replay_failure_permissions", configuration_event_handoff},
         {"network_snapshot_races_shared_limits", configuration_snapshot_races_and_limits},

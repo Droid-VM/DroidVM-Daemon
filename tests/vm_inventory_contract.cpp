@@ -64,6 +64,42 @@ void replacement_and_failure() {
     check(!service.exists(admin, id) && !replacement->start() && fixture.starts == 2, "removed reference cannot restart");
     check(!service.remove(admin, id), "unknown deletion retains legacy false result");
 }
+void conditional_network_adapter() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    TaskService tasks;
+    NetworkConfigService networks(directory.get(), getuid(), {}, &tasks);
+    SystemService system([] { return true; }, [] { return "test"; }, "test", tasks.epoch());
+    RequestDispatcher dispatcher(system, tasks, &networks);
+    ClientSession session; session.caller.authorized = true;
+    const auto caps = dispatcher.execute(session, "capabilities", {});
+    check(caps["network_config_update"] == "compare-config-v1" && caps["service_api_minor"] == 17,
+        "conditional network edit capability is advertised");
+    check(dispatcher.background("network_config_get") && dispatcher.background("network_config_update"),
+        "configuration operations use bounded workers");
+    auto value = config("network"); value["schema"] = 2; value["bridge_name"] = "brtest";
+    const auto id = networks.create(admin, value);
+    Json::Value read; read["network_id"] = id;
+    auto response = dispatcher.execute_background(admin, "network_config_get", read);
+    check(response["success"] == true && response["config"] == networks.get(admin, id)
+        && !response["config"].isMember("state"), "read returns exact configuration without runtime projection");
+    Json::Value update;
+    update["type"] = "request"; update["command"] = "network_config_update"; update["request_id"] = "request";
+    update["expected"] = response["config"]; update["config"] = response["config"];
+    update["config"]["name"] = "updated";
+    auto expect_error = [&](const CallContext& caller, const Json::Value& request, const char* code) {
+        const auto result = dispatcher.execute_background(caller, "network_config_update", request);
+        check(result["success"] == false && result["error"]["code"] == code, "structured conditional edit error");
+    };
+    expect_error({}, update, "UNAUTHENTICATED");
+    expect_error(owner, update, "PERMISSION_DENIED");
+    expect_error(admin, Json::Value(Json::arrayValue), "INVALID_ARGUMENT");
+    expect_error(admin, Json::Value(Json::objectValue), "INVALID_ARGUMENT");
+    response = dispatcher.execute_background(admin, "network_config_update", update);
+    check(response["success"] == true && response["network_id"] == id, "conditional adapter accepts request envelope");
+    expect_error(admin, update, "CONFLICT");
+    check(networks.get(admin, id)["name"] == "updated", "stale request cannot overwrite target");
+}
 void network_removal_is_atomic() {
     Fixture fixture;
     VmService service(fixture.context);
@@ -497,6 +533,7 @@ void revisioned_batch_adapter() {
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
         {"network_removal_atomic_inventory", network_removal_is_atomic},
+        {"conditional_network_config_adapter", conditional_network_adapter},
         {"sixteen_network_removal_start_races", network_removal_races},
         {"session_overrides_failed_admission", session_overrides_and_failed_admission},
         {"invalid_session_overrides", invalid_session_overrides},

@@ -146,6 +146,11 @@ bool NetworkConfigService::exists(const CallContext& caller, const std::string& 
 }
 std::string NetworkConfigService::create(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), false); }
 std::string NetworkConfigService::update(const CallContext& caller, Json::Value value) { return change(caller, std::move(value), true); }
+std::string NetworkConfigService::update_if_matches(const CallContext& caller, const Json::Value& expected, Json::Value value) {
+    access(caller);
+    if (!expected.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Expected network configuration is required");
+    return change(caller, std::move(value), true, &expected);
+}
 bool NetworkConfigService::remove(const CallContext& caller, const std::string& input_id) {
     access(caller);
     const auto id = identity(input_id);
@@ -228,7 +233,7 @@ std::unique_ptr<NetworkRuntimeLease> NetworkConfigService::prepare_runtime(const
         install(decode(std::move(document), false));
     return std::unique_ptr<NetworkRuntimeLease>(new NetworkRuntimeLease(runtime_, id, prepared, mac));
 }
-std::string NetworkConfigService::change(const CallContext& caller, Json::Value value, bool updating) {
+std::string NetworkConfigService::change(const CallContext& caller, Json::Value value, bool updating, const Json::Value* expected) {
     access(caller);
     std::string id;
     try {
@@ -251,6 +256,8 @@ std::string NetworkConfigService::change(const CallContext& caller, Json::Value 
     auto found = previous->ids.find(id);
     if (updating && found == previous->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
     if (!updating && found != previous->ids.end()) throw ServiceError(ErrorCode::conflict, "Network already exists");
+    if (expected && previous->document["networks"][found->second] != *expected)
+        throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before saving");
     if (updating) require_stopped(id);
     auto document = previous->document;
     auto& rows = document["networks"];

@@ -18,7 +18,8 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe",
                               "network_config_snapshot", "resource_snapshot_page", "resource_snapshot_release",
                               "resource_subscribe", "resource_unsubscribe"};
-constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
+constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists",
+    "network_config_get", "network_config_update"};
 constexpr std::array vm_upload_commands{"vm_config_upload_begin", "vm_config_upload_append", "vm_config_upload_commit", "vm_config_upload_abort"};
 bool vm_upload_command(const std::string& command) { return std::find(vm_upload_commands.begin(), vm_upload_commands.end(), command) != vm_upload_commands.end(); }
 bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || command == "vm_start_configured" || vm_upload_command(command); }
@@ -242,7 +243,11 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     }
     Json::Value result;
     result["success"] = false;
-    if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
+    if (!caller.authenticated) {
+        if (command == "network_config_get" || command == "network_config_update")
+            return failure(ServiceError(ErrorCode::unauthenticated, "Authentication required"));
+        result["message"] = "client is not authorized to perform this action"; return result;
+    }
     if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
     if (packages_ && package_command(command)) {
         // ExportHandler/ImportHandler: RequestException texts, else "internal error".
@@ -283,6 +288,8 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             return result;
         }
         if (!networks_) { result["message"] = "internal error"; return result; }
+        if ((command == "network_config_get" || command == "network_config_update") && !request.isObject())
+            throw ServiceError(ErrorCode::invalid_argument, "Network configuration request must be an object");
         if (runtime_ && runtime_command(command)) {
             const auto id = legacy_id(request);
             if (id.empty()) { result["message"] = "missing network_id"; return result; }
@@ -344,7 +351,12 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             }
             result["success"] = true; return result;
         }
-        if (command == "network_create" || command == "network_modify") {
+        if (command == "network_config_get") {
+            if (!request["network_id"].isString()) throw ServiceError(ErrorCode::invalid_argument, "network_id is required");
+            result["config"] = networks_->get(caller, request["network_id"].asString());
+        } else if (command == "network_config_update") {
+            result["network_id"] = networks_->update_if_matches(caller, request["expected"], request["config"]);
+        } else if (command == "network_create" || command == "network_modify") {
             if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
             result["network_id"] = command == "network_create" ? networks_->create(caller, request["config"]) : networks_->update(caller, request["config"]);
         } else if (command == "network_list") {
@@ -384,6 +396,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         return result;
     } catch (const ServiceError& error) {
         if (runtime_command(command)) return failure(error);
+        if (command == "network_config_get" || command == "network_config_update") return failure(error);
         if (runtime_ && command == "network_modify" && error.code() == ErrorCode::conflict) return failure(error);
         if (host_command(command)) return failure(error);
         if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::io_error || error.code() == ErrorCode::resource_exhausted)
@@ -393,7 +406,11 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         else if (command == "network_info" && error.code() == ErrorCode::not_found) result["message"] = "network not found";
         else result["message"] = "internal error";
         return result;
-    } catch (...) { result["message"] = "internal error"; return result; }
+    } catch (...) {
+        if (command == "network_config_get" || command == "network_config_update")
+            return failure(ServiceError(ErrorCode::internal, "Network configuration result unknown; reload before retrying"));
+        result["message"] = "internal error"; return result;
+    }
 }
 Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request) {
     Json::Value result;
@@ -645,6 +662,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                     result["vm_config_start"] = "revisioned-session-v1";
                     result["service_api_minor"] = 16;
                 }
+            }
+            if (networks_) {
+                result["network_config_update"] = "compare-config-v1";
+                result["service_api_minor"] = 17;
             }
         }
         return result;

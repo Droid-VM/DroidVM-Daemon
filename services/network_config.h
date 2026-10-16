@@ -37,6 +37,10 @@ public:
     bool exists(const CallContext& caller, const std::string& id) const;
     std::string create(const CallContext& caller, Json::Value value);
     std::string update(const CallContext& caller, Json::Value value);
+    // Compare the exact configuration returned by get(), under the writer lock.
+    // Runtime projections are not valid expectations. No implicit retry/merge
+    // with a concurrently changed target; unrelated network edits are allowed.
+    std::string update_if_matches(const CallContext& caller, const Json::Value& expected, Json::Value value);
     bool remove(const CallContext& caller, const std::string& id); // false when unknown; conflict while reserved
     // Persist stable Linux MAC/DUID/PD table identities before returning a
     // runtime lease. occupied_tables excludes host tables from NEW allocation;
@@ -62,7 +66,7 @@ private:
     std::shared_ptr<NetworkRuntimeLease::Registry> runtime_;
     std::shared_ptr<const State> state() const;
     static std::shared_ptr<State> decode(Json::Value document, bool recovered);
-    std::string change(const CallContext& caller, Json::Value value, bool update);
+    std::string change(const CallContext& caller, Json::Value value, bool update, const Json::Value* expected = nullptr);
     void install(std::shared_ptr<State> next);
     void publish(std::shared_ptr<State> next);
     void require_stopped(const std::string& id) const;
