@@ -189,6 +189,10 @@ void atomic_restore_and_order() {
         iptables.insert(foreign.rule, foreign.tag);
         iptables.replace({}, {first, second});
         check(iptables.at_head({first, second}) && iptables.contains(foreign.rule, foreign.tag), "ordered transaction preserves foreign tail");
+        check(iptables.contains_all({first, second}) && iptables.at_head({first, second}), "successful complete-spec test transaction does not delete rules");
+        check(!iptables.contains_all({first, missing}) && iptables.at_head({first, second}), "failed test transaction also preserves every rule");
+        auto modified = first; modified.rule.target = "ACCEPT";
+        check(!iptables.contains_all({modified}) && iptables.contains(first.rule, first.tag), "batch presence check rejects changed rule semantics without mutation");
         error(ErrorCode::io_error, [&] { iptables.replace({first, missing}, {}); });
         check(iptables.at_head({first, second}) && iptables.contains(first.rule, first.tag), "failed complete-spec deletion rolls back earlier deletion");
         auto wrong_family = second; wrong_family.rule = rule(!ipv6);
@@ -403,13 +407,64 @@ void actual_daemon_recovery() {
     while (access((test.path + "/droidvmd-port.txt").c_str(), F_OK) < 0 && !batch_process.poll_exit() && std::chrono::steady_clock::now() < batch_deadline)
         std::this_thread::sleep_for(10ms);
     check(!batch_process.poll_exit() && access((test.path + "/droidvmd-port.txt").c_str(), F_OK) == 0, "actual daemon accepts recovered batch inventory");
-    for (const auto& row : pending.inventory()["rules"])
+    const auto pending_inventory = pending.inventory();
+    for (const auto& row : pending_inventory["rules"])
         check(!test.iptables.tagged(FirewallRule::from(row["rule"]), row["tag"].asString()), "actual daemon removes both atomic generations before readiness");
     check(batch_process.signal(SIGTERM) && batch_process.communicate({}, 3s).exit_code == 128 + SIGTERM, "batch recovered daemon exits normally");
     test.finish();
 }
 void packets() { firewall_packet_contract(executable, directory); }
 void planned_packets() { linux_firewall_packet_contract(executable, directory); }
+void coordinated_packets() { linux_firewall_coordinator_packets(executable, directory); }
+Json::Value coordinator_config(const std::string& bridge) {
+    auto config = wire::parse(R"({"schema":2,"name":"coordinator","bridge_type":"linux","uplink_mode":"l3","l3":{"vlans":[]}})");
+    config["id"] = random_id(true); config["bridge_name"] = bridge; return config;
+}
+void shared_coordinator_lifecycle() {
+    std::cerr << "coordinator: shared lifecycle" << std::endl;
+    Case test; OwnedFirewall owned(test.fd.get(), getuid(), test.iptables);
+    int transitions = 0;
+    LinuxFirewall coordinator(owned, [&](const char*) { ++transitions; });
+    auto first = coordinator_config("brfirst"), second = coordinator_config("brsecond");
+    owned.put("independent", "foreign", rule()); const auto foreign = tag(owned, "foreign");
+    coordinator.set(first); coordinator.set(second);
+    check(coordinator.ready(), "multiple network plans published by one coordinator");
+    const auto inventory = owned.inventory(); const auto before = transitions;
+    coordinator.refresh(); coordinator.set(first);
+    check(coordinator.ready() && before == transitions && owned.inventory() == inventory, "unchanged refresh preserves tags and performs no publication");
+    error(ErrorCode::conflict, [&] { LinuxFirewall duplicate(owned); });
+    Json::Value displaced;
+    for (const auto& row : inventory["rules"]) if (row["owner"] == LinuxFirewall::owner_key && row["rule"]["chain"] == "OUTPUT") { displaced = row; break; }
+    const auto desired = FirewallRule::from(displaced["rule"]); const auto identity = displaced["tag"].asString();
+    test.iptables.erase(desired, identity); coordinator.refresh();
+    check(coordinator.ready() && transitions > before, "kernel drift repaired through guarded shared publication");
+    coordinator.remove(first["id"].asString()); // no links were created by this fixture
+    const auto remaining = owned.inventory();
+    for (const auto& row : remaining["rules"]) if (row["owner"] == LinuxFirewall::owner_key)
+        check(row["rule"]["input"] != "brfirst" && row["rule"]["output"] != "brfirst", "departed network policy removed without deleting other owner");
+    check(test.iptables.contains(rule(), foreign), "unrelated firewall ownership survives coordinator updates");
+    coordinator.stop(); coordinator.stop(); check(!coordinator.ready(), "stopped coordinator is not ready");
+    error(ErrorCode::conflict, [&] { coordinator.refresh(); });
+    error(ErrorCode::conflict, [&] { coordinator.set(first); });
+    check(owned.inventory()["rules"].size() == 1, "stop retires all coordinator rules only");
+    test.finish();
+}
+void coordinator_crash_boundaries() {
+    for (const auto* stage : {"linux_firewall_guard4", "linux_firewall_guard6", "linux_firewall_nat4", "linux_firewall_mangle4",
+                             "linux_firewall_filter4", "linux_firewall_filter6"}) {
+        std::cerr << "coordinator crash boundary: " << stage << std::endl;
+        Case test;
+        ChildOptions options; options.argv = {"/proc/self/exe", "--firewall-crash", test.path, "4", stage};
+        const auto output = Child(options).communicate({}, 15s);
+        check(output.exit_code == -SIGKILL && !output.timed_out, "kill coordinator between actual table publications");
+        OwnedFirewall recovered(test.fd.get(), getuid(), test.iptables); const auto before = recovered.inventory();
+        error(ErrorCode::conflict, [&] { LinuxFirewall premature(recovered); });
+        check(recovered.recover_all().empty(), "existing recovery handles partial multi-table publications");
+        for (const auto& row : before["rules"]) check(!test.iptables.tagged(FirewallRule::from(row["rule"]), row["tag"].asString()), "no recorded coordinator rule survives recovery");
+        LinuxFirewall clean(recovered); clean.refresh(); check(clean.ready(), "coordinator can be recreated after ownership recovery");
+        test.finish();
+    }
+}
 void prefix_rules_and_old_journal() {
     Case test; OwnedFirewall owned(test.fd.get(), getuid(), test.iptables);
     for (const bool ipv6 : {false, true}) {
@@ -475,21 +530,24 @@ void linux_policy_plan() {
         "L2 is exactly one IPv4 bridge pair without L3 or prefix rules");
 }
 }
-void firewall_namespace_contract(const std::string& netbox, const std::string& work, const std::string& daemon, bool planned) {
-    const auto path = work + (planned ? "/linux-firewall" : "/firewall");
+void firewall_namespace_contract(const std::string& netbox, const std::string& work, const std::string& daemon, FirewallSuite suite) {
+    const std::string name = suite == FirewallSuite::coordinator ? "linux-firewall-coordinator" : suite == FirewallSuite::plan ? "linux-firewall-namespace" : "firewall-namespace";
+    const auto path = work + "/" + name;
     check(mkdir(path.c_str(), 0700) == 0, "create firewall namespace fixture");
-    ChildOptions options; options.argv = {"/proc/self/exe", planned ? "--linux-firewall-namespace" : "--firewall-namespace", netbox, path, daemon};
+    ChildOptions options; options.argv = {"/proc/self/exe", "--" + name, netbox, path, daemon};
     const auto result = Child(options).communicate({}, 60s);
     std::cerr << "isolated firewall contracts: " << result.output << result.error << std::endl;
     check(result.exit_code == 0 && !result.timed_out && wire::parse(result.output)["passed"] == true, "isolated firewall contracts pass");
     check(rmdir(path.c_str()) == 0, "firewall namespace fixture empty");
 }
-int firewall_namespace_child(const std::string& netbox, const std::string& work, const std::string& program, bool orphan_only, bool planned) {
+int firewall_namespace_child(const std::string& netbox, const std::string& work, const std::string& program, FirewallSuite suite) {
     const auto scope = network_scope();
     if (unshare(CLONE_NEWNET) != 0 || same_scope(scope, network_scope())) return 70;
     executable = netbox; directory = work; daemon = program;
-    if (orphan_only) return run({{"orphan_mutator_inherited_barrier", orphan_mutator_barrier}});
-    if (planned) return run({{"typed_prefix_and_old_journal", prefix_rules_and_old_journal}, {"linux_configuration_policy_plan", linux_policy_plan},
+    if (suite == FirewallSuite::orphan) return run({{"orphan_mutator_inherited_barrier", orphan_mutator_barrier}});
+    if (suite == FirewallSuite::coordinator) return run({{"shared_coordinator_refresh_and_stop", shared_coordinator_lifecycle},
+        {"coordinator_guarded_packet_transitions", coordinated_packets}, {"six_coordinator_sigkill_boundaries", coordinator_crash_boundaries}});
+    if (suite == FirewallSuite::plan) return run({{"typed_prefix_and_old_journal", prefix_rules_and_old_journal}, {"linux_configuration_policy_plan", linux_policy_plan},
         {"linux_policy_real_dual_stack_packets", planned_packets}});
     return run({{"typed_rules_and_real_dual_stack_tables", typed_rules_and_real_tables}, {"foreign_rules_and_ambiguity", foreign_rules_and_ambiguity},
         {"creation_deletion_races_and_write_failure", races_and_write_failures}, {"scope_and_corrupt_primary", inventory_scope_and_corruption},
@@ -505,13 +563,23 @@ int firewall_crash_child(const std::string& work, bool ipv6, const std::string& 
     OwnedFirewall owner(fd.get(), getuid(), iptables, [&](const char* stage) {
         if (phase == stage && (!phase.starts_with("firewall_batch_") || armed)) kill(getpid(), SIGKILL);
     });
+    if (phase.starts_with("linux_firewall_")) {
+        LinuxFirewall coordinator(owner, [&](const char* stage) { if (phase == stage) kill(getpid(), SIGKILL); });
+        auto config = coordinator_config("brcrash");
+        config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":true}})"));
+        coordinator.set(config); return 74;
+    }
     if (phase.starts_with("firewall_batch_") || phase == "inflight") {
         owner.put("test", "drop", policy(ipv6, false)[0].rule);
         armed = true; owner.replace_table("test", ipv6, "filter", policy(ipv6, true)); return 74;
     }
     owner.put("test", "test", rule(ipv6)); owner.remove("test", "test"); return 74;
 }
-int firewall_delayed_restore(const std::string& executable) {
+int firewall_delayed_restore(const std::string& executable, bool check_only) {
+    if (check_only) {
+        execl("/system/bin/iptables-restore", "/system/bin/iptables-restore", "--noflush", "-w", "2", "--test", nullptr);
+        return 76;
+    }
     const auto work = executable.substr(0, executable.rfind('/'));
     write_file(work + "/restore.pid", std::to_string(getpid()));
     if (setenv("XTABLES_LOCKFILE", (work + "/xtables.lock").c_str(), 1) != 0) return 75;

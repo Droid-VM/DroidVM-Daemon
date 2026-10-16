@@ -33,7 +33,8 @@ namespace {
 std::string executable, work, daemon_executable;
 void forwarding_contract() { forwarding_namespace_contract(executable, work); }
 void firewall_contract() { firewall_namespace_contract(executable, work, daemon_executable); }
-void linux_firewall_contract() { firewall_namespace_contract(executable, work, daemon_executable, true); }
+void linux_firewall_contract() { firewall_namespace_contract(executable, work, daemon_executable, FirewallSuite::plan); }
+void linux_firewall_coordinator_contract() { firewall_namespace_contract(executable, work, daemon_executable, FirewallSuite::coordinator); }
 struct Case {
     std::string name = "dt" + random_id(false).substr(0, 8);
     std::string path = work + "/" + name;
@@ -1116,10 +1117,12 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
-    if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4], false, true);
-    if (argc == 5 && std::string_view(argv[1]) == "--firewall-orphan") return firewall_namespace_child(argv[2], argv[3], argv[4], true);
+    if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-coordinator") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::coordinator);
+    if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::plan);
+    if (argc == 5 && std::string_view(argv[1]) == "--firewall-orphan") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::orphan);
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4]);
-    if (argc == 4 && std::string_view(argv[1]) == "--noflush" && std::string_view(argv[0]).ends_with("/restore")) return firewall_delayed_restore(argv[0]);
+    if ((argc == 4 || (argc == 5 && std::string_view(argv[4]) == "--test")) && std::string_view(argv[1]) == "--noflush" &&
+        std::string_view(argv[0]).ends_with("/restore")) return firewall_delayed_restore(argv[0], argc == 5);
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-crash") return firewall_crash_child(argv[2], std::string_view(argv[3]) == "6", argv[4]);
     if (argc == 4 && std::string_view(argv[1]) == "--forwarding-namespace") return forwarding_namespace_child(argv[2], argv[3]);
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
@@ -1211,6 +1214,7 @@ int main(int argc, char** argv) {
         {"isolated_forwarding_and_real_dual_stack_packets", forwarding_contract},
         {"isolated_firewall_ownership_recovery_and_packets", firewall_contract},
         {"isolated_linux_firewall_policy", linux_firewall_contract},
+        {"isolated_linux_firewall_coordinator", linux_firewall_coordinator_contract},
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
         {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},

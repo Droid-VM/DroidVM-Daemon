@@ -346,6 +346,74 @@ void linux_firewall_packet_contract(const std::string& netbox, const std::string
     for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
     check(rmdir(place.c_str()) == 0, "planned packet fixture empty");
 }
+void linux_firewall_coordinator_packets(const std::string& netbox, const std::string& work) {
+    std::cerr << "coordinator: guarded packet transitions" << std::endl;
+    executable = netbox; set_forwarding(0);
+    auto config = configuration("coordinated firewall packets"); config["bridge_name"] = "brcf";
+    config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":false},
+        "ipv6":{"source":"static","cidr":"fd91:fe21:201::1/64"}})"));
+    Forwarding forwarding; auto demand = forwarding.acquire(config);
+    const auto place = work + "/coordinated-packets";
+    check(mkdir(place.c_str(), 0700) == 0, "create coordinator packet inventory");
+    Fd fd(open(place.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)); Iptables iptables;
+    OwnedFirewall owner(fd.get(), getuid(), iptables);
+    std::string failure;
+    bool tamper = false;
+    LinuxFirewall coordinator(owner, [&](const char* stage) {
+        if (failure == stage) throw std::runtime_error("injected publication failure");
+        if (tamper && std::string_view(stage) == "linux_firewall_mangle4") {
+            const auto inventory = owner.inventory();
+            for (const auto& row : inventory["rules"]) if (row["owner"] == LinuxFirewall::owner_key && row["rule"]["table"] == "nat") {
+                iptables.erase(FirewallRule::from(row["rule"]), row["tag"].asString()); break;
+            }
+        }
+    });
+    auto fail_set = [&](const Json::Value& desired) {
+        bool rejected = false;
+        try { coordinator.set(desired); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected && !coordinator.ready(), "incomplete publication never reports ready");
+    };
+    uint8_t sequence = 170;
+    {
+        Path path("brcf", "eth0"); coordinator.set(config);
+        check(coordinator.ready() && path.packet(false, sequence++) && path.packet(true, sequence++), "published baseline forwards both families");
+        config["l3"]["vlans"][0]["ipv4"]["snat"] = true;
+        failure = "linux_firewall_guard6"; fail_set(config);
+        check(!path.packet(false, sequence++) && !path.packet(true, sequence++), "both families remain blocked before NAT update");
+        failure.clear(); coordinator.refresh();
+        check(coordinator.ready() && path.packet(false, sequence++, "198.18.202.1") && path.packet(true, sequence++), "retry publishes forwarding only after dependencies converge");
+        config["l3"]["vlans"][0]["ipv4_secondary"].append("198.18.203.1/24"); tamper = true;
+        error(ErrorCode::conflict, [&] { coordinator.set(config); });
+        check(!coordinator.ready() && !path.packet(false, sequence++) && !path.packet(true, sequence++), "dependency drift is detected before releasing either family guard");
+        tamper = false; coordinator.refresh();
+        check(coordinator.ready() && path.packet(false, sequence++, "198.18.202.1") && path.packet(true, sequence++), "dependency drift recovery restores actual data path");
+        config["l3"]["vlans"][0]["ipv4_secondary"] = Json::Value(Json::arrayValue);
+        failure = "linux_firewall_filter4"; fail_set(config);
+        check(path.packet(false, sequence++, "198.18.202.1") && !path.packet(true, sequence++),
+            "partial family publication exposes only completed dependencies while remaining family stays blocked");
+        failure.clear(); coordinator.refresh();
+        check(coordinator.ready() && path.packet(true, sequence++), "retry completes remaining family publication");
+    }
+    {
+        // Legacy SNAT is source-scoped, even when a packet did not enter a
+        // bridge. Guard both old and new source ranges, not just bridge names.
+        std::cerr << "coordinator: old and new NAT source domains" << std::endl;
+        Path path("otherin", "eth0");
+        check(path.packet(false, sequence++, "198.18.202.1"), "legacy source-scoped NAT can match a non-bridge ingress");
+        config["l3"]["vlans"][0]["ipv4"]["cidr"] = "198.18.203.1/24";
+        failure = "linux_firewall_nat4"; fail_set(config);
+        check(!path.packet(false, sequence++) && !path.packet(false, sequence++, {}, "198.18.203.2"),
+            "old and new NAT match domains remain protected after NAT commit failure");
+        failure.clear(); coordinator.refresh();
+        check(coordinator.ready() && path.packet(false, sequence++) && path.packet(false, sequence++, "198.18.202.1", "198.18.203.2"),
+            "successful publication removes obsolete NAT and activates only new source range");
+    }
+    coordinator.remove(config["id"].asString()); // all fixture TAPs are closed
+    check(coordinator.ready() && owner.inventory()["rules"].empty(), "quiesced network removal retires all policy and guard rules");
+    coordinator.stop();
+    for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
+    check(rmdir(place.c_str()) == 0, "coordinator packet fixture empty");
+}
 void forwarding_namespace_contract(const std::string& netbox, const std::string& work) {
     const auto path = work + "/forwarding";
     check(mkdir(path.c_str(), 0700) == 0, "create isolated forwarding fixture");

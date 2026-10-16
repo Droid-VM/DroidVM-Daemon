@@ -197,16 +197,19 @@ std::vector<std::vector<std::string>> Iptables::snapshot(const FirewallRule& rul
     }
     return rows;
 }
-size_t Iptables::tagged(const FirewallRule& rule, const std::string& tag) const {
-    tag_valid(tag);
-    size_t count = 0;
+std::map<std::string, size_t> Iptables::tags(const FirewallRule& rule) const {
+    std::map<std::string, size_t> counts;
     for (const auto& tokens : snapshot(rule)) {
         if (tokens[0] != "-A") continue;
         for (size_t i = 2; i + 1 < tokens.size(); ++i) if (tokens[i] == "--comment") {
-            if (tokens[++i] == tag) ++count;
+            ++counts[tokens[++i]];
         }
     }
-    return count;
+    return counts;
+}
+size_t Iptables::tagged(const FirewallRule& rule, const std::string& tag) const {
+    tag_valid(tag); const auto counts = tags(rule);
+    const auto at = counts.find(tag); return at == counts.end() ? 0 : at->second;
 }
 bool Iptables::contains(const FirewallRule& rule, const std::string& tag) const {
     const auto result = run(rule, "-C", tag); completed(result);
@@ -215,8 +218,8 @@ bool Iptables::contains(const FirewallRule& rule, const std::string& tag) const 
 }
 void Iptables::insert(const FirewallRule& rule, const std::string& tag, int barrier) const { success(run(rule, "-I", tag, barrier)); }
 void Iptables::erase(const FirewallRule& rule, const std::string& tag, int barrier) const { success(run(rule, "-D", tag, barrier)); }
-void Iptables::replace(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier) const {
-    if (before.empty() && after.empty()) return;
+ChildOutput Iptables::transaction(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier, bool check_only) const {
+    if (before.empty() && after.empty()) { ChildOutput result; result.exit_code = 0; return result; }
     if (before.size() + after.size() > 4096) throw ServiceError(ErrorCode::resource_exhausted, "firewall transaction exceeds rule budget");
     const auto& scope = before.empty() ? after.front().rule : before.front().rule;
     std::string input = "*" + scope.table + "\n";
@@ -233,8 +236,19 @@ void Iptables::replace(const std::vector<TaggedRule>& before, const std::vector<
     input += "COMMIT\n";
     if (input.size() > (2u << 20)) throw ServiceError(ErrorCode::resource_exhausted, "firewall transaction exceeds byte budget");
     ChildOptions options; options.argv = {restore_[scope.ipv6], "--noflush", "-w", "2"};
+    if (check_only) options.argv.push_back("--test");
     if (barrier >= 0) options.preserve_fds.push_back(barrier);
-    success(Child(options).communicate(input, std::chrono::seconds(3), 2u << 20));
+    return Child(options).communicate(input, std::chrono::seconds(3), 2u << 20);
+}
+void Iptables::replace(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier) const {
+    success(transaction(before, after, barrier, false));
+}
+bool Iptables::contains_all(const std::vector<TaggedRule>& rules) const {
+    // Validate complete-spec deletions in one userspace transaction. --test
+    // discards that transaction instead of committing any deletion to kernel.
+    const auto result = transaction(rules, {}, -1, true); completed(result);
+    if (result.exit_code == 1) return false;
+    success(result); return true;
 }
 bool Iptables::at_head(const std::vector<TaggedRule>& rules) const {
     if (rules.empty()) return true;
@@ -328,7 +342,7 @@ void OwnedFirewall::put(const std::string& owner, const std::string& key, const 
         auto next = document_; next["rules"][index]["stage"] = "owned"; save(std::move(next)); point("firewall_identity_saved");
     } else if (uncertain_) save(document_);
 }
-void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) {
+OwnedFirewall::TableState OwnedFirewall::inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const {
     key_valid(owner); const auto scope_rule = table_scope(ipv6, table);
     if (desired.size() > 4096) throw ServiceError(ErrorCode::resource_exhausted, "firewall table plan exceeds rule budget");
     std::set<std::string> keys;
@@ -336,12 +350,13 @@ void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std
         key_valid(row.key); row.rule.arguments();
         if (!same_table(scope_rule, row.rule) || !keys.insert(row.key).second) invalid("invalid firewall table plan");
     }
-    std::lock_guard lock(mutex_);
-    const auto operation = barrier();
     if (!same_scope(scope_, network_scope())) conflict("firewall worker namespace changed");
     auto selected = [&](const Json::Value& row) {
         return row["owner"] == owner && row["rule"]["ipv6"] == ipv6 && row["rule"]["table"] == table;
     };
+    bool has_records = false;
+    for (const auto& row : document_["rules"]) if (selected(row)) has_records = true;
+    const auto tags = has_records || !desired.empty() ? iptables_.tags(scope_rule) : std::map<std::string, size_t>{};
     Json::Value retained(Json::arrayValue), present(Json::arrayValue);
     std::map<std::string, Json::Value> current;
     std::vector<Iptables::TaggedRule> before, ordered;
@@ -353,12 +368,13 @@ void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std
         }
         if (!same_scope(row["scope"], scope_)) conflict("firewall table plan has a different scope; recover it first");
         const auto rule = FirewallRule::from(row["rule"]); const auto tag = row["tag"].asString();
-        const auto count = iptables_.tagged(rule, tag);
-        if (count > 1 || (count == 1 && !iptables_.contains(rule, tag))) conflict("firewall ownership tag duplicated or rule replaced");
+        const auto at = tags.find(tag); const auto count = at == tags.end() ? 0 : at->second;
+        if (count > 1) conflict("firewall ownership tag duplicated or rule replaced");
         if (count) { before.push_back({rule, tag}); present.append(row); }
         if (!count || row["stage"] != "owned") unchanged = false;
         current.emplace(row["key"].asString(), row);
     }
+    if (!iptables_.contains_all(before)) conflict("firewall ownership tag duplicated or rule replaced");
     unchanged = unchanged && current.size() == desired.size();
     for (const auto& row : desired) {
         const auto it = current.find(row.key);
@@ -366,10 +382,24 @@ void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std
             it->second["rule"]["chain"] != row.rule.chain) { unchanged = false; continue; }
         ordered.push_back({row.rule, it->second["tag"].asString()});
     }
-    if (unchanged && iptables_.at_head(ordered)) { if (uncertain_) save(document_); return; }
+    return {std::move(retained), std::move(present), std::move(before), tags, unchanged && iptables_.at_head(ordered)};
+}
+bool OwnedFirewall::matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const {
+    std::lock_guard lock(mutex_); const auto operation = barrier();
+    return inspect_table(owner, ipv6, table, desired).matched && !uncertain_;
+}
+void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) {
+    std::lock_guard lock(mutex_); const auto operation = barrier();
+    const auto state = inspect_table(owner, ipv6, table, desired);
+    if (state.matched) { if (uncertain_) save(document_); return; }
+    const auto& retained = state.retained;
+    const auto& present = state.present;
+    const auto& before = state.before;
     if (retained.size() + present.size() + desired.size() > 4096)
         throw ServiceError(ErrorCode::resource_exhausted, "firewall update needs space for both generations");
     Json::Value pending = document_; pending["rules"] = retained;
+    std::set<std::string> keys;
+    for (const auto& row : desired) keys.insert(row.key);
     for (const auto& row : retained) if (row["owner"] == owner) keys.insert(row["key"].asString());
     for (auto row : present) {
         std::string retired;
@@ -381,15 +411,17 @@ void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std
     for (const auto& desired_row : desired) {
         Json::Value row; row["owner"] = owner; row["key"] = desired_row.key; row["rule"] = desired_row.rule.json(); row["scope"] = scope_;
         row["tag"] = "droidvm:" + random_id(false); row["stage"] = "pending";
-        if (iptables_.tagged(desired_row.rule, row["tag"].asString())) conflict("new firewall ownership tag already exists");
+        if (state.tags.contains(row["tag"].asString())) conflict("new firewall ownership tag already exists");
         pending["rules"].append(row); after.push_back({desired_row.rule, row["tag"].asString()});
         row["stage"] = "owned"; installed["rules"].append(row);
     }
     save(std::move(pending)); point("firewall_batch_intent_saved");
     iptables_.replace(before, after, operation.get()); point("firewall_batch_committed");
-    for (const auto& row : before) if (iptables_.tagged(row.rule, row.tag)) conflict("old firewall generation remains after update");
-    for (const auto& row : after) if (iptables_.tagged(row.rule, row.tag) != 1 || !iptables_.contains(row.rule, row.tag))
+    const auto installed_tags = iptables_.tags(table_scope(ipv6, table));
+    for (const auto& row : before) if (installed_tags.contains(row.tag)) conflict("old firewall generation remains after update");
+    for (const auto& row : after) if (!installed_tags.contains(row.tag) || installed_tags.at(row.tag) != 1)
         conflict("firewall table update did not converge");
+    if (!iptables_.contains_all(after)) conflict("firewall table update did not converge");
     if (!iptables_.at_head(after)) conflict("firewall table update lost required ordering");
     save(std::move(installed)); point("firewall_batch_identity_saved");
 }

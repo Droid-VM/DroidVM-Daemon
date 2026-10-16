@@ -3,6 +3,7 @@
 #include "store/json_file.h"
 #include "runtime/child.h"
 #include <mutex>
+#include <map>
 
 namespace droidvm::network {
 // Typed rule grammar: configuration never supplies an iptables operation,
@@ -25,7 +26,9 @@ public:
     Iptables(std::string ipv4 = "/system/bin/iptables", std::string ipv6 = "/system/bin/ip6tables",
         std::string restore4 = "/system/bin/iptables-restore", std::string restore6 = "/system/bin/ip6tables-restore");
     size_t tagged(const FirewallRule& rule, const std::string& tag) const;
+    std::map<std::string, size_t> tags(const FirewallRule& scope) const;
     bool contains(const FirewallRule& rule, const std::string& tag) const;
+    bool contains_all(const std::vector<TaggedRule>& rules) const;
     void insert(const FirewallRule& rule, const std::string& tag, int barrier = -1) const;
     void erase(const FirewallRule& rule, const std::string& tag, int barrier = -1) const;
     // One family/table, one COMMIT. Complete-spec deletions then head insertions
@@ -35,6 +38,7 @@ public:
 private:
     std::array<std::string, 2> executable_, restore_;
     ChildOutput run(const FirewallRule& rule, const std::string& operation, const std::string& tag = {}, int barrier = -1) const;
+    ChildOutput transaction(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier, bool check_only) const;
     std::vector<std::vector<std::string>> snapshot(const FirewallRule& rule) const;
 };
 // Durable rule ownership and single-table revision, not a policy planner.
@@ -53,6 +57,9 @@ public:
     // preserved. Desired rules are ordered at each hook's head. Journal both
     // generations before the atomic kernel update; retry/recovery handles either.
     void replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired);
+    // Read-only convergence check, including rule identity, hook order and
+    // confirmed journal durability. Ownership conflicts still throw.
+    bool matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const;
     void remove(const std::string& owner, const std::string& key);
     Json::Value cleanup(const std::string& owner);
     Json::Value recover_all(); // startup, after helpers and before link cleanup
@@ -65,6 +72,13 @@ private:
     Json::Value scope_, document_;
     bool uncertain_ = false;
     mutable std::mutex mutex_;
+    struct TableState {
+        Json::Value retained, present;
+        std::vector<Iptables::TaggedRule> before;
+        std::map<std::string, size_t> tags;
+        bool matched;
+    };
+    TableState inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const;
     void save(Json::Value next);
     Fd barrier() const;
     void remove_at(Json::ArrayIndex index, int barrier);
