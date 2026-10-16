@@ -5,6 +5,7 @@
 #include "dhcp_client.h"
 #include "network/firewall.h"
 #include "network/linux_bridge.h"
+#include "network/pd_ownership.h"
 #include "services/network.h"
 #include "services/network_config.h"
 #include "store/network_config.h"
@@ -20,6 +21,11 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <future>
+#include <atomic>
 
 namespace droidvm::test {
 using namespace droidvm::network;
@@ -72,9 +78,12 @@ std::string acquire(int tap) {
         catch (const std::exception&) { if (std::chrono::steady_clock::now() > deadline) throw; }
     }
 }
+// Plain fixtures keep every journal in one new directory. A data layout uses
+// the daemon's existing run/ and files/ split so droidvmd can recover it.
 struct Fixture {
     std::string path, dhcp;
-    Fd directory;
+    bool layout;
+    Fd run, files;
     Netbox netbox{netbox_path};
     Iptables iptables;
     OwnedFirewall firewall;
@@ -82,25 +91,28 @@ struct Fixture {
     OwnedRules rules;
     OwnedRoutes routes;
     SwitchRuntime runtime;
+    PdOwnership pd;
     LinuxFirewall coordinator;
     NetworkConfigService configs;
-    explicit Fixture(const std::string& name, std::string helper = binary("bridgedhcp"))
-        : path(work + "/" + name), dhcp(std::move(helper)), directory(fixture_directory(path)),
-          firewall(directory.get(), getuid(), iptables), links(directory.get(), getuid(), netbox),
-          rules(directory.get(), getuid(), links), routes(directory.get(), getuid(), links),
-          runtime(directory.get(), getuid()), coordinator(firewall), configs(directory.get(), getuid()) {}
+    explicit Fixture(const std::string& name, std::string helper = binary("bridgedhcp"), bool data_layout = false)
+        : path(data_layout ? name : work + "/" + name), dhcp(std::move(helper)), layout(data_layout),
+          run(data_layout ? Fd(open((path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) : fixture_directory(path)),
+          files(data_layout ? Fd(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) : Fd(fcntl(run.get(), F_DUPFD_CLOEXEC, 3))),
+          firewall(run.get(), getuid(), iptables), links(run.get(), getuid(), netbox),
+          rules(run.get(), getuid(), links), routes(run.get(), getuid(), links),
+          runtime(run.get(), getuid()), pd(run.get(), getuid()), coordinator(firewall), configs(files.get(), getuid()) {}
     NetworkService::Factory factory() {
         return [this](const Json::Value&) -> std::unique_ptr<Backend> {
             return std::make_unique<LinuxBridge>(LinuxBridge::Resources{
-                netbox, links, rules, routes, coordinator, runtime, dhcp, directory.get()});
+                netbox, links, rules, routes, coordinator, pd, runtime, dhcp, files.get()});
         };
     }
     bool idle() const {
         return released(links.inventory()) && released(firewall.inventory()) && released(runtime.inventory()) &&
-            released(rules.inventory()) && released(routes.inventory());
+            released(rules.inventory()) && released(routes.inventory()) && released(pd.inventory());
     }
     void finish() {
-        check(idle(), "Linux backend released links, routing, firewall and helpers");
+        check(idle(), "Linux backend released links, routing, firewall, PD and helpers");
         coordinator.stop(); remove_files(path);
     }
 };
@@ -112,16 +124,17 @@ void rejections_and_rollback() {
         l2["uplink_mode"] = "l2"; l2["l2"]["uplink"] = "Ethernet";
         const auto l2_id = fixture.configs.create(admin, l2);
         error(ErrorCode::unavailable, [&] { service.start(admin, l2_id); });
+        check(service.get(admin, l2_id).state == NetworkState::stopped && fixture.idle(),
+            "unimplemented L2 uplinks are rejected before kernel changes");
         auto pd = network_config("lbp" + random_id(false).substr(0, 8));
         pd["l3"]["vlans"][0]["ipv6"] = wire::parse(R"({"source":"dhcp_pd","cidr":"fd91:fe21:211::1/64","pd":{"uplink":"unresolved"}})");
         const auto pd_id = fixture.configs.create(admin, pd);
-        error(ErrorCode::unavailable, [&] { service.start(admin, pd_id); });
-        check(service.get(admin, l2_id).state == NetworkState::stopped && service.get(admin, pd_id).state == NetworkState::stopped &&
-            fixture.idle(), "unimplemented L2 uplinks and PD ownership are rejected before kernel changes");
+        check(service.start(admin, pd_id).state == NetworkState::running && released(fixture.pd.inventory()),
+            "unresolved PD uplink starts without registering a delegation, as legacy did");
+        check(service.stop(admin, pd_id).state == NetworkState::stopped, "unresolved PD network stops");
         check(service.shutdown().empty(), "rejection fixture shutdown");
         fixture.finish();
-    }
-    Fixture fixture("lb-rollback", binary("absent-bridgedhcp"));
+    }    Fixture fixture("lb-rollback", binary("absent-bridgedhcp"));
     NetworkService service(fixture.configs, fixture.factory());
     const auto bridge = "lbx" + random_id(false).substr(0, 8);
     const auto id = fixture.configs.create(admin, network_config(bridge));
@@ -248,6 +261,247 @@ void actual_daemon() {
     for (const char* name : {"/run", "/cache", "/files", "/bin"}) remove_files(path + name);
     check(unlink((path + "/fixture.apk").c_str()) == 0 && rmdir(path.c_str()) == 0, "daemon fixture reclaimed");
 }
+std::string read_text(const std::string& path) {
+    std::ifstream file(path); std::string value; std::getline(file, value); return value;
+}
+void write_text(const std::string& path, const std::string& value) {
+    std::ofstream file(path); file << value << "\n"; check(file.good(), "write fixture sysctl");
+}
+void ip(std::vector<std::string> args) {
+    args.insert(args.begin(), "/system/bin/ip");
+    ChildOptions options; options.argv = std::move(args);
+    const auto result = Child(options).communicate({}, 5s);
+    if (result.exit_code != 0) throw std::runtime_error("ip failed: " + result.error);
+}
+std::string uplink_sysctl(const std::string& uplink, const char* key) { return read_text("/proc/sys/net/ipv6/conf/" + uplink + "/" + key); }
+// Minimal RFC 8415 IA_PD server on the far end of a veth pair. Its end lives
+// in a network namespace private to the server thread, so replies cross the
+// veth instead of being short-circuited to a local link-local address.
+class PdServer {
+public:
+    std::string uplink, peer;
+    explicit PdServer(const std::string& name) : uplink(name + "u"), peer(name + "s") {
+        ip({"link", "add", uplink, "type", "veth", "peer", "name", peer});
+        auto tid = tid_.get_future();
+        thread_ = std::thread([this] { serve(); });
+        try {
+            const auto id = tid.get();
+            ip({"link", "set", peer, "netns", std::to_string(id)});
+            write_text("/proc/sys/net/ipv6/conf/" + uplink + "/accept_dad", "0");
+        } catch (...) { stop_ = true; release(); thread_.join(); throw; }
+        release();
+    }
+    ~PdServer() { stop_ = true; release(); if (thread_.joinable()) thread_.join(); }
+    int replies() const { return replies_; }
+    std::string error() const { std::lock_guard lock(mutex_); return error_; }
+private:
+    std::promise<pid_t> tid_;
+    std::promise<void> moved_;
+    bool released_ = false;
+    std::atomic<bool> stop_{false};
+    std::atomic<int> replies_{0};
+    mutable std::mutex mutex_;
+    std::string error_;
+    std::thread thread_;
+    void release() { if (!released_) { released_ = true; moved_.set_value(); } }
+    void serve() {
+        auto moved = moved_.get_future();
+        if (unshare(CLONE_NEWNET) != 0) { tid_.set_exception(std::make_exception_ptr(std::runtime_error("PD server netns"))); return; }
+        tid_.set_value(static_cast<pid_t>(gettid()));
+        moved.wait();
+        if (stop_) return;
+        try {
+            write_text("/proc/sys/net/ipv6/conf/" + peer + "/accept_dad", "0");
+            Fd socket_fd(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+            ifreq request{}; std::copy(peer.begin(), peer.end(), request.ifr_name);
+            check(socket_fd.get() >= 0 && ioctl(socket_fd.get(), SIOCGIFFLAGS, &request) == 0, "PD server link flags");
+            request.ifr_flags |= IFF_UP;
+            check(ioctl(socket_fd.get(), SIOCSIFFLAGS, &request) == 0, "PD server link up");
+            check(setsockopt(socket_fd.get(), SOL_SOCKET, SO_BINDTODEVICE, peer.c_str(), peer.size()) == 0, "PD server device");
+            sockaddr_in6 local{}; local.sin6_family = AF_INET6; local.sin6_port = htons(547);
+            check(bind(socket_fd.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0, "PD server bind");
+            ipv6_mreq group{}; inet_pton(AF_INET6, "ff02::1:2", &group.ipv6mr_multiaddr);
+            group.ipv6mr_interface = if_nametoindex(peer.c_str());
+            check(setsockopt(socket_fd.get(), IPPROTO_IPV6, IPV6_JOIN_GROUP, &group, sizeof(group)) == 0, "PD server group");
+            while (!stop_) {
+                pollfd fd{socket_fd.get(), POLLIN, 0};
+                if (poll(&fd, 1, 100) <= 0) continue;
+                uint8_t in[1500]; sockaddr_in6 from{}; socklen_t size = sizeof(from);
+                const auto n = recvfrom(socket_fd.get(), in, sizeof(in), 0, reinterpret_cast<sockaddr*>(&from), &size);
+                if (n < 4) continue;
+                // SOLICIT -> ADVERTISE; REQUEST/RENEW/REBIND/RELEASE -> REPLY
+                const uint8_t type = in[0] == 1 ? 2 : (in[0] == 3 || in[0] == 5 || in[0] == 6 || in[0] == 8) ? 7 : 0;
+                if (!type) continue;
+                std::vector<uint8_t> client, out{type, in[1], in[2], in[3]};
+                std::array<uint8_t, 4> iaid{};
+                for (ssize_t at = 4; at + 4 <= n;) {
+                    const uint16_t code = (in[at] << 8) | in[at + 1], length = (in[at + 2] << 8) | in[at + 3];
+                    if (at + 4 + length > n) break;
+                    if (code == 1) client.assign(in + at + 4, in + at + 4 + length);
+                    if (code == 25 && length >= 4) std::copy_n(in + at + 4, 4, iaid.begin());
+                    at += 4 + length;
+                }
+                auto option = [&](uint16_t code, const std::vector<uint8_t>& body) {
+                    out.insert(out.end(), {uint8_t(code >> 8), uint8_t(code), uint8_t(body.size() >> 8), uint8_t(body.size())});
+                    out.insert(out.end(), body.begin(), body.end());
+                };
+                auto u32 = [](std::vector<uint8_t>& body, uint32_t value) {
+                    body.insert(body.end(), {uint8_t(value >> 24), uint8_t(value >> 16), uint8_t(value >> 8), uint8_t(value)});
+                };
+                option(1, client);
+                option(2, {0, 3, 0, 1, 2, 0, 0, 0, 0xaa, 1});
+                if (in[0] != 8) {
+                    std::vector<uint8_t> prefix; u32(prefix, 3000); u32(prefix, 4000); prefix.push_back(64);
+                    std::array<uint8_t, 16> bytes{}; inet_pton(AF_INET6, "2001:db8:aa:1::", bytes.data());
+                    prefix.insert(prefix.end(), bytes.begin(), bytes.end());
+                    std::vector<uint8_t> ia(iaid.begin(), iaid.end()); u32(ia, 1000); u32(ia, 2000);
+                    ia.insert(ia.end(), {0, 26, 0, uint8_t(prefix.size())}); ia.insert(ia.end(), prefix.begin(), prefix.end());
+                    option(25, ia);
+                }
+                if (sendto(socket_fd.get(), out.data(), out.size(), 0, reinterpret_cast<sockaddr*>(&from), size) == static_cast<ssize_t>(out.size()))
+                    ++replies_;
+            }
+        } catch (const std::exception& error) { std::lock_guard lock(mutex_); error_ = error.what(); }
+    }
+};
+// Earlier global forwarding demand propagates to new links; start from the
+// typical phone uplink state the helper changes.
+void reset_uplink(const std::string& uplink) {
+    write_text("/proc/sys/net/ipv6/conf/" + uplink + "/accept_ra", "1");
+    write_text("/proc/sys/net/ipv6/conf/" + uplink + "/forwarding", "0");
+    check(uplink_sysctl(uplink, "accept_ra") == "1" && uplink_sysctl(uplink, "forwarding") == "0", "uplink starts as a host interface");
+}
+constexpr const char* pd_prefix = "2001:db8:aa:1::/64";
+Json::Value pd_network(const std::string& bridge, const std::string& uplink) {
+    auto config = network_config(bridge);
+    config["l3"]["vlans"][0]["ipv6"] = wire::parse(R"({"source":"dhcp_pd","pd":{}})");
+    config["l3"]["vlans"][0]["ipv6"]["pd"]["uplink"] = uplink;
+    return config;
+}
+uint32_t pd_table(NetworkConfigService& configs, const std::string& id) {
+    return configs.get(admin, id)["l3"]["vlans"][0]["ipv6"]["pd"]["route_table"].asUInt();
+}
+// Rules from/to the prefix plus its subnet route, and the daemon applied the
+// helper's delegation to the firewall plan.
+bool delegated(const Fixture& fixture, uint32_t table) {
+    return pd_table_users(table) >= 3 && wire::stringify(fixture.firewall.inventory()).find(pd_prefix) != std::string::npos;
+}
+void wait_delegated(Fixture& fixture, NetworkService& service, const std::string& id,
+                    NetworkService::Clock::time_point& now, const PdServer* server) {
+    const auto table = pd_table(fixture.configs, id);
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    while (!delegated(fixture, table) && std::chrono::steady_clock::now() < deadline) {
+        now += 6s; service.reconcile(admin, id); std::this_thread::sleep_for(100ms);
+    }
+    if (!delegated(fixture, table))
+        std::cerr << "PD: replies=" << (server ? server->replies() : -1) << " server=" << (server ? server->error() : "")
+                  << " users=" << pd_table_users(table) << " view=" << service.get(admin, id).error
+                  << " state=" << network_state_name(service.get(admin, id).state)
+                  << " firewall=" << wire::stringify(fixture.firewall.inventory()).substr(0, 6000) << std::endl;
+    check(delegated(fixture, table), "real DHCPv6-PD delegation reaches helper routing and daemon firewall");
+}
+void pd_delegation_ownership() {
+    PdServer server("pd" + random_id(false).substr(0, 6));
+    Fixture fixture("lb-pd");
+    fixture.netbox.state(server.uplink, true);
+    reset_uplink(server.uplink);
+    auto now = NetworkService::Clock::now();
+    NetworkService service(fixture.configs, fixture.factory(), [&] { return now; });
+    const auto id = fixture.configs.create(admin, pd_network("lbq" + random_id(false).substr(0, 8), server.uplink));
+    check(service.start(admin, id).state == NetworkState::running, "PD network reaches RUNNING");
+    const auto table = pd_table(fixture.configs, id);
+    const auto entries = fixture.pd.inventory()["entries"];
+    check(entries.size() == 1 && entries[0]["table"].asUInt() == table && entries[0]["uplink"] == server.uplink,
+        "delegation registered durably before helper start");
+    wait_delegated(fixture, service, id, now, &server);
+    check(uplink_sysctl(server.uplink, "accept_ra") == "2" && uplink_sysctl(server.uplink, "forwarding") == "1", "helper relaxed uplink sysctls");
+    for (const auto& row : fixture.routes.inventory()["routes"]) check(row["table"].asUInt() != table, "return routes never enter the helper PD table");
+    const auto pid = helper_pid("/proc/" + std::to_string(getpid()) + "/fd/");
+    check(pid > 0 && kill(pid, SIGKILL) == 0, "kill PD helper before it can clean up");
+    std::this_thread::sleep_for(200ms);
+    check(pd_table_users(table) >= 2, "killed helper left its PD rules behind");
+    check(service.stop(admin, id).state == NetworkState::stopped, "network stops after helper death");
+    check(!pd_table_users(table) && uplink_sysctl(server.uplink, "accept_ra") == "1" && uplink_sysctl(server.uplink, "forwarding") == "0",
+        "daemon flushed PD rules/routes and restored uplink sysctls");
+    check(service.shutdown().empty(), "PD fixture shutdown");
+    fixture.finish();
+}
+// Two networks on one uplink: a clean helper stop restores the per-process
+// original, so the daemon must reassert it for the remaining network.
+void pd_shared_uplink_and_foreign_table() {
+    const auto path = work + "/lb-pd-shared";
+    for (const char* dir : {"", "/sys", "/sys/up0"}) check(mkdir((path + dir).c_str(), 0700) == 0, "create PD sysctl fixture");
+    const auto key = [&](const char* name) { return path + "/sys/up0/" + name; };
+    write_text(key("accept_ra"), "1"); write_text(key("forwarding"), "0");
+    Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    PdOwnership owner(directory.get(), getuid(), {}, path + "/sys");
+    owner.acquire("net-a", 0, 50001, "up0");
+    write_text(key("accept_ra"), "2"); write_text(key("forwarding"), "1"); // helper A
+    owner.acquire("net-b", 0, 50002, "up0"); // helper B sees 2/1 and changes nothing
+    error(ErrorCode::conflict, [&] { owner.acquire("net-c", 0, 50001, "up0"); });
+    write_text(key("accept_ra"), "1"); write_text(key("forwarding"), "0"); // helper A clean stop
+    owner.release("net-a");
+    check(read_text(key("accept_ra")) == "2" && read_text(key("forwarding")) == "1", "remaining network gets uplink sysctls reasserted");
+    write_text(key("accept_ra"), "0"); // administrator disables RA meanwhile
+    owner.release("net-b");
+    check(read_text(key("accept_ra")) == "0" && read_text(key("forwarding")) == "0", "last release restores only helper-owned values");
+    check(released(owner.inventory()) && owner.inventory()["uplinks"].empty(), "shared uplink record retired");
+    ip({"-6", "rule", "add", "from", "2001:db8:ff::/64", "table", "50003", "priority", "5000"});
+    error(ErrorCode::conflict, [&] { owner.acquire("net-d", 0, 50003, "up0"); });
+    check(pd_table_users(50003) == 1 && released(owner.inventory()), "foreign table user is never registered or flushed");
+    ip({"-6", "rule", "del", "from", "2001:db8:ff::/64", "table", "50003", "priority", "5000"});
+    remove_files(path + "/sys/up0"); remove_files(path + "/sys"); remove_files(path);
+}
+void pd_daemon_recovery() {
+    PdServer server("pr" + random_id(false).substr(0, 6));
+    Netbox netbox(netbox_path); netbox.state(server.uplink, true); reset_uplink(server.uplink);
+    const auto path = work + "/lb-pd-daemon";
+    for (const char* dir : {"", "/bin", "/files", "/run"}) check(mkdir((path + dir).c_str(), 0700) == 0, "create PD daemon fixture");
+    for (const char* tool : {"netbox", "bridgedhcp"})
+        check(symlink(binary(tool).c_str(), (path + "/bin/" + tool).c_str()) == 0, "reuse installed network tools");
+    { std::ofstream apk(path + "/fixture.apk"); apk << "isolated PD recovery fixture"; }
+    {
+        Fd files(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        NetworkConfigService(files.get(), getuid()).create(admin, pd_network("lbk" + random_id(false).substr(0, 8), server.uplink));
+    }
+    ChildOptions crash; crash.argv = {"/proc/self/exe", "--linux-backend-pd-crash", netbox_path, path};
+    const auto crashed = Child(crash).communicate({}, 40s);
+    if (crashed.exit_code != -SIGKILL) std::cerr << "PD crash fixture: " << crashed.exit_code << " " << crashed.error << std::endl;
+    check(crashed.exit_code == -SIGKILL, "PD owner killed after live delegation");
+    uint32_t table;
+    {
+        Fd files(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        NetworkConfigService configs(files.get(), getuid());
+        table = pd_table(configs, configs.list(admin)[0]["id"].asString());
+    }
+    check(pd_table_users(table) >= 2 && uplink_sysctl(server.uplink, "accept_ra") == "2", "crashed owner left PD host state");
+    ChildOptions launch; launch.argv = {daemon_path, "--data-dir", path, "--apk", path + "/fixture.apk"};
+    Child daemon(launch);
+    const auto port = path + "/run/droidvmd-port.txt";
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (access(port.c_str(), F_OK) < 0 && !daemon.poll_exit() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(20ms);
+    if (access(port.c_str(), F_OK) < 0) std::cerr << "daemon: " << daemon.communicate({}, 3s).error << std::endl;
+    check(access(port.c_str(), F_OK) == 0, "daemon recovers PD ownership before readiness");
+    check(!pd_table_users(table) && uplink_sysctl(server.uplink, "accept_ra") == "1" && uplink_sysctl(server.uplink, "forwarding") == "0",
+        "startup recovery flushed orphan PD state and restored uplink sysctls");
+    check(daemon.signal(SIGTERM) && daemon.communicate({}, 10s).exit_code == 128 + SIGTERM, "recovered daemon stops");
+    for (const char* dir : {"/run", "/cache", "/files", "/bin"}) remove_files(path + dir);
+    check(unlink((path + "/fixture.apk").c_str()) == 0 && rmdir(path.c_str()) == 0, "PD daemon fixture reclaimed");
+}
+}
+int linux_backend_pd_crash_child(const std::string& netbox, const std::string& path) {
+    netbox_path = netbox;
+    try {
+        Fixture fixture(path, binary("bridgedhcp"), true);
+        auto now = NetworkService::Clock::now();
+        NetworkService service(fixture.configs, fixture.factory(), [&] { return now; });
+        const auto id = fixture.configs.list(admin)[0]["id"].asString();
+        service.start(admin, id);
+        wait_delegated(fixture, service, id, now, nullptr);
+        kill(getpid(), SIGKILL);
+    } catch (const std::exception& error) { std::cerr << error.what() << std::endl; }
+    return 1;
 }
 int linux_backend_namespace_child(const std::string& netbox, const std::string& directory, const std::string& daemon) {
     struct stat before{}, after{};
@@ -261,6 +515,9 @@ int linux_backend_namespace_child(const std::string& netbox, const std::string& 
     Netbox(netbox).state("lo", true); // the daemon listens on loopback
     return run({{"linux_backend_rejections_and_rollback", rejections_and_rollback},
         {"linux_backend_service_dhcp_recovery_and_quiesce", service_lifecycle},
-        {"actual_daemon_linux_network_lifecycle", actual_daemon}});
+        {"actual_daemon_linux_network_lifecycle", actual_daemon},
+        {"real_pd_delegation_and_helper_death_cleanup", pd_delegation_ownership},
+        {"pd_shared_uplink_and_foreign_table", pd_shared_uplink_and_foreign_table},
+        {"actual_daemon_pd_ownership_recovery", pd_daemon_recovery}});
 }
 }

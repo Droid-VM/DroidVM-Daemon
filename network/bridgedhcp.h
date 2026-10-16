@@ -13,7 +13,9 @@ class BridgeDhcp {
 public:
     BridgeDhcp(std::string executable, SwitchRuntime& runtime, int state_directory);
     ~BridgeDhcp();
-    bool start(Json::Value network, std::map<int, DhcpStatics> statics = {});
+    // uplinks: resolved PD uplink per VLAN. The caller registers each with
+    // PdOwnership first; an unresolved PD VLAN runs without a PD client.
+    bool start(Json::Value network, std::map<int, DhcpStatics> statics = {}, std::map<int, std::string> uplinks = {});
     void restart(); // reuses persistent leases; caller enforces recovery backoff
     void stop(); // temporary resources only; lease state survives normal stop
     bool healthy() const { return ready_ && process_.status().running; }
@@ -39,6 +41,7 @@ private:
     std::unique_ptr<ControlHttp> client_;
     Json::Value network_;
     std::map<int, DhcpStatics> statics_;
+    std::map<int, std::string> uplinks_;
     std::map<int, std::string> devices_;
     PdState pd_;
     bool ready_ = false;

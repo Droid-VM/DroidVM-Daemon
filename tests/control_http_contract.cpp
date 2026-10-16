@@ -397,8 +397,11 @@ void managed_dhcp_lifecycle() {
         auto pd = lease->config();
         pd["l3"]["vlans"][0]["ipv6"]["source"] = "dhcp_pd";
         pd["l3"]["vlans"][0]["ipv6"]["pd"]["uplink"] = bridge;
-        error(ErrorCode::unavailable, [&] { helper.start(pd); });
-        check(runtime.inventory()["switches"].empty(), "unimplemented PD ownership rejected before allocation");
+        // Legacy semantics: without a caller-resolved uplink PD is skipped.
+        check(helper.start(pd) && helper.healthy() && helper.poll_pd(true).addresses.empty(),
+            "unresolved PD uplink runs the helper without a PD client");
+        helper.stop(); unlinkat(directory.get(), BridgeDhcp::state_file(pd).c_str(), 0);
+        check(runtime.inventory()["switches"].empty(), "stopped unresolved PD helper releases its runtime");
         const auto state = BridgeDhcp::state_file(lease->config());
         check(symlinkat("/does/not/exist", directory.get(), state.c_str()) == 0, "place test state symlink");
         error(ErrorCode::conflict, [&] { helper.start(lease->config()); });

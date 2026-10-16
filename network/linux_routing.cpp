@@ -31,6 +31,12 @@ std::vector<VlanRoutes> linux_route_plan(const LinuxPlan& plan, const PdAddresse
     return result;
 }
 namespace {
+// PD helpers own and flush their dedicated tables; reflecting return routes
+// there would race that flush and fight the helper over ownership.
+void exclude(RoutingTables& tables, const std::set<uint32_t>& excluded) {
+    for (auto& family : {&tables.upstream, &tables.returns}) for (auto& values : *family)
+        std::erase_if(values, [&](uint32_t table) { return excluded.contains(table); });
+}
 void validate_tables(const RoutingTables& tables) {
     for (const bool family : {false, true}) {
         for (const auto* values : {&tables.upstream[family], &tables.returns[family]}) {
@@ -56,15 +62,15 @@ void LinuxRouting::reconcile(const PdAddresses& pd, const RoutingTables& tables)
     const auto desired = linux_route_plan(plan_, pd); validate_tables(tables);
     apply_rules(tables); apply_routes(desired, tables);
 }
-void LinuxRouting::refresh(const PdAddresses& pd) {
+void LinuxRouting::refresh(const PdAddresses& pd, const std::set<uint32_t>& excluded) {
     if (stopped_) throw ServiceError(ErrorCode::conflict, "Linux routing is stopped");
     const auto desired = linux_route_plan(plan_, pd);
     auto tables = RoutingTables::from(policy_rules(false), policy_rules(true));
-    validate_tables(tables); apply_rules(tables);
+    exclude(tables, excluded); validate_tables(tables); apply_rules(tables);
     // Our previous chain may itself have referenced a now-departed netd table.
     // Re-read after updating egress before deciding which return routes remain.
     tables = RoutingTables::from(policy_rules(false), policy_rules(true));
-    validate_tables(tables); apply_routes(desired, tables);
+    exclude(tables, excluded); validate_tables(tables); apply_routes(desired, tables);
 }
 void LinuxRouting::stop() {
     stopped_ = true;

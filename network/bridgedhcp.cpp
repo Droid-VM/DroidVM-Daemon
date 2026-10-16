@@ -26,24 +26,23 @@ BridgeDhcp::BridgeDhcp(std::string executable, SwitchRuntime& runtime, int state
 }
 BridgeDhcp::~BridgeDhcp() { try { stop(); } catch (...) {} }
 std::string BridgeDhcp::state_file(const Json::Value& network) { return "dhcp-" + config::uuid(network) + ".json"; }
-bool BridgeDhcp::start(Json::Value network, std::map<int, DhcpStatics> statics) {
+bool BridgeDhcp::start(Json::Value network, std::map<int, DhcpStatics> statics, std::map<int, std::string> uplinks) {
     if (!allocation_.name.empty() || process_.status().running) throw ServiceError(ErrorCode::conflict, "DHCP helper requires cleanup before start");
     const auto state_name = state_file(network);
     const auto persistent = fd_path(state_directory_.get()) + "/" + state_name;
     // Validate before allocating a directory or starting any kernel service.
-    auto plan = bridgedhcp_config(network, {"/pending/s", "/pending/key", persistent}, {}, statics);
+    auto plan = bridgedhcp_config(network, {"/pending/s", "/pending/key", persistent}, uplinks, statics);
     if (config::string(network, "bridge_type") == "gvisor") throw ServiceError(ErrorCode::invalid_argument, "bridgedhcp requires Linux topology");
-    if (!plan.unresolved_pd.empty()) throw ServiceError(ErrorCode::unavailable, "PD route ownership is not connected yet");
     std::map<int, std::string> pd_devices;
     for (const auto& vlan : linux_plan(network).vlans) if (vlan.pd) pd_devices.emplace(vlan.id, vlan.device);
     pd_.reset(std::move(pd_devices));
-    if (!plan.needed) { network_ = std::move(network); statics_ = std::move(statics); return false; }
+    if (!plan.needed) { network_ = std::move(network); statics_ = std::move(statics); uplinks_ = std::move(uplinks); return false; }
     struct stat info{};
     if (fstatat(state_directory_.get(), state_name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) {
         if (!S_ISREG(info.st_mode) || info.st_nlink != 1 || (info.st_uid != runtime_.owner() && info.st_uid != geteuid()) || (info.st_mode & 0022))
             throw ServiceError(ErrorCode::conflict, "DHCP state file identity or permissions changed");
     } else require(errno == ENOENT, "inspect DHCP state file");
-    network_ = std::move(network); statics_ = std::move(statics);
+    network_ = std::move(network); statics_ = std::move(statics); uplinks_ = std::move(uplinks);
     try {
         runtime_.allocate(config::uuid(network_), allocation_, SwitchRuntime::Kind::bridgedhcp);
         const auto path = fd_path(allocation_.directory.get());
@@ -57,7 +56,7 @@ bool BridgeDhcp::start(Json::Value network, std::map<int, DhcpStatics> statics) 
             require(count > 0, "write DHCP API key"); written += static_cast<size_t>(count);
         }
         require(fsync(key.get()) == 0, "sync DHCP API key");
-        plan = bridgedhcp_config(network_, {path + "/s", path + "/api.key", persistent}, {}, statics_);
+        plan = bridgedhcp_config(network_, {path + "/s", path + "/api.key", persistent}, uplinks_, statics_);
         config::JsonFile(allocation_.directory.get(), "config.json", runtime_.owner()).save(plan.config);
         devices_.clear();
         for (const auto& row : plan.config["interfaces"]) devices_.emplace(std::stoi(row["tag"].asString()), row["name"].asString());
@@ -98,8 +97,8 @@ void BridgeDhcp::stop() {
 }
 void BridgeDhcp::restart() {
     if (network_.isNull()) throw ServiceError(ErrorCode::conflict, "DHCP helper has no restart configuration");
-    const auto network = network_; const auto statics = statics_;
-    stop(); start(network, statics);
+    const auto network = network_; const auto statics = statics_; const auto uplinks = uplinks_;
+    stop(); start(network, statics, uplinks);
 }
 std::string BridgeDhcp::endpoint(int vlan) const {
     const auto at = devices_.find(vlan);
@@ -121,7 +120,7 @@ PdSnapshot BridgeDhcp::poll_pd(bool force) {
 void BridgeDhcp::set_statics(int vlan, DhcpStatics statics) {
     const auto path = endpoint(vlan);
     auto desired = statics_; desired[vlan] = std::move(statics);
-    bridgedhcp_config(network_, {"/pending/s", "/pending/key", "/pending/state"}, {}, desired);
+    bridgedhcp_config(network_, {"/pending/s", "/pending/key", "/pending/state"}, uplinks_, desired);
     // Both operations are idempotent. Retain the validated desired set even
     // if a disconnect makes a PUT's outcome uncertain, for restart/retry.
     statics_ = std::move(desired);

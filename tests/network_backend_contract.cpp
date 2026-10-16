@@ -1014,6 +1014,8 @@ void pd_snapshot_contract() {
     error(ErrorCode::io_error, [&] { state.poll(output, fetch); });
     status["ifaces"][0]["pd_address"] = "fd91:fe21:88::1/64";
     check(state.poll(output, fetch, true).addresses.at(4094) == "fd91:fe21:88::1/64", "periodic forced status closes missing-event gaps");
+    status["ifaces"][0].removeMember("pd_address"); status["ifaces"][0]["pd_prefix"] = "fd91:fe21:99::/64";
+    check(state.poll(output, fetch, true).addresses.at(4094) == "fd91:fe21:99::1/64", "current helper pd_prefix yields the ::1 router address");
     output.status.running = false;
     error(ErrorCode::unavailable, [&] { state.poll(output, fetch); });
 }
@@ -1119,6 +1121,7 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--linux-backend-pd-crash") return linux_backend_pd_crash_child(argv[2], argv[3]);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-backend") return linux_backend_namespace_child(argv[2], argv[3], argv[4]);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-forwards") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::forwards);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-coordinator") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::coordinator);

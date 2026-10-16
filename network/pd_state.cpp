@@ -21,14 +21,21 @@ PdAddresses PdState::parse(const Json::Value& status) const {
         if (!row.isObject() || !row["name"].isString() || !row["tag"].isString()) invalid();
         for (const auto& [id, name] : devices_) if (row["name"] == name || row["tag"] == std::to_string(id)) {
             if (row["name"] != name || row["tag"] != std::to_string(id) || !seen.insert(id).second) invalid();
-            if (row.isMember("pd_address") && !row["pd_address"].isString()) invalid();
-            const auto text = row.get("pd_address", "").asString();
-            if (!text.empty()) {
-                try {
-                    const auto prefix = config::NetworkPrefix::parse(text, true);
+            for (const char* key : {"pd_address", "pd_prefix"})
+                if (row.isMember(key) && !row[key].isString()) invalid();
+            // Current helpers report only pd_prefix; the router address is its
+            // base OR the configured "::1" suffix (helper composePD).
+            const auto address = row.get("pd_address", "").asString(), delegated = row.get("pd_prefix", "").asString();
+            try {
+                if (!address.empty()) {
+                    const auto prefix = config::NetworkPrefix::parse(address, true);
                     addresses[id] = prefix.address() + "/" + std::to_string(prefix.prefix());
-                } catch (const std::invalid_argument&) { invalid(); }
-            }
+                } else if (!delegated.empty()) {
+                    const auto prefix = config::NetworkPrefix::parse(delegated, true);
+                    if (prefix.prefix() > 127) invalid();
+                    addresses[id] = prefix.address_at(1) + "/" + std::to_string(prefix.prefix());
+                }
+            } catch (const std::invalid_argument&) { invalid(); }
         }
     }
     if (seen.size() != devices_.size()) invalid();

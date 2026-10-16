@@ -10,6 +10,7 @@
 #include "network/routes.h"
 #include "network/firewall.h"
 #include "network/linux_bridge.h"
+#include "network/pd_ownership.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -90,6 +91,11 @@ int main(int argc, char** argv) {
             const auto recovery_failures = switch_runtime.recover_all();
             if (!recovery_failures.empty())
                 throw std::runtime_error("Network runtime recovery incomplete: " + droidvm::wire::stringify(recovery_failures));
+            // Helpers are gone: finish their PD rule/route/sysctl cleanup.
+            droidvm::network::PdOwnership pd_ownership(instance->directory_fd(), layout ? layout->owner() : getuid());
+            const auto pd_failures = pd_ownership.recover_all();
+            if (!pd_failures.empty())
+                throw std::runtime_error("Network PD recovery incomplete: " + droidvm::wire::stringify(pd_failures));
             droidvm::network::Iptables iptables;
             droidvm::network::OwnedFirewall owned_firewall(instance->directory_fd(), layout ? layout->owner() : getuid(), iptables);
             std::unique_ptr<droidvm::network::Netbox> netbox;
@@ -131,7 +137,7 @@ int main(int argc, char** argv) {
                         if (droidvm::config::string(config, "bridge_type") == "gvisor")
                             return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime);
                         return std::make_unique<droidvm::network::LinuxBridge>(droidvm::network::LinuxBridge::Resources{
-                            *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, switch_runtime,
+                            *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, pd_ownership, switch_runtime,
                             (binaries / "bridgedhcp").string(), files.get()});
                     });
                 network_runtime->request_autostart({"network-autostart", true, true, true});

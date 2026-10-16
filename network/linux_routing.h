@@ -3,6 +3,7 @@
 #include "linux_plan.h"
 #include "routes.h"
 #include <map>
+#include <set>
 
 namespace droidvm::network {
 struct RoutingTables {
@@ -19,7 +20,8 @@ std::vector<VlanRoutes> linux_route_plan(const LinuxPlan& plan, const PdAddresse
 class LinuxRouting {
 public:
     LinuxRouting(Json::Value config, OwnedRules& rules, OwnedRoutes& routes);
-    void refresh(const PdAddresses& pd); // live netd policy, including VPN ordering
+    // live netd policy, including VPN ordering; excluded: helper-owned PD tables
+    void refresh(const PdAddresses& pd, const std::set<uint32_t>& excluded = {});
     void reconcile(const PdAddresses& pd, const RoutingTables& tables); // shared watcher snapshot
     void stop(); // rejects late refreshes, keeps failed cleanup retryable
 private:
