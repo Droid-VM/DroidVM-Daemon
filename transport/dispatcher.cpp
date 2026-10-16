@@ -176,6 +176,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : runtime_commands) result["commands"].append(name);
                 result["network_lifecycle_backends"] = Json::Value(Json::arrayValue);
                 result["network_lifecycle_backends"].append("gvisor");
+                result["network_lifecycle_backends"].append("linux-l3"); // no L2 uplink, PD or VM ports yet
                 result["network_watchdog"] = true;
                 result["network_auto_up"] = true;
                 result["network_live_details"] = false;

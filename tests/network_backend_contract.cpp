@@ -2,6 +2,7 @@
 #include "contracts.h"
 #include "forwarding_contract.h"
 #include "firewall_contract.h"
+#include "linux_backend_contract.h"
 #include "network/links.h"
 #include "network/linux_topology.h"
 #include "network/policy_rules.h"
@@ -1118,6 +1119,7 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 5 && std::string_view(argv[1]) == "--linux-backend") return linux_backend_namespace_child(argv[2], argv[3], argv[4]);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-forwards") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::forwards);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-coordinator") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::coordinator);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-namespace") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::plan);

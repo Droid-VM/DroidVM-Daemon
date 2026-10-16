@@ -9,6 +9,7 @@
 #include "network/policy_rules.h"
 #include "network/routes.h"
 #include "network/firewall.h"
+#include "network/linux_bridge.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -91,9 +92,6 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Network runtime recovery incomplete: " + droidvm::wire::stringify(recovery_failures));
             droidvm::network::Iptables iptables;
             droidvm::network::OwnedFirewall owned_firewall(instance->directory_fd(), layout ? layout->owner() : getuid(), iptables);
-            const auto firewall_failures = owned_firewall.recover_all();
-            if (!firewall_failures.empty())
-                throw std::runtime_error("Network firewall recovery incomplete: " + droidvm::wire::stringify(firewall_failures));
             std::unique_ptr<droidvm::network::Netbox> netbox;
             std::unique_ptr<droidvm::network::OwnedLinks> owned_links;
             std::unique_ptr<droidvm::network::OwnedRules> owned_rules;
@@ -111,22 +109,30 @@ int main(int argc, char** argv) {
                 const auto failures = owned_links->recover_all();
                 if (!failures.empty()) throw std::runtime_error("Network link recovery incomplete: " + droidvm::wire::stringify(failures));
             }
+            // Retire stale guards only after their guest-facing links are gone.
+            const auto firewall_failures = owned_firewall.recover_all();
+            if (!firewall_failures.empty())
+                throw std::runtime_error("Network firewall recovery incomplete: " + droidvm::wire::stringify(firewall_failures));
+            droidvm::network::LinuxFirewall linux_firewall(owned_firewall);
+            droidvm::Fd files;
             const auto token = droidvm::random_id(false);
             const auto hash = droidvm::apk_sha256(apk); // fork before starting service threads.
             std::unique_ptr<droidvm::NetworkConfigService> networks;
             std::unique_ptr<droidvm::NetworkHostService> host_network;
             std::unique_ptr<droidvm::NetworkService> network_runtime;
             if (layout) {
-                auto files = layout->open_files();
+                files = layout->open_files();
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
                 host_network = std::make_unique<droidvm::NetworkHostService>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
-                const auto switch_executable = (std::filesystem::absolute(data_directory) / "bin/gvswitch").string();
+                const auto binaries = std::filesystem::absolute(data_directory) / "bin";
                 network_runtime = std::make_unique<droidvm::NetworkService>(*networks,
-                    [&, switch_executable](const Json::Value& config) -> std::unique_ptr<droidvm::network::Backend> {
-                        if (droidvm::config::string(config, "bridge_type") != "gvisor")
-                            throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Native Linux network lifecycle is not implemented yet");
-                        return std::make_unique<droidvm::network::Gvswitch>(switch_executable, switch_runtime);
+                    [&, binaries](const Json::Value& config) -> std::unique_ptr<droidvm::network::Backend> {
+                        if (droidvm::config::string(config, "bridge_type") == "gvisor")
+                            return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime);
+                        return std::make_unique<droidvm::network::LinuxBridge>(droidvm::network::LinuxBridge::Resources{
+                            *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, switch_runtime,
+                            (binaries / "bridgedhcp").string(), files.get()});
                     });
                 network_runtime->request_autostart({"network-autostart", true, true, true});
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
@@ -142,6 +148,7 @@ int main(int argc, char** argv) {
             if (network_runtime) {
                 const auto failures = network_runtime->shutdown();
                 if (!failures.empty()) throw std::runtime_error("Network shutdown incomplete: " + droidvm::wire::stringify(failures));
+                linux_firewall.stop(); // every Linux network was removed above
             }
             if (log) log->write("INFO", "stopped exit=" + std::to_string(result));
             return result;
