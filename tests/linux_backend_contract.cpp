@@ -6,6 +6,9 @@
 #include "network/firewall.h"
 #include "network/linux_bridge.h"
 #include "network/pd_ownership.h"
+#include "network/ports.h"
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
 #include "services/network.h"
 #include "services/network_config.h"
 #include "store/network_config.h"
@@ -92,6 +95,7 @@ struct Fixture {
     OwnedRoutes routes;
     SwitchRuntime runtime;
     PdOwnership pd;
+    OwnedPorts ports;
     LinuxFirewall coordinator;
     NetworkConfigService configs;
     explicit Fixture(const std::string& name, std::string helper = binary("bridgedhcp"), bool data_layout = false)
@@ -100,16 +104,16 @@ struct Fixture {
           files(data_layout ? Fd(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) : Fd(fcntl(run.get(), F_DUPFD_CLOEXEC, 3))),
           firewall(run.get(), getuid(), iptables), links(run.get(), getuid(), netbox),
           rules(run.get(), getuid(), links), routes(run.get(), getuid(), links),
-          runtime(run.get(), getuid()), pd(run.get(), getuid()), coordinator(firewall), configs(files.get(), getuid()) {}
+          runtime(run.get(), getuid()), pd(run.get(), getuid()), ports(run.get(), getuid(), netbox), coordinator(firewall), configs(files.get(), getuid()) {}
     NetworkService::Factory factory() {
         return [this](const Json::Value&) -> std::unique_ptr<Backend> {
             return std::make_unique<LinuxBridge>(LinuxBridge::Resources{
-                netbox, links, rules, routes, coordinator, pd, runtime, dhcp, files.get()});
+                netbox, links, rules, routes, coordinator, pd, ports, runtime, dhcp, files.get()});
         };
     }
     bool idle() const {
         return released(links.inventory()) && released(firewall.inventory()) && released(runtime.inventory()) &&
-            released(rules.inventory()) && released(routes.inventory()) && released(pd.inventory());
+            released(rules.inventory()) && released(routes.inventory()) && released(pd.inventory()) && released(ports.inventory());
     }
     void finish() {
         check(idle(), "Linux backend released links, routing, firewall, PD and helpers");
@@ -452,6 +456,105 @@ void pd_shared_uplink_and_foreign_table() {
     ip({"-6", "rule", "del", "from", "2001:db8:ff::/64", "table", "50003", "priority", "5000"});
     remove_files(path + "/sys/up0"); remove_files(path + "/sys"); remove_files(path);
 }
+std::string master_of(const std::string& name) {
+    char target[256];
+    const auto length = readlink(("/sys/class/net/" + name + "/master").c_str(), target, sizeof(target) - 1);
+    if (length <= 0) return {};
+    const std::string path(target, static_cast<size_t>(length));
+    return path.substr(path.rfind('/') + 1);
+}
+Json::Value l2_network(const std::string& bridge, const std::string& uplink, bool pseudo) {
+    auto config = network_config(bridge);
+    config["uplink_mode"] = "l2"; config["l2"]["uplink"] = uplink;
+    if (!pseudo) config["l2"]["pseudo_bridge"] = false;
+    return config;
+}
+// A broadcast frame injected into a guest-side TAP must leave on the uplink.
+bool bridged(int tap, const std::string& peer, uint8_t sequence) {
+    Fd raw(socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_ALL)));
+    sockaddr_ll address{}; address.sll_family = AF_PACKET; address.sll_protocol = htons(ETH_P_ALL);
+    address.sll_ifindex = static_cast<int>(if_nametoindex(peer.c_str()));
+    check(raw.get() >= 0 && bind(raw.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "capture on uplink peer");
+    std::array<uint8_t, 60> frame{};
+    std::fill_n(frame.begin(), 6, 0xff);
+    const std::array<uint8_t, 6> source{2, 0, 0, 0x4c, 0x32, sequence};
+    std::copy(source.begin(), source.end(), frame.begin() + 6);
+    frame[12] = 0x88; frame[13] = 0xb5; // IEEE local experimental EtherType
+    frame[14] = sequence;
+    check(write(tap, frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()), "inject guest broadcast");
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd fd{raw.get(), POLLIN, 0};
+        if (poll(&fd, 1, 50) <= 0) continue;
+        std::array<uint8_t, 2048> bytes{};
+        const auto n = read(raw.get(), bytes.data(), bytes.size());
+        if (n >= 15 && std::equal(source.begin(), source.end(), bytes.begin() + 6) && bytes[14] == sequence) return true;
+    }
+    return false;
+}
+void l2_direct_uplink() {
+    const auto name = "l2" + random_id(false).substr(0, 6);
+    const auto uplink = name + "u", peer = name + "s";
+    ip({"link", "add", uplink, "type", "veth", "peer", "name", peer});
+    Fixture fixture("lb-l2");
+    fixture.netbox.state(uplink, true); fixture.netbox.state(peer, true);
+    auto now = NetworkService::Clock::now();
+    NetworkService service(fixture.configs, fixture.factory(), [&] { return now; });
+    const auto pseudo = fixture.configs.create(admin, l2_network("lbm" + random_id(false).substr(0, 8), uplink, true));
+    error(ErrorCode::unavailable, [&] { service.start(admin, pseudo); });
+    check(fixture.idle() && master_of(uplink).empty(), "pseudo-bridge default is rejected before touching the uplink");
+    const auto bridge = "lbl" + random_id(false).substr(0, 8);
+    const auto id = fixture.configs.create(admin, l2_network(bridge, uplink, false));
+    const auto view = service.start(admin, id);
+    check(view.state == NetworkState::running && view.tools.empty() && master_of(uplink) == bridge &&
+        fixture.ports.inventory()["ports"].size() == 1 && !released(fixture.firewall.inventory()),
+        "direct L2 enslaves the uplink with a durable port record and L2 firewall");
+    auto tap = client_tap(fixture.netbox, bridge + "c", bridge);
+    check(bridged(tap.get(), peer, 1), "guest frame crosses the bridge onto the uplink");
+    fixture.netbox.nomaster(uplink);
+    now += 6s;
+    check(service.reconcile(admin, id).state == NetworkState::running && master_of(uplink) == bridge && bridged(tap.get(), peer, 2),
+        "refresh reattaches an uplink that left the bridge");
+    tap = Fd();
+    check(service.stop(admin, id).state == NetworkState::stopped && master_of(uplink).empty() && !exists(fixture.netbox, bridge),
+        "stop detaches the uplink before releasing the bridge");
+    check(service.shutdown().empty(), "L2 fixture shutdown");
+    fixture.finish();
+    fixture.netbox.delete_link(uplink);
+}
+void l2_daemon_recovery() {
+    const auto name = "l3" + random_id(false).substr(0, 6);
+    const auto uplink = name + "u";
+    ip({"link", "add", uplink, "type", "veth", "peer", "name", name + "s"});
+    Netbox netbox(netbox_path); netbox.state(uplink, true);
+    const auto path = work + "/lb-l2-daemon";
+    for (const char* dir : {"", "/bin", "/files", "/run"}) check(mkdir((path + dir).c_str(), 0700) == 0, "create L2 daemon fixture");
+    for (const char* tool : {"netbox", "bridgedhcp"})
+        check(symlink(binary(tool).c_str(), (path + "/bin/" + tool).c_str()) == 0, "reuse installed network tools");
+    { std::ofstream apk(path + "/fixture.apk"); apk << "isolated L2 recovery fixture"; }
+    const auto bridge = "lbn" + random_id(false).substr(0, 8);
+    {
+        Fd files(open((path + "/files").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        NetworkConfigService(files.get(), getuid()).create(admin, l2_network(bridge, uplink, false));
+    }
+    ChildOptions crash; crash.argv = {"/proc/self/exe", "--linux-backend-pd-crash", netbox_path, path};
+    const auto crashed = Child(crash).communicate({}, 20s);
+    if (crashed.exit_code != -SIGKILL) std::cerr << "L2 crash fixture: " << crashed.exit_code << " " << crashed.error << std::endl;
+    check(crashed.exit_code == -SIGKILL && master_of(uplink) == bridge, "killed owner left the uplink in its bridge");
+    ChildOptions launch; launch.argv = {daemon_path, "--data-dir", path, "--apk", path + "/fixture.apk"};
+    Child daemon(launch);
+    const auto port = path + "/run/droidvmd-port.txt";
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (access(port.c_str(), F_OK) < 0 && !daemon.poll_exit() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(20ms);
+    if (access(port.c_str(), F_OK) < 0) std::cerr << "daemon: " << daemon.communicate({}, 3s).error << std::endl;
+    check(access(port.c_str(), F_OK) == 0 && master_of(uplink).empty() && !exists(netbox, bridge),
+        "startup detaches the foreign uplink, then reclaims the bridge");
+    check(daemon.signal(SIGTERM) && daemon.communicate({}, 10s).exit_code == 128 + SIGTERM, "recovered daemon stops");
+    for (const char* dir : {"/run", "/cache", "/files", "/bin"}) remove_files(path + dir);
+    check(unlink((path + "/fixture.apk").c_str()) == 0 && rmdir(path.c_str()) == 0, "L2 daemon fixture reclaimed");
+    netbox.delete_link(uplink);
+}
 void pd_daemon_recovery() {
     PdServer server("pr" + random_id(false).substr(0, 6));
     Netbox netbox(netbox_path); netbox.state(server.uplink, true); reset_uplink(server.uplink);
@@ -498,7 +601,7 @@ int linux_backend_pd_crash_child(const std::string& netbox, const std::string& p
         NetworkService service(fixture.configs, fixture.factory(), [&] { return now; });
         const auto id = fixture.configs.list(admin)[0]["id"].asString();
         service.start(admin, id);
-        wait_delegated(fixture, service, id, now, nullptr);
+        if (config::string(fixture.configs.get(admin, id), "uplink_mode") != "l2") wait_delegated(fixture, service, id, now, nullptr);
         kill(getpid(), SIGKILL);
     } catch (const std::exception& error) { std::cerr << error.what() << std::endl; }
     return 1;
@@ -518,6 +621,8 @@ int linux_backend_namespace_child(const std::string& netbox, const std::string& 
         {"actual_daemon_linux_network_lifecycle", actual_daemon},
         {"real_pd_delegation_and_helper_death_cleanup", pd_delegation_ownership},
         {"pd_shared_uplink_and_foreign_table", pd_shared_uplink_and_foreign_table},
-        {"actual_daemon_pd_ownership_recovery", pd_daemon_recovery}});
+        {"actual_daemon_pd_ownership_recovery", pd_daemon_recovery},
+        {"direct_l2_uplink_datapath_and_reattach", l2_direct_uplink},
+        {"actual_daemon_l2_port_recovery", l2_daemon_recovery}});
 }
 }

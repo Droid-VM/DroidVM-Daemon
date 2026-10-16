@@ -6,13 +6,15 @@
 #include "linux_routing.h"
 #include "linux_topology.h"
 #include "pd_ownership.h"
+#include "ports.h"
 #include <memory>
 
 namespace droidvm::network {
 // Linux L3 data path composed from owned topology, the shared firewall
 // coordinator, policy routing and bridgedhcp, with PdOwnership covering the
-// helper's own PD host changes. L2 uplinks are rejected until uplink
-// ownership exists; VM attachment and forwards come from the VM integration.
+// helper's own PD host changes. L2 enslaves a bridgeable uplink through
+// OwnedPorts; pseudo-bridge (pbridge) uplinks are rejected until their host
+// state is owned. VM attachment and forwards come from the VM integration.
 class LinuxBridge final : public Backend {
 public:
     struct Resources {
@@ -22,6 +24,7 @@ public:
         OwnedRoutes& routes;
         LinuxFirewall& firewall;
         PdOwnership& pd;
+        OwnedPorts& ports;
         SwitchRuntime& runtime;
         std::string dhcp_executable;
         int dhcp_state_directory;
@@ -44,7 +47,7 @@ private:
     Json::Value config_;
     std::map<int, std::string> uplinks_; // PD uplinks given to the helper
     PdAddresses pd_; // last authoritative helper delegation snapshot
-    bool running_ = false, dhcp_needed_ = false, rebuild_ = false, pd_registered_ = false;
+    bool running_ = false, dhcp_needed_ = false, rebuild_ = false, pd_registered_ = false, l3_ = true;
     void start_dhcp(std::map<int, std::string> uplinks);
 };
 }

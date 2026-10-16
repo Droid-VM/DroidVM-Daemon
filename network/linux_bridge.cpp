@@ -8,10 +8,22 @@
 
 namespace droidvm::network {
 namespace {
-// prepare_runtime persisted exactly one of these for a Linux L3 network.
+// prepare_runtime persisted exactly one of these; L2 always generates.
 std::string bridge_mac(const Json::Value& config) {
-    const auto configured = config::string(config::member(config, "l3"), "mac_address");
+    const auto configured = config::string(config, "uplink_mode") == "l2" ? "" : config::string(config::member(config, "l3"), "mac_address");
     return configured.empty() ? config::string(config, "generated_mac") : configured;
+}
+std::string l2_uplink(const Json::Value& config) {
+    const auto& l2 = config::member(config, "l2");
+    const auto configured = config::string(l2, "uplink");
+    const auto snapshot = UplinkSnapshot::scan();
+    const auto uplink = snapshot.resolve(configured);
+    if (!uplink) throw ServiceError(ErrorCode::unavailable, "Uplink \"" + configured + "\" not found");
+    // Legacy: honor the toggle, but force pseudo-bridging for a device that
+    // cannot be enslaved (Wi-Fi STA / non-Ethernet).
+    if (config::boolean(l2, "pseudo_bridge", true) || snapshot.assume_dont_bridge(*uplink))
+        throw ServiceError(ErrorCode::unavailable, "Native pseudo-bridge (pbridge) uplinks are not implemented yet");
+    return *uplink;
 }
 struct PdVlan { int vlan; uint32_t table; std::string uplink; };
 std::vector<PdVlan> pd_vlans(const Json::Value& config) {
@@ -53,15 +65,17 @@ void LinuxBridge::start(const Json::Value& config) {
     if (running_ || routing_ || !firewall_owner_.empty() || pd_registered_)
         throw ServiceError(ErrorCode::conflict, "Linux network requires cleanup before start");
     const auto plan = linux_plan(config);
-    if (!plan.l3) throw ServiceError(ErrorCode::unavailable, "Native Linux L2 uplinks are not implemented yet");
+    const auto uplink = plan.l3 ? std::string() : l2_uplink(config);
     try {
         // Guard bridge scopes before any guest-facing link comes up.
-        config_ = config; pd_.clear();
+        config_ = config; pd_.clear(); l3_ = plan.l3;
         firewall_owner_ = plan.owner; resources_.firewall.set(config);
         topology_.start(config, bridge_mac(config));
-        routing_ = std::make_unique<LinuxRouting>(config, resources_.rules, resources_.routes);
-        routing_->refresh({}, resources_.pd.tables());
-        start_dhcp(resolve(config));
+        if (l3_) {
+            routing_ = std::make_unique<LinuxRouting>(config, resources_.rules, resources_.routes);
+            routing_->refresh({}, resources_.pd.tables());
+            start_dhcp(resolve(config));
+        } else resources_.ports.attach(plan.owner, uplink, plan.bridge);
         running_ = true; rebuild_ = false;
     } catch (const std::exception& error) {
         const std::string detail = error.what();
@@ -77,6 +91,15 @@ void LinuxBridge::refresh() {
     if (!running_) throw ServiceError(ErrorCode::unavailable, "Linux network is stopped");
     try { topology_.verify(); }
     catch (...) { rebuild_ = true; throw; }
+    if (!l3_) {
+        // A replugged uplink is a new device: retire the stale record, then
+        // attach whatever the configured identifier resolves to now.
+        if (!resources_.ports.attached(firewall_owner_)) {
+            resources_.ports.release(firewall_owner_);
+            resources_.ports.attach(firewall_owner_, l2_uplink(config_), config::string(config_, "bridge_name"));
+        }
+        resources_.firewall.refresh(); return;
+    }
     // Legacy reconcilePdUplinks: reload when a PD uplink now resolves to a
     // different device; a still-unresolved one is left to the helper.
     const auto uplinks = resolve(config_);
@@ -111,6 +134,9 @@ void LinuxBridge::stop() {
     auto attempt = [&](auto&& step) {
         try { step(); } catch (const std::exception& error) { failures.append(error.what()); }
     };
+    // Detach a foreign uplink first: it quiesces external traffic and must
+    // leave before the bridge can be released.
+    if (!l3_ && !firewall_owner_.empty()) attempt([&] { resources_.ports.release(firewall_owner_); });
     bool helper_stopped = false;
     attempt([&] { dhcp_.stop(); dhcp_needed_ = false; helper_stopped = true; });
     // A live helper could reinstall rules after a flush; retire PD state only
