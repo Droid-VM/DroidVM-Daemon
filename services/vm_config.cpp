@@ -161,6 +161,7 @@ VmConfigService::Snapshot VmConfigService::replace(const CallContext& caller,
         throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before saving");
     if (next->document == previous->document && previous->persisted && !previous->recovered && !previous->durability_uncertain)
         return previous;
+    if (validate_change_) validate_change_(previous->document, next->document);
     auto update = prepare_ ? prepare_(next->document) : nullptr;
     try { file_.save(next->document); }
     catch (const config::CommitError& error) {

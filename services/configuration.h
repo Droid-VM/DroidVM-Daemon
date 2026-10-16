@@ -38,5 +38,6 @@ private:
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     void publish_pending();
+    void validate_vm_networks(const Json::Value& before, const Json::Value& after) const;
 };
 }

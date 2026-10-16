@@ -57,6 +57,9 @@ private:
     std::mutex writer_mutex_;
     Snapshot state_;
     Prepare prepare_;
+    // Coordinator binds before serving. Runs under writer + gate admission,
+    // before runtime preparation or IO; may inspect other immutable views.
+    std::function<void(const Json::Value&, const Json::Value&)> validate_change_;
     TaskService* events_;
     std::shared_ptr<ConfigurationGate> gate_;
     Snapshot state() const;

@@ -158,6 +158,96 @@ void coordinated_network_delete() {
     error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, input.network); });
     error(ErrorCode::not_found, [&] { c.service.remove_network(admin, result->revision, input.network); });
 }
+void coordinated_vm_network_references() {
+    Fixture fixture;
+    Coordinated c(fixture);
+    auto input = seed_deletion(c);
+    const auto id = input.network["id"].asString();
+    error(ErrorCode::conflict, [&] { c.service.networks().remove(admin, id); });
+    auto before = c.service.vms().snapshot(admin);
+    auto runtime = c.inventory.runtime(admin, input.vm_id);
+    auto invalid = before->document;
+    invalid["vms"][0]["networks"][0]["network_id"] = random_id(true);
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, before->revision, invalid); });
+    check(c.service.vms().snapshot(admin)->revision == before->revision
+        && c.inventory.runtime(admin, input.vm_id) == runtime, "missing reference rejected before runtime publication");
+    Json::Value op; op["op"] = "replace"; op["config"] = invalid["vms"][0];
+    Json::Value operations(Json::arrayValue); operations.append(op);
+    error(ErrorCode::conflict, [&] { c.service.vms().apply(admin, before->revision, operations); });
+    ConfigUploads uploads(&c.service.vms(), &c.service.networks());
+    auto encoded = config::encode_json(invalid);
+    auto upload = uploads.begin(admin, before->revision, encoded.size());
+    uploads.append(admin, upload, 0, encoded);
+    error(ErrorCode::conflict, [&] { uploads.commit(admin, upload); });
+    check(config::JsonFile(c.directory.get(), "vms.json", getuid(), {}, VmConfigService::max_bytes).load()->value == before->document,
+        "all VM write adapters reject dangling refs without changing disk");
+    auto canonical = before->document;
+    auto upper = id;
+    for (auto& ch : upper) if (ch >= 'a' && ch <= 'f') ch -= 'a' - 'A';
+    canonical["vms"][0]["networks"][0]["network_id"] = upper;
+    before = c.service.vms().replace(admin, before->revision, canonical);
+    auto deleted = c.service.remove_network(admin, before->revision, input.network);
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, deleted->revision, before->document); });
+    check(!c.service.networks().exists(admin, id), "fresh revision cannot resurrect deleted network references");
+}
+void coordinated_historical_network_references() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto row = config("historical");
+    Json::Value nic; nic["network_id"] = random_id(true); nic["extension"] = "old";
+    row["networks"] = Json::Value(Json::arrayValue); row["networks"].append(nic);
+    auto future = config("future"); future["schema"] = 999;
+    nic["network_id"] = future["id"]; row["networks"].append(nic);
+    nic["network_id"] = "malformed"; row["networks"].append(nic);
+    Json::Value vm_document; vm_document["vms"] = Json::Value(Json::arrayValue); vm_document["vms"].append(row);
+    Json::Value network_document; network_document["networks"] = Json::Value(Json::arrayValue); network_document["networks"].append(future);
+    config::JsonFile(directory.get(), "vms.json", getuid()).save(vm_document);
+    config::JsonFile(directory.get(), "networks.json", getuid()).save(network_document);
+    Coordinated c(fixture);
+    auto base = c.service.vms().snapshot(admin);
+    auto renamed = base->document; renamed["vms"][0]["name"] = "repairable";
+    base = c.service.vms().replace(admin, base->revision, renamed);
+    for (int mode = 0; mode < 3; ++mode) {
+        auto invalid = base->document;
+        if (mode == 0) invalid["vms"][0]["networks"].append(invalid["vms"][0]["networks"][0]);
+        if (mode == 1) invalid["vms"][0]["networks"][0]["extension"] = "changed";
+        if (mode == 2) {
+            auto copy = invalid["vms"][0]; copy["id"] = random_id(true); copy["name"] = "copy";
+            invalid["vms"].append(copy);
+        }
+        error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, base->revision, invalid); });
+    }
+    auto repaired = base->document; repaired["vms"][0]["networks"] = Json::Value(Json::arrayValue);
+    auto saved = c.service.vms().replace(admin, base->revision, repaired);
+    check(saved->document["vms"][0]["networks"].empty(), "historical dangling refs load, survive unrelated edits and can be removed");
+}
+void coordinated_reference_delete_races() {
+    for (int i = 0; i < 16; ++i) {
+        Fixture fixture;
+        Coordinated c(fixture);
+        auto input = seed_deletion(c);
+        auto edited = input.baseline->document; edited["vms"][0]["name"] = "concurrent edit";
+        std::promise<void> ready; auto begin = ready.get_future().share();
+        auto save = std::async(std::launch::async, [&] {
+            begin.wait();
+            try { c.service.vms().replace(admin, input.baseline->revision, edited); }
+            catch (const ServiceError& error) {
+                check(error.code() == ErrorCode::conflict || error.code() == ErrorCode::unavailable, "save race has bounded rejection");
+            }
+        });
+        auto remove = std::async(std::launch::async, [&] {
+            begin.wait();
+            try { c.service.remove_network(admin, input.baseline->revision, input.network); }
+            catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict, "delete race rejects stale VM revision"); }
+        });
+        ready.set_value(); save.get(); remove.get();
+        const bool exists = c.service.networks().exists(admin, input.network["id"].asString());
+        const auto after = c.service.vms().snapshot(admin);
+        check(after->document["vms"][0]["networks"].size() == (exists ? 2u : 1u), "VM edits and deletion never publish a new dangling reference");
+        check(config::JsonFile(c.directory.get(), "vms.json", getuid(), {}, VmConfigService::max_bytes).load()->value == after->document,
+            "racing edits preserve durable inventory view");
+    }
+}
 void coordinated_delete_rejections() {
     Fixture fixture;
     Coordinated c(fixture);
@@ -941,6 +1031,9 @@ int main() {
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
         {"coordinated_network_delete", coordinated_network_delete},
+        {"coordinated_vm_network_references", coordinated_vm_network_references},
+        {"coordinated_historical_network_references", coordinated_historical_network_references},
+        {"sixteen_coordinated_reference_delete_races", coordinated_reference_delete_races},
         {"coordinated_delete_rejections", coordinated_delete_rejections},
         {"coordinated_delete_failure_recovery", coordinated_delete_failure_recovery},
         {"coordinated_delete_restart", coordinated_delete_restart},

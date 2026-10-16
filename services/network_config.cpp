@@ -162,6 +162,8 @@ std::string NetworkConfigService::update_if_matches(const CallContext& caller, c
 bool NetworkConfigService::remove(const CallContext& caller, const std::string& input_id) {
     access(caller);
     auto admission = ConfigurationGate::enter(gate_);
+    if (coordinated_removal_)
+        throw ServiceError(ErrorCode::conflict, "Network deletion requires a coordinated confirmation");
     const auto id = identity(input_id);
     std::lock_guard writer(writer_mutex_);
     const auto previous = state();

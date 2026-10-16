@@ -6,6 +6,8 @@
 #include "common/identity.h"
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
+#include <map>
+#include <set>
 
 namespace droidvm {
 namespace {
@@ -41,7 +43,45 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     networks_ = std::make_unique<NetworkConfigService>(directory, owner, config::JsonFile::Observer{}, &events, true, gate_);
     vms_ = std::make_unique<VmConfigService>(directory, owner, config::JsonFile::Observer{},
         [&inventory](const Json::Value& document) { return inventory.prepare_config(document); }, &events, gate_);
+    networks_->coordinated_removal_ = true;
+    vms_->validate_change_ = [this](const Json::Value& before, const Json::Value& after) {
+        validate_vm_networks(before, after);
+    };
     exclusive.recovered();
+}
+void ConfigurationService::validate_vm_networks(const Json::Value& before, const Json::Value& after) const {
+    // Caller holds VM writer + admission. Deletion must drain that admission;
+    // all other network writes preserve existing IDs. Do not re-enter the gate
+    // or take network writer/inventory locks here (a transaction may be draining).
+    const auto networks = networks_->state();
+    auto unresolved = [&](const Json::Value& nic) {
+        const auto& value = config::member(nic, "network_id");
+        if (value.isNull() || (value.isString() && value.asString().empty())) return false;
+        Json::Value identity; identity["id"] = value;
+        try { return !networks->ids.contains(config::uuid(identity)); }
+        catch (const std::invalid_argument&) { return true; }
+    };
+    // Preserve historical unresolved NICs only in their original VM, with exact
+    // content and multiplicity. Repair/removal and unrelated edits remain possible;
+    // copying, retargeting or editing an unresolved NIC requires a live network.
+    std::map<std::string, std::multiset<Json::Value>> historical;
+    for (const auto& vm : before["vms"]) {
+        const auto& nics = config::member(vm, "networks");
+        if (!nics.isArray()) continue;
+        for (const auto& nic : nics) if (unresolved(nic))
+            historical[config::uuid(vm)].insert(nic);
+    }
+    for (const auto& vm : after["vms"]) {
+        const auto& nics = config::member(vm, "networks");
+        if (!nics.isArray()) continue;
+        auto& allowed = historical[config::uuid(vm)];
+        for (const auto& nic : nics) if (unresolved(nic)) {
+            const auto found = allowed.find(nic);
+            if (found == allowed.end())
+                throw ServiceError(ErrorCode::conflict, "VM network reference is missing or inactive; reload networks before saving");
+            allowed.erase(found);
+        }
+    }
 }
 void ConfigurationService::publish_pending() {
     vms_->publish(pending_vm_);

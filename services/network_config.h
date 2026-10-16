@@ -71,6 +71,7 @@ private:
     config::JsonFile file_;
     TaskService* events_;
     std::shared_ptr<ConfigurationGate> gate_;
+    bool coordinated_removal_ = false; // Startup binding; only coordinator may erase IDs.
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     std::shared_ptr<const State> state_;
