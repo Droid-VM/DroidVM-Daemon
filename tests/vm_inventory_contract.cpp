@@ -73,7 +73,7 @@ void conditional_network_adapter() {
     RequestDispatcher dispatcher(system, tasks, &networks);
     ClientSession session; session.caller.authorized = true;
     const auto caps = dispatcher.execute(session, "capabilities", {});
-    check(caps["network_config_update"] == "compare-config-v1" && caps["service_api_minor"] == 17,
+    check(caps["network_config_update"] == "compare-config-v1" && caps["service_api_minor"] == 18,
         "conditional network edit capability is advertised");
     check(dispatcher.background("network_config_get") && dispatcher.background("network_config_update"),
         "configuration operations use bounded workers");
@@ -99,6 +99,19 @@ void conditional_network_adapter() {
     check(response["success"] == true && response["network_id"] == id, "conditional adapter accepts request envelope");
     expect_error(admin, update, "CONFLICT");
     check(networks.get(admin, id)["name"] == "updated", "stale request cannot overwrite target");
+    check(caps["network_config_import"] == "conditional-chunks-v1"
+        && dispatcher.background("network_config_import_commit"), "network import staging is advertised on workers");
+    Json::Value begin; begin["type"] = "request"; begin["bytes"] = 17;
+    auto started = dispatcher.execute_background(admin, "network_config_import_begin", begin);
+    check(started["success"] == true && started["chunk_bytes"] == Json::UInt64(48u << 10), "network staging begins");
+    Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0;
+    chunk["data"] = "eyJvcGVyYXRpb25zIjpbXX0=";
+    check(dispatcher.execute_background(admin, "network_config_import_append", chunk)["received"] == 17, "network staging accepts strict base64");
+    auto committed = dispatcher.execute_background(admin, "network_config_import_commit", chunk);
+    check(committed["success"] == true && committed["network_ids"].isArray() && committed["network_ids"].empty(),
+        "network staging consumes an empty atomic import");
+    check(dispatcher.execute_background(admin, "network_config_import_commit", chunk)["error"]["code"] == "NOT_FOUND",
+        "network import cannot commit twice");
 }
 void network_removal_is_atomic() {
     Fixture fixture;

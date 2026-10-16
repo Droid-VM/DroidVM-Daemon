@@ -29,7 +29,9 @@ public:
                       network::HostIpv4Watch* host_ipv4 = nullptr, VmService* vms = nullptr, LegacyEvents* events = nullptr,
                       input::KeyboardGrab* keyboard = nullptr)
         : system_(system), tasks_(tasks), networks_(networks), host_network_(host_network), runtime_(runtime), host_ipv4_(host_ipv4), vms_(vms), events_(events),
-          keyboard_(keyboard) {}
+          keyboard_(keyboard) {
+        if (networks_) vm_uploads_ = std::make_unique<ConfigUploads>(nullptr, networks_);
+    }
     LegacyEvents* legacy_events() const { return events_; }
     bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr || (vms_ && !vms_swept_); }
     void maintenance() {
@@ -44,7 +46,7 @@ public:
     void set_packages(pkg::PkgService* service) { packages_ = service; }
     // Startup binding only; service outlives dispatcher and in-flight workers.
     void set_vm_config(VmConfigService* service) {
-        vm_uploads_ = service ? std::make_unique<VmConfigUploads>(*service) : nullptr;
+        vm_uploads_ = service || networks_ ? std::make_unique<ConfigUploads>(service, networks_) : nullptr;
         vm_config_ = service;
     }
     bool background(const std::string& command) const;

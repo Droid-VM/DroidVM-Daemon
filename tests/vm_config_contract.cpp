@@ -62,6 +62,94 @@ std::string stage(VmConfigUploads& uploads, const std::string& revision, const s
     }
     return id;
 }
+std::string stage_network(ConfigUploads& uploads, const std::string& bytes) {
+    auto id = uploads.begin_network(admin, bytes.size());
+    for (size_t offset = 0; offset < bytes.size(); offset += ConfigUploads::chunk_bytes) {
+        auto chunk = std::string_view(bytes).substr(offset, ConfigUploads::chunk_bytes);
+        check(uploads.append_network(admin, id, offset, chunk) == offset + chunk.size(), "network chunk accepted");
+    }
+    return id;
+}
+Json::Value imported_network() {
+    Json::Value value;
+    value["id"] = random_id(true); value["name"] = "imported";
+    value["schema"] = 2; value["bridge_name"] = "brtest";
+    return value;
+}
+void shared_upload_limits_and_domains() {
+    Temporary temp;
+    VmConfigService vms(temp.directory.get(), getuid());
+    NetworkConfigService networks(temp.directory.get(), getuid());
+    ConfigUploads::Clock::time_point now{};
+    ConfigUploads uploads(&vms, &networks, [&] { return now; });
+    const auto revision = vms.snapshot(admin)->revision;
+    auto network = uploads.begin_network(admin, NetworkConfigService::max_import_bytes);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, revision, VmConfigService::max_bytes); });
+    error(ErrorCode::not_found, [&] { uploads.abort(admin, network); });
+    error(ErrorCode::not_found, [&] { uploads.append(admin, network, 0, "{}"); });
+    error(ErrorCode::not_found, [&] { uploads.commit(admin, network); });
+    error(ErrorCode::permission_denied, [&] { uploads.abort_network({"another-admin", true, true, true}, network); });
+    uploads.abort_network(admin, network);
+    auto vm = uploads.begin(admin, revision, 2);
+    error(ErrorCode::not_found, [&] { uploads.abort_network(admin, vm); });
+    for (size_t i = 1; i < ConfigUploads::max_uploads; ++i) uploads.begin_network(admin, 2);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, revision, 2); });
+    now += ConfigUploads::lifetime;
+    network = uploads.begin_network(admin, 2);
+    error(ErrorCode::not_found, [&] { uploads.append(admin, vm, 0, "{}"); });
+    uploads.append_network(admin, network, 0, "{}");
+    check(uploads.append_network(admin, network, 0, "{}") == 2, "network repeated chunk is idempotent");
+    error(ErrorCode::conflict, [&] { uploads.append_network(admin, network, 0, "[]"); });
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_network(admin, network); });
+    error(ErrorCode::not_found, [&] { uploads.commit_network(admin, network); });
+}
+void network_upload_full_capacity_and_conflict() {
+    Temporary temp;
+    VmConfigService vms(temp.directory.get(), getuid());
+    NetworkConfigService networks(temp.directory.get(), getuid());
+    ConfigUploads uploads(&vms, &networks);
+    auto value = imported_network();
+    Json::Value document, operation; operation["expected"] = Json::Value(); operation["config"] = value;
+    document["operations"].append(operation);
+    auto bytes = wire::stringify(document);
+    bytes.resize(NetworkConfigService::max_import_bytes, ' ');
+    const auto upload = stage_network(uploads, bytes);
+    auto result = uploads.commit_network(admin, upload);
+    check(result.size() == 1 && result[0] == value["id"] && networks.get(admin, value["id"].asString()) == value,
+        "maximum network upload commits through atomic service");
+    error(ErrorCode::not_found, [&] { uploads.commit_network(admin, upload); });
+    document["operations"][0]["expected"] = value;
+    document["operations"][0]["config"]["name"] = "stale";
+    const auto stale = stage_network(uploads, wire::stringify(document));
+    value["name"] = "concurrent"; networks.update(admin, value);
+    error(ErrorCode::conflict, [&] { uploads.commit_network(admin, stale); });
+    check(networks.get(admin, value["id"].asString())["name"] == "concurrent", "staged import cannot overwrite new target");
+    const auto vm = uploads.begin(admin, vms.snapshot(admin)->revision, VmConfigService::max_bytes);
+    uploads.abort(admin, vm);
+}
+void network_upload_inflight_reservation() {
+    Temporary temp;
+    Gate reached, proceed;
+    NetworkConfigService networks(temp.directory.get(), getuid(), [&](const char* stage) {
+        if (std::string_view(stage) == "before_install") { reached.release(); proceed.wait(); }
+    });
+    VmConfigService vms(temp.directory.get(), getuid());
+    ConfigUploads::Clock::time_point now{};
+    ConfigUploads uploads(&vms, &networks, [&] { return now; });
+    Json::Value document, operation; operation["expected"] = Json::Value(); operation["config"] = imported_network();
+    document["operations"].append(operation);
+    const auto id = stage_network(uploads, wire::stringify(document));
+    auto commit = std::async(std::launch::async, [&] { return uploads.commit_network(admin, id); });
+    reached.wait();
+    now += ConfigUploads::lifetime;
+    error(ErrorCode::conflict, [&] { uploads.abort_network(admin, id); });
+    error(ErrorCode::conflict, [&] { uploads.append_network(admin, id, 0, "{}"); });
+    const auto revision = vms.snapshot(admin)->revision;
+    for (size_t i = 1; i < ConfigUploads::max_uploads; ++i) uploads.begin(admin, revision, 2);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_network(admin, 2); });
+    proceed.release();
+    check(commit.get().size() == 1, "inflight import retains shared slot through publication");
+}
 void ownership_gate() {
     Temporary temp;
     config::require_legacy_vm_config(temp.directory.get(), getuid());
@@ -495,5 +583,8 @@ int main(int argc, char** argv) {
         {"atomic_batches", atomic_batches}, {"batch_validation_permissions", batch_validation_and_permissions},
         {"snapshots_events_failure", snapshots_events_and_failure}, {"full_capacity_snapshot", full_capacity_document_snapshot},
         {"upload_limits_scope_offsets", upload_limits_scope_and_offsets}, {"upload_strict_parse_stale_revision", upload_strict_parse_and_stale_revision},
-        {"upload_commit_faults_inflight_budget", upload_commit_faults_and_inflight_budget}, {"strict_base64_chunks", strict_base64_chunks}});
+        {"upload_commit_faults_inflight_budget", upload_commit_faults_and_inflight_budget}, {"strict_base64_chunks", strict_base64_chunks},
+        {"shared_upload_limits_domains", shared_upload_limits_and_domains},
+        {"network_upload_full_capacity_conflict", network_upload_full_capacity_and_conflict},
+        {"network_upload_inflight_reservation", network_upload_inflight_reservation}});
 }

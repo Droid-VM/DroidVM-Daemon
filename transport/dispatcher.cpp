@@ -21,6 +21,8 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists",
     "network_config_get", "network_config_update"};
 constexpr std::array vm_upload_commands{"vm_config_upload_begin", "vm_config_upload_append", "vm_config_upload_commit", "vm_config_upload_abort"};
+constexpr std::array network_upload_commands{"network_config_import_begin", "network_config_import_append", "network_config_import_commit", "network_config_import_abort"};
+bool network_upload_command(const std::string& command) { return std::find(network_upload_commands.begin(), network_upload_commands.end(), command) != network_upload_commands.end(); }
 bool vm_upload_command(const std::string& command) { return std::find(vm_upload_commands.begin(), vm_upload_commands.end(), command) != vm_upload_commands.end(); }
 bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || command == "vm_start_configured" || vm_upload_command(command); }
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
@@ -165,6 +167,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
+    if (networks_ && network_upload_command(command)) return true;
     return (vm_config_ && (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
@@ -208,30 +211,41 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         } catch (const ServiceError& error) { return failure(error); }
         catch (...) { return failure(ServiceError(ErrorCode::internal, "VM start outcome is unknown; reload state before retrying")); }
     }
-    if (vm_uploads_ && vm_upload_command(command)) {
+    const bool network_upload = networks_ && network_upload_command(command);
+    if (vm_uploads_ && (network_upload || (vm_config_ && vm_upload_command(command)))) {
         try {
             if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
             if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Upload request must be an object");
             Json::Value result; result["success"] = true;
-            if (command == "vm_config_upload_begin") {
-                result["upload_id"] = vm_uploads_->begin(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
+            if (command == "vm_config_upload_begin" || command == "network_config_import_begin") {
+                result["upload_id"] = network_upload ? vm_uploads_->begin_network(caller, size_field(request, "bytes", 0))
+                    : vm_uploads_->begin(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
                 result["chunk_bytes"] = Json::UInt64(VmConfigUploads::chunk_bytes);
                 result["expires_in_seconds"] = 120;
             } else {
                 const auto id = string_field(request, "upload_id");
                 if (command == "vm_config_upload_commit") return config_status(vm_uploads_->commit(caller, id));
+                if (command == "network_config_import_commit") {
+                    result["network_ids"] = vm_uploads_->commit_network(caller, id);
+                    return result;
+                }
                 if (command == "vm_config_upload_abort") vm_uploads_->abort(caller, id);
+                else if (command == "network_config_import_abort") vm_uploads_->abort_network(caller, id);
                 else {
                     if (!request["data"].isString() || !request.isMember("offset"))
                         throw ServiceError(ErrorCode::invalid_argument, "Missing upload chunk data or offset");
                     std::string bytes;
                     try { bytes = wire::decode_base64(request["data"].asString(), VmConfigUploads::chunk_bytes); }
                     catch (const std::exception&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid base64 upload chunk"); }
-                    result["received"] = Json::UInt64(vm_uploads_->append(caller, id, size_field(request, "offset", 0), bytes));
+                    result["received"] = Json::UInt64(network_upload
+                        ? vm_uploads_->append_network(caller, id, size_field(request, "offset", 0), bytes)
+                        : vm_uploads_->append(caller, id, size_field(request, "offset", 0), bytes));
                 }
             }
             return result;
         } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Configuration upload outcome unknown; reload before retrying")); }
     }
     if (vm_config_ && command == "vm_config_apply") {
         try {
@@ -665,7 +679,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             }
             if (networks_) {
                 result["network_config_update"] = "compare-config-v1";
-                result["service_api_minor"] = 17;
+                result["network_config_import"] = "conditional-chunks-v1";
+                for (const auto* name : network_upload_commands) result["commands"].append(name);
+                result["service_api_minor"] = 18;
             }
         }
         return result;
