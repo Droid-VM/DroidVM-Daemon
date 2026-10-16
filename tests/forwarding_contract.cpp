@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "forwarding_contract.h"
+#include "firewall_contract.h"
 #include "contracts.h"
 #include "network/forwarding.h"
+#include "network/firewall.h"
 #include "network/netbox.h"
 #include "network/netlink.h"
 #include "services/network.h"
@@ -116,7 +118,7 @@ struct Path {
             netlink_exchange(message.header);
         }
     }
-    bool packet(bool ipv6, uint8_t sequence) {
+    bool packet(bool ipv6, uint8_t sequence, const std::string& expected_source = {}) {
         const size_t ip_size = ipv6 ? 40 : 20, udp = 14 + ip_size;
         std::vector<uint8_t> packet(udp + 12, 0);
         auto word = [&](size_t at, uint16_t value) { packet[at] = value >> 8; packet[at + 1] = value & 255; };
@@ -132,7 +134,9 @@ struct Path {
                 inet_pton(AF_INET, "198.18.202.2", packet.data() + 30) == 1, "encode IPv4 packet");
             word(24, checksum(packet.data() + 14, ip_size));
         }
-        word(udp, 45678); word(udp + 2, 45679); word(udp + 4, 12);
+        // A fresh flow per packet also permits meaningful NAT changes without
+        // reusing a previous conntrack translation decision.
+        word(udp, 45000 + sequence); word(udp + 2, 45679); word(udp + 4, 12);
         packet[udp + 8] = 'D'; packet[udp + 9] = 'V'; packet[udp + 10] = 'M'; packet[udp + 11] = sequence;
         if (ipv6) {
             const uint32_t pseudo = static_cast<uint16_t>(~checksum(packet.data() + 22, 32));
@@ -151,6 +155,10 @@ struct Path {
             if (count != static_cast<ssize_t>(frame.size()) || bytes[12] != packet[12] || bytes[13] != packet[13] ||
                 !std::equal(packet.begin() + udp, packet.end(), bytes + udp)) continue;
             check(bytes[ipv6 ? 21 : 22] == 63, "kernel routed packet and decremented hop count");
+            std::array<uint8_t, 16> source{};
+            const auto text = expected_source.empty() ? (ipv6 ? "fd91:fe21:201::2" : "198.18.201.2") : expected_source.c_str();
+            check(inet_pton(ipv6 ? AF_INET6 : AF_INET, text, source.data()) == 1 &&
+                std::equal(source.begin(), source.begin() + (ipv6 ? 16 : 4), bytes + (ipv6 ? 22 : 26)), "forwarded source address matches expected NAT behavior");
             return true;
         }
         return false;
@@ -207,6 +215,46 @@ void service_lifecycle() {
     set_forwarding(0); service.reconcile(admin, first); flags(0);
     for (const char* file : {"networks.json", "networks.json.bak"}) unlinkat(files.get(), file, 0);
 }
+}
+void firewall_packet_contract(const std::string& netbox, const std::string& work) {
+    // Only invoked after the firewall suite has entered its private netns.
+    executable = netbox;
+    set_forwarding(0); Path path;
+    Forwarding forwarding; auto demand = forwarding.acquire(configuration("firewall packets"));
+    const auto place = work + "/packets";
+    check(mkdir(place.c_str(), 0700) == 0, "create packet firewall inventory");
+    Fd fd(open(place.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)); Iptables iptables;
+    OwnedFirewall owner(fd.get(), getuid(), iptables);
+    check(path.packet(false, 20) && path.packet(true, 21), "baseline dual-stack data path");
+    for (const bool ipv6 : {false, true}) {
+        FirewallRule drop; drop.ipv6 = ipv6; drop.input = "fwin"; drop.output = "fwout"; drop.target = "DROP";
+        owner.put("packets", ipv6 ? "drop6" : "drop4", drop);
+    }
+    check(!path.packet(false, 22) && !path.packet(true, 23), "owned scoped drops block actual packets in both families");
+    for (const bool ipv6 : {false, true}) {
+        FirewallRule accept; accept.ipv6 = ipv6; accept.input = "fwin"; accept.output = "fwout";
+        accept.protocol = "udp"; accept.port_first = accept.port_last = 45678;
+        owner.put("packets", ipv6 ? "wrong6" : "wrong4", accept);
+    }
+    check(!path.packet(false, 24) && !path.packet(true, 25), "port-specific acceptance does not allow a different destination port");
+    for (const bool ipv6 : {false, true}) {
+        FirewallRule accept; accept.ipv6 = ipv6; accept.input = "fwin"; accept.output = "fwout";
+        accept.protocol = "udp"; accept.port_first = accept.port_last = 45679;
+        owner.put("packets", ipv6 ? "allow6" : "allow4", accept);
+    }
+    check(path.packet(false, 26) && path.packet(true, 27), "head insertion allows intended dual-stack traffic ahead of drop");
+    FirewallRule snat; snat.table = "nat"; snat.chain = "POSTROUTING"; snat.source = "198.18.201.0/24";
+    snat.output = "fwout"; snat.target = "MASQUERADE";
+    owner.put("packets", "snat", snat);
+    check(path.packet(false, 28, "198.18.202.1"), "real MASQUERADE rewrites guest source to egress router IP");
+    owner.remove("packets", "snat");
+    check(path.packet(false, 29), "removing owned NAT restores original source for new flows");
+    owner.remove("packets", "allow4"); owner.remove("packets", "allow6");
+    check(!path.packet(false, 30) && !path.packet(true, 31), "exact ACCEPT removal leaves independent DROP rules active");
+    check(owner.cleanup("packets").empty(), "packet firewall inventory cleanup");
+    check(path.packet(false, 32) && path.packet(true, 33), "cleanup restores baseline forwarding behavior");
+    for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
+    check(rmdir(place.c_str()) == 0, "packet firewall fixture empty");
 }
 void forwarding_namespace_contract(const std::string& netbox, const std::string& work) {
     const auto path = work + "/forwarding";

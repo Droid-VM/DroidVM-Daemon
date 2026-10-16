@@ -8,6 +8,7 @@ namespace droidvm::network {
 // Shared comparisons for dependent resource inventories; JSON reload can
 // change integer storage types, so numeric identity is compared by value.
 bool same_scope(const Json::Value& a, const Json::Value& b);
+Json::Value network_scope(); // current boot and network namespace identity
 bool same_link(const Json::Value& a, const Json::Value& b);
 uint32_t link_cookie(const Json::Value& identity);
 // A durable inventory of links created by this daemon. The caller holds the

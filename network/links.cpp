@@ -70,13 +70,20 @@ void owner_id(const std::string& owner) {
         throw ServiceError(ErrorCode::invalid_argument, "invalid network resource owner");
 }
 }
+Json::Value network_scope() {
+    Json::Value result;
+    result["boot"] = read_at(AT_FDCWD, "/proc/sys/kernel/random/boot_id", 64);
+    struct stat ns{};
+    require(stat("/proc/self/ns/net", &ns) == 0, "stat network namespace");
+    result["namespace_device"] = Json::UInt64(ns.st_dev); result["namespace_inode"] = Json::UInt64(ns.st_ino);
+    return result;
+}
 OwnedLinks::OwnedLinks(int directory, uid_t uid, const Netbox& netbox, Observer observer,
                        config::JsonFile::Observer file_observer)
     : netbox_(netbox), file_(directory, "network-links.json", uid, std::move(file_observer)), observer_(std::move(observer)) {
-    boot_ = read_at(AT_FDCWD, "/proc/sys/kernel/random/boot_id", 64);
-    struct stat ns{};
-    require(stat("/proc/self/ns/net", &ns) == 0, "stat network namespace");
-    namespace_device_ = ns.st_dev; namespace_inode_ = ns.st_ino;
+    const auto scope = network_scope();
+    boot_ = scope["boot"].asString();
+    namespace_device_ = scope["namespace_device"].asUInt64(); namespace_inode_ = scope["namespace_inode"].asUInt64();
     auto loaded = file_.load();
     if (loaded && loaded->recovered)
         throw ServiceError(ErrorCode::io_error, "network link primary is damaged; recovery requires the latest inventory");

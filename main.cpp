@@ -8,6 +8,7 @@
 #include "network/links.h"
 #include "network/policy_rules.h"
 #include "network/routes.h"
+#include "network/firewall.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -88,6 +89,11 @@ int main(int argc, char** argv) {
             const auto recovery_failures = switch_runtime.recover_all();
             if (!recovery_failures.empty())
                 throw std::runtime_error("Network runtime recovery incomplete: " + droidvm::wire::stringify(recovery_failures));
+            droidvm::network::Iptables iptables;
+            droidvm::network::OwnedFirewall owned_firewall(instance->directory_fd(), layout ? layout->owner() : getuid(), iptables);
+            const auto firewall_failures = owned_firewall.recover_all();
+            if (!firewall_failures.empty())
+                throw std::runtime_error("Network firewall recovery incomplete: " + droidvm::wire::stringify(firewall_failures));
             std::unique_ptr<droidvm::network::Netbox> netbox;
             std::unique_ptr<droidvm::network::OwnedLinks> owned_links;
             std::unique_ptr<droidvm::network::OwnedRules> owned_rules;
