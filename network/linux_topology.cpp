@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "linux_topology.h"
+#include "linux_plan.h"
 #include "store/network_config.h"
 #include "services/context.h"
 #include "common/wire.h"
@@ -10,13 +11,6 @@
 #include <system_error>
 
 namespace droidvm::network {
-namespace {
-struct Vlan {
-    int id;
-    std::string device, leg;
-    std::vector<std::string> addresses;
-};
-}
 LinuxTopology::LinuxTopology(const Netbox& netbox, OwnedLinks& links, Observer observer)
     : netbox_(netbox), links_(links), observer_(std::move(observer)) {}
 void LinuxTopology::disable_ra(const std::string& name) {
@@ -34,36 +28,14 @@ void LinuxTopology::disable_ra(const std::string& name) {
 }
 void LinuxTopology::start(Json::Value configuration, const std::string& mac) {
     if (!owner_.empty()) throw ServiceError(ErrorCode::conflict, "Linux topology requires cleanup before start");
-    config::validate_network(configuration);
-    if (config::string(configuration, "bridge_type") == "gvisor")
-        throw ServiceError(ErrorCode::invalid_argument, "Linux topology requires a Linux bridge");
+    const auto plan = linux_plan(configuration);
     if (!std::regex_match(mac, std::regex("([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}")))
         throw ServiceError(ErrorCode::invalid_argument, "Linux topology requires a persisted bridge MAC");
-    const auto owner = config::uuid(configuration), bridge = config::string(configuration, "bridge_name");
-    const bool l3 = config::string(configuration, "uplink_mode") != "l2";
-    std::vector<Vlan> vlans;
+    const auto& owner = plan.owner; const auto& bridge = plan.bridge;
+    const bool l3 = plan.l3;
+    const auto& vlans = plan.vlans;
     std::set<std::string> names{bridge};
-    const auto& rows = config::member(config::member(configuration, "l3"), "vlans");
-    if (l3 && rows.isArray()) for (const auto& row : rows) {
-        if (!row.isObject()) continue;
-        const int vid = std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(row, "vlan_id")));
-        Vlan vlan{vid, OwnedLinks::vlan_device(bridge, vid), vid ? OwnedLinks::vlan_leg(bridge, vid) : "", {}};
-        if (vid) { names.insert(vlan.device); names.insert(vlan.leg); }
-        std::set<std::string> unique;
-        for (const bool ipv6 : {false, true}) {
-            const auto& ip = config::member(row, ipv6 ? "ipv6" : "ipv4");
-            auto add = [&](const std::string& cidr) {
-                if (cidr.empty()) return;
-                const auto prefix = config::NetworkPrefix::parse(cidr, ipv6);
-                const auto canonical = prefix.address() + "/" + std::to_string(prefix.prefix());
-                if (unique.insert(canonical).second) vlan.addresses.push_back(canonical);
-            };
-            if (!ipv6 || config::string(ip, "source") != "dhcp_pd") add(config::string(ip, "cidr"));
-            const auto& secondary = config::member(row, ipv6 ? "ipv6_secondary" : "ipv4_secondary");
-            if (secondary.isArray()) for (const auto& cidr : secondary) if (cidr.isString()) add(cidr.asString());
-        }
-        vlans.push_back(std::move(vlan));
-    }
+    for (const auto& vlan : vlans) if (vlan.id) { names.insert(vlan.device); names.insert(vlan.leg); }
     // Validate the whole requested topology before touching the kernel. The
     // inventory still checks atomically-created identities at each operation.
     const auto inventory = links_.inventory();
@@ -77,7 +49,7 @@ void LinuxTopology::start(Json::Value configuration, const std::string& mac) {
     try {
         links_.bridge(owner_, bridge); devices_.push_back(bridge);
         links_.require_owned(owner_, bridge); netbox_.mac(bridge, mac);
-        links_.require_owned(owner_, bridge); netbox_.stp(bridge, config::boolean(configuration, "stp"));
+        links_.require_owned(owner_, bridge); netbox_.stp(bridge, plan.stp);
         if (l3) disable_ra(bridge);
         point("main_configured");
         for (const auto& vlan : vlans) {
@@ -89,7 +61,7 @@ void LinuxTopology::start(Json::Value configuration, const std::string& mac) {
                 netbox_.master(vlan.leg, vlan.device);
                 point("vlan_attached");
             }
-            for (const auto& address : vlan.addresses) {
+            for (const auto& family : vlan.addresses) for (const auto& address : family) {
                 links_.require_owned(owner_, vlan.device); netbox_.address(vlan.device, address, true);
                 point("address_added");
             }

@@ -404,6 +404,8 @@ void managed_dhcp_lifecycle() {
         check(unlinkat(directory.get(), state.c_str(), 0) == 0, "remove test state symlink");
         check(helper.start(lease->config()) && helper.healthy(), "managed DHCP reaches verified service readiness");
         const auto generation = helper.process_status().generation;
+        const auto pd_snapshot = helper.poll_pd(true);
+        check(pd_snapshot.generation == generation && pd_snapshot.addresses.empty(), "real non-PD helper publishes current generation without invented delegations");
         DhcpStatics statics;
         statics.ipv4 = wire::parse(R"([{"id":"fixed","mac":"02:00:00:12:34:56","offset":17}])");
         helper.set_statics(0, statics);

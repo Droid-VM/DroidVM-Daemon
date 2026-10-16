@@ -4,6 +4,7 @@
 #include "control_http.h"
 #include "switch_runtime.h"
 #include "runtime/managed_process.h"
+#include "pd_state.h"
 
 namespace droidvm::network {
 // Serialized by the Linux backend's worker. Caller owns the bridge topology
@@ -18,6 +19,10 @@ public:
     bool healthy() const { return ready_ && process_.status().running; }
     Json::Value status() const;
     Json::Value leases(int vlan, bool ipv6) const;
+    // Single mailbox consumer; force=true provides the watcher's periodic
+    // status backstop even if no stdout event arrived. Do not mix with raw
+    // take_output consumption. Logs remain available through tool_log().
+    PdSnapshot poll_pd(bool force = false);
     void set_statics(int vlan, DhcpStatics statics);
     Json::Value tools() const;
     Json::Value tool_log() const;
@@ -35,6 +40,7 @@ private:
     Json::Value network_;
     std::map<int, DhcpStatics> statics_;
     std::map<int, std::string> devices_;
+    PdState pd_;
     bool ready_ = false;
     std::string endpoint(int vlan) const;
     Json::Value request(HttpMethod method, const std::string& path,

@@ -4,6 +4,8 @@
 #include "network/linux_topology.h"
 #include "network/policy_rules.h"
 #include "network/routes.h"
+#include "network/linux_routing.h"
+#include "network/pd_state.h"
 #include "network/netlink.h"
 #include <linux/fib_rules.h>
 #include <arpa/inet.h>
@@ -937,6 +939,131 @@ void daemon_linux_topology_recovery() {
         test.finish();
     }
 }
+Json::Value routing_config(const std::string& bridge) {
+    auto config = topology_config(bridge);
+    config["l3"]["vlans"][2]["ipv6_secondary"].append("fd91:fe21:44::1/64");
+    return config;
+}
+void linux_routing_plan_contract() {
+    const auto config = routing_config("dtplan");
+    const auto plan = linux_plan(config);
+    const auto static_routes = linux_route_plan(plan, {});
+    check(static_routes.size() == 3 && static_routes[0].device == "dtplan", "one route plan for each L3 VLAN including zero");
+    check(static_routes[0].prefixes[0] == std::vector<std::string>({"198.18.125.0/28", "198.18.126.0/28"}) &&
+        static_routes[0].prefixes[1] == std::vector<std::string>({"fd91:fe21:12::/64", "fd91:fe21:13::/64"}), "canonical primary and secondary subnet plan preserves family order");
+    check(static_routes[2].prefixes[1] == std::vector<std::string>({"fd91:fe21:44::/64"}), "PD configured CIDR is not a live prefix, static secondary remains");
+    const auto delegated = linux_route_plan(plan, {{4094, "fd91:fe21:55::1/64"}});
+    check(delegated[2].prefixes[1] == std::vector<std::string>({"fd91:fe21:44::/64", "fd91:fe21:55::/64"}), "live PD prefix joins static secondary union");
+    check(linux_route_plan(plan, {{4094, "fd91:fe21:44::9/64"}})[2].prefixes[1].size() == 1, "overlapping static and PD subnets deduplicate");
+    error(ErrorCode::invalid_argument, [&] { linux_route_plan(plan, {{0, "fd91:fe21:55::1/64"}}); });
+    error(ErrorCode::invalid_argument, [&] { linux_route_plan(plan, {{22, "fd91:fe21:55::1/64"}}); });
+    auto l2 = config; l2["uplink_mode"] = "l2"; l2["l2"]["uplink"] = "Ethernet";
+    check(linux_route_plan(linux_plan(l2), {}).empty(), "L2 has no router-facing VLAN subnets");
+    std::vector<PolicyRule> snapshot;
+    auto vpn = test_rule("lo", false, 123456); vpn.mark.reset(); vpn.mask = 0x20000; snapshot.push_back(vpn);
+    auto default_rule = vpn; default_rule.table = 123457; default_rule.mask = 0xffff; snapshot.push_back(default_rule);
+    auto explicit_rule = default_rule; explicit_rule.mark = 123; explicit_rule.table = 123458; snapshot.push_back(explicit_rule);
+    const auto tables = RoutingTables::from(snapshot, snapshot);
+    check(tables.upstream[0] == std::vector<uint32_t>({123456, 123457}) && tables.returns[0] == std::vector<uint32_t>({123456, 123457, 123458}),
+        "egress preserves VPN precedence while return subnets cover all lookup tables");
+}
+void pd_snapshot_contract() {
+    PdState state; state.reset({{4094, "dtpd"}});
+    auto status = wire::parse(R"({"ifaces":[{"name":"dtpd","tag":"4094","pd_state":"bound","pd_address":"fd91:fe21:55::1/64"}]})");
+    ProcessOutput output; output.status.generation = 1; output.status.running = true;
+    size_t calls = 0; bool fail = false;
+    auto fetch = [&]() -> Json::Value { ++calls; if (fail) throw ServiceError(ErrorCode::unavailable, "status failed"); return status; };
+    check(state.poll(output, fetch).addresses.at(4094) == "fd91:fe21:55::1/64" && calls == 1, "initial generation requires full status");
+    check(state.poll(output, fetch).addresses.size() == 1 && calls == 1, "quiet mailbox uses authoritative cache");
+    output.lines.push_back({1, 1, ProcessStream::output, R"({"event":"pd_lost","tag":"4094"})", false});
+    check(state.poll(output, fetch).addresses.size() == 1 && calls == 2, "stale lost event cannot override newer authoritative status");
+    output.lines.clear(); output.lines.push_back({2, 1, ProcessStream::error, R"({"event":"pd_lost"})", false});
+    state.poll(output, fetch); check(calls == 2, "stderr is not an event source");
+    output.lines.clear(); output.lines.push_back({3, 1, ProcessStream::output, "{broken", false});
+    fail = true; error(ErrorCode::unavailable, [&] { state.poll(output, fetch); });
+    output.lines.clear(); fail = false; status["ifaces"][0]["pd_address"] = "";
+    check(state.poll(output, fetch).addresses.empty() && calls == 4, "failed refresh stays dirty after mailbox drain and retries genuine withdrawal");
+    status["ifaces"][0]["pd_address"] = "fd91:fe21:66::1/64";
+    output.resync_required = true; output.dropped = 4;
+    check(state.poll(output, fetch).addresses.at(4094) == "fd91:fe21:66::1/64", "overflow resynchronizes to full current state");
+    output.resync_required = false; output.dropped = 0;
+    output.lines.push_back({4, 1, ProcessStream::output, "partial", true});
+    status["ifaces"] = Json::Value(Json::arrayValue);
+    error(ErrorCode::io_error, [&] { state.poll(output, fetch); });
+    output.lines.clear();
+    status = wire::parse(R"({"ifaces":[{"name":"dtpd","tag":"4094","pd_address":"fd91:fe21:77::1/64"}]})");
+    check(state.poll(output, fetch).addresses.at(4094) == "fd91:fe21:77::1/64", "incomplete snapshot never publishes false empty success");
+    output.status.generation = 2; status["ifaces"][0]["pd_address"] = "";
+    check(state.poll(output, fetch).generation == 2 && state.poll(output, fetch).addresses.empty(), "new generation cannot inherit old delegation");
+    auto old = output; old.status.generation = 1; old.status.running = false;
+    const auto before = calls;
+    check(state.poll(old, fetch).generation == 2 && calls == before, "old generation output and death cannot override current generation");
+    status["ifaces"].append(status["ifaces"][0]);
+    error(ErrorCode::io_error, [&] { state.poll(output, fetch, true); });
+    status["ifaces"].removeIndex(1, nullptr); status["ifaces"][0]["name"] = "replaced";
+    error(ErrorCode::io_error, [&] { state.poll(output, fetch); });
+    status["ifaces"][0]["name"] = "dtpd"; status["ifaces"][0]["pd_address"] = "192.0.2.1/24";
+    error(ErrorCode::io_error, [&] { state.poll(output, fetch); });
+    status["ifaces"][0]["pd_address"] = "fd91:fe21:88::1/64";
+    check(state.poll(output, fetch, true).addresses.at(4094) == "fd91:fe21:88::1/64", "periodic forced status closes missing-event gaps");
+    output.status.running = false;
+    error(ErrorCode::unavailable, [&] { state.poll(output, fetch); });
+}
+void linux_routing_orchestration() {
+    Case test;
+    const auto config = routing_config(test.name);
+    const auto plan = linux_plan(config); const auto pd_device = plan.vlans[2].device;
+    OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+    OwnedRules rules(test.directory.get(), getuid(), links);
+    OwnedRoutes route_owner(test.directory.get(), getuid(), links);
+    LinuxTopology topology(test.netbox, links); topology.start(config, "02:de:ad:12:34:56");
+    LinuxRouting routing(config, rules, route_owner);
+    RoutingTables tables; tables.upstream = {{{123456, 123457}, {123456, 123457}}}; tables.returns = tables.upstream;
+    PdState pd_state; pd_state.reset({{4094, pd_device}});
+    ProcessOutput events; events.status.generation = 1; events.status.running = true;
+    auto pd = [&](const std::string& address) {
+        Json::Value status, iface; iface["name"] = pd_device; iface["tag"] = "4094"; iface["pd_address"] = address;
+        status["ifaces"].append(std::move(iface));
+        events.lines.clear(); events.lines.push_back({1, 1, ProcessStream::output,
+            address.empty() ? R"({"event":"pd_lost","tag":"4094"})" : R"({"event":"pd_prefix","tag":"4094"})", false});
+        return pd_state.poll(events, [&] { return status; }).addresses;
+    };
+    auto has = [&](const std::string& prefix, uint32_t table) {
+        for (const auto& route : routes(true)) if (route.output == if_nametoindex(pd_device.c_str()) && route.prefix == prefix && route.table == table) return true;
+        return false;
+    };
+    routing.reconcile(pd(""), tables);
+    check(rules.inventory()["rules"].size() == 12 && !has("fd91:fe21:14::/64", 123456) && has("fd91:fe21:44::/64", 123456),
+        "all VLAN egress chains installed, PD placeholder excluded, static secondary routed");
+    routing.reconcile(pd("fd91:fe21:55::1/64"), tables);
+    check(has("fd91:fe21:55::/64", 123456) && has("fd91:fe21:55::/64", 123457), "delegation prefix routes reach both policy tables");
+    routing.reconcile(pd("fd91:fe21:66::1/64"), tables);
+    check(!has("fd91:fe21:55::/64", 123456) && has("fd91:fe21:66::/64", 123456), "renumbering retires old dynamic prefix");
+    routing.reconcile(pd(""), tables);
+    check(!has("fd91:fe21:66::/64", 123456) && has("fd91:fe21:44::/64", 123456), "PD loss removes dynamic route and preserves static secondary");
+    auto moved = tables; moved.upstream = {{{123458}, {123458}}}; moved.returns = moved.upstream;
+    routing.reconcile({}, moved);
+    check(!has("fd91:fe21:44::/64", 123456) && has("fd91:fe21:44::/64", 123458) && rules.inventory()["rules"].size() == 6,
+        "upstream changes replace all VLAN chains and return table sets");
+    Route foreign;
+    for (const auto& route : routes(true)) if (route.output == if_nametoindex(pd_device.c_str()) && route.table == 123458 && route.prefix == "fd91:fe21:44::/64") foreign = route;
+    foreign.prefix = "fd91:fe21:77::/64"; foreign.protocol = 187; foreign.metric = 1;
+    change_route(foreign, true);
+    const auto latest_pd = pd("fd91:fe21:77::1/64");
+    error(ErrorCode::conflict, [&] { routing.reconcile(latest_pd, moved); });
+    change_route(foreign, false);
+    routing.reconcile(latest_pd, moved);
+    check(has("fd91:fe21:77::/64", 123458), "failed route update can retry against the same authoritative PD snapshot");
+    Route original;
+    for (const auto& route : routes(true)) if (route.output == foreign.output && route.table == foreign.table && route.prefix == foreign.prefix) original = route;
+    change_route(original, false); change_route(foreign, true);
+    error(ErrorCode::io_error, [&] { routing.stop(); });
+    check(rules.inventory()["rules"].empty() && route_owner.inventory()["routes"].size() == 1, "stop cleans independent rules/routes while retaining conflicting route");
+    error(ErrorCode::conflict, [&] { routing.reconcile({}, tables); });
+    change_route(foreign, false); routing.stop(); routing.stop();
+    check(route_owner.inventory()["routes"].empty(), "stop retry retires last conflict without resurrecting routing");
+    topology.stop(); test.finish();
+}
 void real_address_monitor() {
     Case test;
     OwnedLinks links(test.directory.get(), getuid(), test.netbox);
@@ -1073,6 +1200,8 @@ int main(int argc, char** argv) {
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
         {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
+        {"linux_routing_plan", linux_routing_plan_contract}, {"pd_snapshot_resynchronization", pd_snapshot_contract},
+        {"linux_routing_pd_and_table_reconciliation", linux_routing_orchestration},
         {"return_route_journal_failures", return_route_journal_failures}, {"twelve_return_route_sigkill_boundaries", return_route_crash_recovery},
         {"policy_conflicts_replacement_and_races", policy_conflicts_and_races}, {"policy_journal_failures", policy_journal_failures},
         {"twelve_policy_sigkill_boundaries", policy_crash_recovery},

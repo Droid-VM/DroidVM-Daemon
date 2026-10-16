@@ -34,6 +34,9 @@ bool BridgeDhcp::start(Json::Value network, std::map<int, DhcpStatics> statics) 
     auto plan = bridgedhcp_config(network, {"/pending/s", "/pending/key", persistent}, {}, statics);
     if (config::string(network, "bridge_type") == "gvisor") throw ServiceError(ErrorCode::invalid_argument, "bridgedhcp requires Linux topology");
     if (!plan.unresolved_pd.empty()) throw ServiceError(ErrorCode::unavailable, "PD route ownership is not connected yet");
+    std::map<int, std::string> pd_devices;
+    for (const auto& vlan : linux_plan(network).vlans) if (vlan.pd) pd_devices.emplace(vlan.id, vlan.device);
+    pd_.reset(std::move(pd_devices));
     if (!plan.needed) { network_ = std::move(network); statics_ = std::move(statics); return false; }
     struct stat info{};
     if (fstatat(state_directory_.get(), state_name.c_str(), &info, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -84,6 +87,7 @@ bool BridgeDhcp::start(Json::Value network, std::map<int, DhcpStatics> statics) 
     }
 }
 void BridgeDhcp::stop() {
+    pd_.reset({});
     ready_ = false; process_.stop(); client_.reset();
     if (process_.status().running) throw std::runtime_error("DHCP helper did not stop");
     if (!allocation_.name.empty()) {
@@ -110,6 +114,10 @@ Json::Value BridgeDhcp::request(HttpMethod method, const std::string& path, std:
 }
 Json::Value BridgeDhcp::status() const { return request(HttpMethod::get, "/v1/status"); }
 Json::Value BridgeDhcp::leases(int vlan, bool ipv6) const { return request(HttpMethod::get, endpoint(vlan) + (ipv6 ? "/leases/6" : "/leases/4")); }
+PdSnapshot BridgeDhcp::poll_pd(bool force) {
+    if (!healthy()) throw ServiceError(ErrorCode::unavailable, "DHCP helper is not ready");
+    return pd_.poll(process_.take_output(), [&] { return status(); }, force);
+}
 void BridgeDhcp::set_statics(int vlan, DhcpStatics statics) {
     const auto path = endpoint(vlan);
     auto desired = statics_; desired[vlan] = std::move(statics);
