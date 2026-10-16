@@ -41,8 +41,8 @@ Json::Value VmConfigService::normalize(Json::Value document) {
     try { return wire::parse(config::encode_json(document, max_bytes)); }
     catch (const std::exception&) { throw ServiceError(ErrorCode::resource_exhausted, "VM configuration storage limit exceeded"); }
 }
-VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer)
-    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict) {
+VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::Observer observer, Prepare prepare)
+    : file_(directory, "vms.json", owner, std::move(observer), max_bytes, config::JsonSyntax::strict), prepare_(std::move(prepare)) {
     auto loaded = file_.load();
     auto initial = std::make_shared<VmConfigSnapshot>();
     initial->document = normalize(loaded ? std::move(loaded->value) : Json::Value(Json::objectValue));
@@ -50,6 +50,8 @@ VmConfigService::VmConfigService(int directory, uid_t owner, config::JsonFile::O
     initial->recovered = loaded && loaded->recovered;
     initial->persisted = loaded.has_value();
     initial->durability_uncertain = loaded.has_value();
+    auto update = prepare_ ? prepare_(initial->document) : nullptr;
+    if (update) update->commit();
     state_ = std::move(initial);
 }
 VmConfigService::Snapshot VmConfigService::state() const {
@@ -85,15 +87,18 @@ VmConfigService::Snapshot VmConfigService::replace(const CallContext& caller,
         throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before saving");
     if (next->document == previous->document && previous->persisted && !previous->recovered && !previous->durability_uncertain)
         return previous;
+    auto update = prepare_ ? prepare_(next->document) : nullptr;
     try { file_.save(next->document); }
     catch (const config::CommitError& error) {
         if (error.installed) {
             next->durability_uncertain = true;
+            if (update) update->commit();
             publish(next);
         }
         throw ServiceError(error.installed ? ErrorCode::commit_uncertain : ErrorCode::io_error,
             error.installed ? "VM configuration installed; durability could not be confirmed" : "VM configuration could not be saved");
     } catch (const std::exception&) { throw ServiceError(ErrorCode::io_error, "VM configuration could not be saved"); }
+    if (update) update->commit();
     publish(next);
     return next;
 }

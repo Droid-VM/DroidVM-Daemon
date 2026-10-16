@@ -5,6 +5,7 @@
 #include <atomic>
 #include <dirent.h>
 #include <future>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -120,9 +121,133 @@ void lifecycle_races(bool removing) {
 }
 void modify_races() { lifecycle_races(false); }
 void remove_races() { lifecycle_races(true); }
+void persistent_inventory_commit() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    std::string failure;
+    VmConfigService store(directory.get(), getuid(), [&](const char* stage) {
+        if (failure == stage) throw std::runtime_error("injected IO failure");
+    }, [&](const Json::Value& document) { return inventory.prepare_config(document); });
+    auto initial = store.snapshot(admin);
+    auto document = initial->document;
+    document["vms"].append(config("first"));
+    document["vms"].append(config("second"));
+    auto saved = store.replace(admin, initial->revision, document);
+    const auto id = saved->document["vms"][0]["id"].asString();
+    const auto other = saved->document["vms"][1]["id"].asString();
+    auto original = inventory.runtime(admin, id), unchanged = inventory.runtime(admin, other);
+    error(ErrorCode::conflict, [&] { inventory.create(admin, config("bypass")); });
+    error(ErrorCode::conflict, [&] { inventory.modify(admin, saved->document["vms"][0]); });
+    error(ErrorCode::conflict, [&] { inventory.remove(admin, id); });
+    error(ErrorCode::conflict, [&] { inventory.drop_network("network"); });
+    original->log("stdio")->append("history before commit\n");
+    auto changed = saved->document;
+    changed["vms"][0]["name"] = "changed";
+    failure = "before_install";
+    error(ErrorCode::io_error, [&] { store.replace(admin, saved->revision, changed); });
+    check(store.snapshot(admin) == saved && inventory.runtime(admin, id) == original, "pre-install failure retains snapshot and runtime");
+    check(!original->start() && fixture.starts == 1, "aborted persistence releases lifecycle lease");
+    failure = "installed";
+    error(ErrorCode::commit_uncertain, [&] { store.replace(admin, saved->revision, changed); });
+    auto uncertain = store.snapshot(admin);
+    config::JsonFile disk(directory.get(), "vms.json", getuid());
+    check(disk.load()->value == uncertain->document, "installed failure snapshot agrees with actual file");
+    auto replacement = inventory.runtime(admin, id);
+    check(uncertain->durability_uncertain && replacement != original && inventory.get(admin, id)["name"] == "changed", "installed failure publishes runtime and uncertain snapshot together");
+    check(inventory.runtime(admin, other) == unchanged && replacement->log("stdio")->contents() == original->log("stdio")->contents(), "unchanged runtime and persistent console survive commit");
+    check(!original->start() && fixture.starts == 1, "installed failure retires stale reference");
+    failure.clear();
+    auto confirmed = store.replace(admin, uncertain->revision, uncertain->document);
+    check(!confirmed->durability_uncertain && inventory.runtime(admin, id) == replacement, "durability retry does not replace runtime");
+    auto removed = confirmed->document;
+    removed["vms"].removeIndex(0, nullptr);
+    store.replace(admin, confirmed->revision, removed);
+    check(!inventory.exists(admin, id) && !replacement->start() && fixture.starts == 1, "persistent deletion retires removed runtime");
+    VmService reopened(fixture.context);
+    VmConfigService restart(directory.get(), getuid(), {}, [&](const Json::Value& value) { return reopened.prepare_config(value); });
+    check(reopened.list(admin).size() == 1 && reopened.exists(admin, other), "startup loads committed inventory through participant");
+}
+void persistent_busy_and_unchanged() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Gate entered, proceed;
+    fixture.context.shutting_down = [&] { entered.release(); proceed.wait(); return true; };
+    VmService inventory(fixture.context);
+    unsigned writes = 0;
+    VmConfigService store(directory.get(), getuid(), [&](const char* stage) {
+        if (std::string_view(stage) == "before_write") ++writes;
+    }, [&](const Json::Value& value) { return inventory.prepare_config(value); });
+    auto empty = store.snapshot(admin);
+    auto document = empty->document; document["vms"].append(config("busy"));
+    auto saved = store.replace(admin, empty->revision, document);
+    const auto id = saved->document["vms"][0]["id"].asString();
+    auto runtime = inventory.runtime(admin, id);
+    Json::Value live_nics(Json::arrayValue);
+    Json::Value live_nic; live_nic["tap_name"] = "runtime-only"; live_nics.append(live_nic);
+    runtime->set_networks(live_nics);
+    auto starting = std::async(std::launch::async, [&] { return runtime->start(); });
+    entered.wait();
+    // Release the lifecycle gate even when an assertion throws.
+    struct Release { Gate& gate; ~Release() { gate.release(); } } release{proceed};
+    auto changed = saved->document; changed["vms"][0]["name"] = "edited";
+    error(ErrorCode::conflict, [&] { store.replace(admin, saved->revision, changed); });
+    auto removed = saved->document; removed["vms"].clear();
+    error(ErrorCode::conflict, [&] { store.replace(admin, saved->revision, removed); });
+    check(writes == 1 && store.snapshot(admin) == saved, "busy edits fail before disk write");
+    auto added = saved->document; added["vms"].append(config("new"));
+    auto current = store.replace(admin, saved->revision, added);
+    check(inventory.runtime(admin, id) == runtime && current->document["vms"].size() == 2, "adding another VM preserves a busy unchanged runtime");
+    check(runtime->config()["networks"] == live_nics, "live-only fields do not turn an unchanged VM into an edit");
+    proceed.release();
+    check(!starting.get(), "fixture never starts VMM");
+}
+void persistent_publication_and_writers() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    Gate saving, proceed;
+    bool block = false;
+    VmConfigService store(directory.get(), getuid(), [&](const char* stage) {
+        if (block && std::string_view(stage) == "before_install") { saving.release(); proceed.wait(); }
+    }, [&](const Json::Value& value) { return inventory.prepare_config(value); });
+    auto empty = store.snapshot(admin);
+    auto document = empty->document; document["vms"].append(config("original"));
+    auto original = store.replace(admin, empty->revision, document);
+    const auto id = original->document["vms"][0]["id"].asString();
+    auto old = inventory.runtime(admin, id);
+    auto changed = original->document; changed["vms"][0]["name"] = "committed";
+    block = true;
+    auto writer = std::async(std::launch::async, [&] { return store.replace(admin, original->revision, changed); });
+    saving.wait();
+    struct Release { Gate& gate; ~Release() { gate.release(); } } release{proceed};
+    check(store.snapshot(admin) == original, "old immutable snapshot remains readable during persistence");
+    // This request has already retained the old object, before publication.
+    auto stale_start = std::async(std::launch::async, [&] { return old->start(); });
+    proceed.release();
+    auto committed = writer.get();
+    check(!stale_start.get() && fixture.starts == 0, "waiting stale start is rejected after publication");
+    check(inventory.get(admin, id)["name"] == "committed", "inventory follows published snapshot");
+    block = false;
+    std::atomic<int> success{0}, conflicts{0}, failures{0};
+    std::vector<std::thread> writers;
+    for (int i = 0; i < 12; ++i) writers.emplace_back([&, i] {
+        auto candidate = committed->document;
+        candidate["vms"][0]["name"] = "winner-" + std::to_string(i);
+        try { store.replace(admin, committed->revision, candidate); ++success; }
+        catch (const ServiceError& error) { if (error.code() == ErrorCode::conflict) ++conflicts; else ++failures; }
+        catch (...) { ++failures; }
+    });
+    for (auto& thread : writers) thread.join();
+    check(success == 1 && conflicts == 11 && failures == 0, "one persistent inventory writer wins revision race");
+    check(inventory.get(admin, id) == store.snapshot(admin)->document["vms"][0], "winning runtime agrees with winning configuration");
+}
 }
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
         {"lease_abort_move_lifetime", lease_abort_and_lifetime},
-        {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races}});
+        {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
+        {"persistent_inventory_commit", persistent_inventory_commit},
+        {"persistent_busy_and_unchanged", persistent_busy_and_unchanged},
+        {"persistent_publication_and_writers", persistent_publication_and_writers}});
 }

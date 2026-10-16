@@ -3,6 +3,7 @@
 #include "context.h"
 #include "store/json_file.h"
 #include <memory>
+#include <functional>
 #include <mutex>
 
 namespace droidvm {
@@ -22,9 +23,16 @@ struct VmConfigSnapshot {
 // This service is not yet enabled by the production entry point.
 class VmConfigService {
 public:
+    // Prepared participants retain their locks until after snapshot publication.
+    // All allocation/validation happens in prepare; commit cannot fail after rename.
+    struct Commit {
+        virtual ~Commit() = default;
+        virtual void commit() noexcept = 0;
+    };
+    using Prepare = std::function<std::unique_ptr<Commit>(const Json::Value&)>;
     using Snapshot = std::shared_ptr<const VmConfigSnapshot>;
     static constexpr size_t max_bytes = 16u << 20;
-    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {});
+    explicit VmConfigService(int files_directory, uid_t owner, config::JsonFile::Observer observer = {}, Prepare prepare = {});
     Snapshot snapshot(const CallContext& caller) const;
     // Replace the COMPLETE document obtained from snapshot, preserving opaque
     // fields in that document. No implicit merge, stale overwrite or retry.
@@ -36,6 +44,7 @@ private:
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     Snapshot state_;
+    Prepare prepare_;
     Snapshot state() const;
     void publish(Snapshot next);
     static Json::Value normalize(Json::Value document);

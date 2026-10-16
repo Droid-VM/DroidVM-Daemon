@@ -6,6 +6,7 @@
 #include "vm/nic.h"
 #include <bit>
 #include <regex>
+#include <set>
 #include "common/fd.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -99,7 +100,62 @@ void VmService::add(const std::string& id, Json::Value config) {
         if (other.id == id) throw ServiceError(ErrorCode::invalid_argument, "Config ID already exists: " + id);
         if (config::member(other.vm->config(), "name") == name) throw ServiceError(ErrorCode::invalid_argument, "Config name already exists: " + name.asString());
     }
-    entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, std::move(config), context_)});
+    auto runtime = std::make_shared<vm::VmRuntime>(id, config, context_);
+    entries_.push_back({id, std::move(runtime), std::move(config)});
+}
+class VmService::ConfigUpdate final : public VmConfigService::Commit {
+public:
+    ConfigUpdate(VmService& owner, const Json::Value& document) : owner_(owner), lock_(owner.mutex_) {
+        if (owner.shutting_down_->load()) throw ServiceError(ErrorCode::unavailable, "VM service is shutting down");
+        if (!owner.config_managed_ && !owner.entries_.empty())
+            throw ServiceError(ErrorCode::conflict, "Persistent VM configuration must attach before loading legacy inventory");
+        const auto& rows = document["vms"];
+        if (!rows.isArray()) throw ServiceError(ErrorCode::invalid_argument, "A complete VM configuration list is required");
+        std::map<std::string, const Json::Value*> definitions;
+        std::set<std::string> names;
+        for (const auto& row : rows) {
+            const auto id = config::uuid(row);
+            const auto& name = config::member(row, "name");
+            if (!name.isString() || !names.insert(name.asString()).second || !definitions.emplace(id, &row).second)
+                throw ServiceError(ErrorCode::invalid_argument, "Duplicate or invalid VM definition");
+        }
+        // Freeze every changed/deleted instance before preparing replacements.
+        // Unchanged VMs keep their runtime, console and live configuration.
+        leases_.reserve(owner.entries_.size());
+        for (const auto& entry : owner.entries_) {
+            const auto found = definitions.find(entry.id);
+            if (found != definitions.end() && *found->second == entry.definition) continue;
+            auto lease = entry.vm->try_edit();
+            if (!lease) throw ServiceError(ErrorCode::conflict, "VM " + entry.id + " is busy; cannot save configuration");
+            leases_.push_back(std::move(lease));
+        }
+        entries_.reserve(rows.size());
+        for (const auto& row : rows) {
+            const auto id = config::uuid(row);
+            const auto* previous = owner.find(id);
+            if (previous && previous->definition == row) entries_.push_back(*previous);
+            else entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, row, owner.context_), row});
+        }
+    }
+    void commit() noexcept override {
+        if (committed_) return;
+        for (auto& lease : leases_) lease.retire();
+        owner_.entries_.swap(entries_);
+        owner_.config_managed_ = true;
+        committed_ = true;
+    }
+private:
+    VmService& owner_;
+    std::unique_lock<std::mutex> lock_;
+    std::vector<Entry> entries_;
+    std::vector<vm::VmRuntime::StoppedLease> leases_;
+    bool committed_ = false;
+};
+std::unique_ptr<VmConfigService::Commit> VmService::prepare_config(const Json::Value& document) {
+    return std::make_unique<ConfigUpdate>(*this, document);
+}
+void VmService::require_legacy_writer() const {
+    if (config_managed_) throw ServiceError(ErrorCode::conflict, "VM configuration requires a revisioned persistent update");
 }
 Json::Value VmService::list(const CallContext& caller) const {
     access(caller);
@@ -134,6 +190,7 @@ std::string VmService::create(const CallContext& caller, Json::Value value) {
     auto config = config::migrate_vm(std::move(value));
     const auto id = config::uuid(config); // invalid_argument: legacy internal error
     std::lock_guard lock(mutex_);
+    require_legacy_writer();
     for (const auto& entry : entries_) if (entry.id == id) throw ServiceError(ErrorCode::conflict, "VM " + id + " already exists");
     config["id"] = id;
     add(id, std::move(config));
@@ -144,6 +201,7 @@ std::string VmService::modify(const CallContext& caller, Json::Value value) {
     auto config = config::migrate_vm(std::move(value));
     const auto id = config::uuid(config);
     std::lock_guard lock(mutex_);
+    require_legacy_writer();
     auto at = entries_.begin();
     while (at != entries_.end() && at->id != id) ++at;
     if (at == entries_.end()) throw ServiceError(ErrorCode::not_found, "VM " + id + " not found");
@@ -165,6 +223,7 @@ bool VmService::remove(const CallContext& caller, const std::string& id) {
     std::shared_ptr<vm::VmRuntime> target;
     {
         std::lock_guard lock(mutex_);
+        require_legacy_writer();
         const auto* entry = find(id);
         if (!entry) return false;
         target = entry->vm;
@@ -261,6 +320,7 @@ std::vector<std::string> VmService::busy_vms_using(const std::string& network) c
 }
 void VmService::drop_network(const std::string& network) {
     std::lock_guard lock(mutex_);
+    require_legacy_writer();
     for (const auto& entry : entries_) {
         const auto config = entry.vm->config();
         const auto& nics = config::member(config, "networks");

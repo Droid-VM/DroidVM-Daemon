@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "context.h"
+#include "vm_config.h"
 #include "vm/runtime.h"
 #include "network/helper_config.h"
 #include <map>
@@ -16,9 +17,10 @@
 namespace droidvm {
 using VmState = vm::State;
 inline const char* vm_state_name(VmState state) { return vm::state_name(state); }
-// VMInstanceStore semantics. vms.json is read once at startup and never
-// written: the app owns it and re-sends a config (vm_create/vm_modify)
-// before every start. Each entry owns its runtime (console streams, VMM).
+// Legacy mode reads vms.json once: the app owns it and re-sends a config
+// before each start. A VmConfigService participant instead owns a revisioned
+// persistent inventory and disables legacy writes. Production still uses
+// legacy mode. Each entry owns its runtime (console streams, VMM).
 class VmService {
 public:
     // A file that fails to load as a whole starts empty, as DataStore.load.
@@ -33,6 +35,10 @@ public:
     // Rejects a VM that is not stopped. A rejected rename keeps the old entry.
     std::string modify(const CallContext& caller, Json::Value config);
     bool remove(const CallContext& caller, const std::string& id); // false when unknown
+    // Internal single-writer participant, called with normalized complete document.
+    // Attach before loading/serving legacy inventory. Commit disables legacy writes.
+    // Owner must outlive the returned transaction and its VmConfigService.
+    std::unique_ptr<VmConfigService::Commit> prepare_config(const Json::Value& document);
     // The VM's runtime; not_found carries the legacy "VM not found: <id>".
     std::shared_ptr<vm::VmRuntime> runtime(const CallContext& caller, const std::string& id) const;
     void stop_all(); // stopAll: refuses further starts
@@ -53,10 +59,12 @@ public:
     size_t loaded() const { return loaded_; }
     const std::string& load_error() const { return load_error_; }
 private:
-    struct Entry { std::string id; std::shared_ptr<vm::VmRuntime> vm; };
+    struct Entry { std::string id; std::shared_ptr<vm::VmRuntime> vm; Json::Value definition; };
+    class ConfigUpdate;
     vm::RuntimeContext context_;
     mutable std::mutex mutex_;
     std::vector<Entry> entries_;
+    bool config_managed_ = false; // mutex_: persistent configuration owns inventory
     std::shared_ptr<std::atomic<bool>> shutting_down_ = std::make_shared<std::atomic<bool>>(false);
     mutable std::mutex app_mutex_; // read from VMM launch threads
     Json::Value app_config_{Json::objectValue};
@@ -67,6 +75,7 @@ private:
     static std::optional<std::string> canonical(const std::string& id);
     const Entry* find(const std::string& id) const;
     void add(const std::string& id, Json::Value config);
+    void require_legacy_writer() const; // mutex_ held
     void auto_up();
 };
 }
