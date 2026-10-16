@@ -14,6 +14,7 @@ public:
     ~Gvswitch() override;
     void start(const Json::Value& config) override;
     bool healthy() const override;
+    void refresh() override;
     void recover(const Json::Value& config) override;
     void stop() override;
     Json::Value tools() const override;

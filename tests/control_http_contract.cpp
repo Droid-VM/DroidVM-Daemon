@@ -14,6 +14,7 @@
 #include "runtime/helper_identity.h"
 #include "common/identity.h"
 #include <cstring>
+#include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
 #include <future>
@@ -594,9 +595,29 @@ void real_network_lifecycle() {
     const auto first_generation = backend->status().generation;
     check(service.start(admin, id).state == NetworkState::running && backend->status().generation == first_generation, "duplicate healthy start is idempotent");
     error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    now += 5s;
+    const auto stable = service.get(admin, id).generation;
+    check(service.reconcile(admin, id).generation == stable && backend->status().generation == first_generation,
+        "healthy API refresh neither restarts helper nor changes network revision");
+    check(backend->signal(SIGSTOP), "suspend only held test switch to stall its control API");
+    now += 5s;
+    const auto stalled = std::chrono::steady_clock::now();
+    check(service.reconcile(admin, id).state == NetworkState::failed && backend->status().running && !backend->healthy(),
+        "live but unresponsive helper fails bounded API refresh");
+    check(std::chrono::steady_clock::now() - stalled >= 1900ms && std::chrono::steady_clock::now() - stalled < 4s,
+        "refresh uses one bounded control request deadline");
+    const auto stalled_revision = service.get(admin, id).generation;
+    check(service.reconcile(admin, id).generation == stalled_revision && backend->status().generation == first_generation,
+        "stalled helper recovery obeys backoff");
+    check(backend->signal(SIGCONT), "resume held test helper before recovery");
+    now += 5s;
+    check(service.reconcile(admin, id).state == NetworkState::running && backend->status().generation > first_generation,
+        "control-plane failure recovers a still-live helper under the same lease");
+    const auto recovered_generation = backend->status().generation;
     check(backend->signal(SIGKILL), "kill only held test switch pidfd"); await_exit(*backend);
     error(ErrorCode::unavailable, [&] { service.start(admin, id); });
-    check(service.reconcile(admin, id).state == NetworkState::running && backend->status().generation > first_generation,
+    now += 5s;
+    check(service.reconcile(admin, id).state == NetworkState::running && backend->status().generation > recovered_generation,
         "real switch crash recovers without dropping configuration lease");
     auto directory = switch_directory(path);
     write_file(directory + "/retained", "unknown file must survive cleanup");
@@ -628,6 +649,92 @@ void real_network_lifecycle() {
     check(runtimes.inventory()["switches"].empty(), "all lifecycle inventory entries retired");
     for (const char* file : {"networks.json", "networks.json.bak", "unready", "network-runtime.json", "network-runtime.json.bak"}) unlinkat(dir.get(), file, 0);
     check(rmdir(path.c_str()) == 0, "lifecycle leaves no runtime directories");
+}
+void network_live_refresh_retry_and_serialization() {
+    const auto path = work + "/refresh";
+    check(mkdir(path.c_str(), 0700) == 0, "create refresh case directory");
+    Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    NetworkConfigService configs(directory.get(), getuid());
+    auto configuration = wire::parse(R"({"schema":2,"name":"refresh","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
+    configuration["id"] = random_id(true);
+    const auto first = configs.create(admin, configuration);
+    auto independent = configuration; independent["id"] = random_id(true); independent["name"] = "independent";
+    const auto second = configs.create(admin, independent);
+    struct RefreshBackend final : Backend {
+        bool live = false, fail = false, blocked = false, exit_during_refresh = false;
+        int refreshes = 0, recoveries = 0;
+        Gate entered, proceed;
+        void start(const Json::Value&) override { live = true; }
+        bool healthy() const override { return live; }
+        void refresh() override {
+            ++refreshes;
+            if (blocked) { entered.release(); proceed.wait(); }
+            if (fail) throw std::runtime_error("transient route conflict");
+            if (exit_during_refresh) live = false;
+        }
+        void recover(const Json::Value&) override { ++recoveries; live = true; }
+        void stop() override { live = false; }
+    };
+    std::map<std::string, RefreshBackend*> backends;
+    std::atomic<int> seconds{0};
+    const auto initial = NetworkService::Clock::now();
+    NetworkService service(configs, [&](const Json::Value& config) {
+        auto result = std::make_unique<RefreshBackend>(); backends[config["id"].asString()] = result.get(); return result;
+    }, [&] { return initial + std::chrono::seconds(seconds.load()); });
+    service.start(admin, first); service.start(admin, second);
+    auto& backend = *backends.at(first);
+    const auto revision = service.get(admin, first).generation;
+    check(service.reconcile(admin, first).generation == revision && backend.refreshes == 0, "initial readiness has refresh interval");
+    seconds = 5;
+    check(service.reconcile(admin, first).generation == revision && backend.refreshes == 1, "successful unchanged poll preserves revision");
+    backend.fail = true; seconds = 10;
+    auto failed = service.reconcile(admin, first);
+    check(failed.state == NetworkState::failed && failed.desired_running && failed.error == "transient route conflict" && backend.live,
+        "refresh failure visible without tearing down live backend");
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    check(service.reconcile(admin, first).generation == failed.generation && backend.refreshes == 2 && backend.recoveries == 0,
+        "transient refresh failure retains lease and observes retry interval");
+    backend.fail = false; seconds = 15;
+    auto resumed = service.reconcile(admin, first);
+    check(resumed.state == NetworkState::running && resumed.error.empty() && backend.recoveries == 0 && backend.refreshes == 3,
+        "successful retry clears FAILED without rebuilding healthy resources");
+    backend.blocked = true; seconds = 20;
+    auto refresh = std::async(std::launch::async, [&] { return service.reconcile(admin, first); });
+    backend.entered.wait();
+    try {
+        check(service.get(admin, first).state == NetworkState::running, "queries do not wait for refresh I/O");
+        error(ErrorCode::conflict, [&] { service.stop(admin, first); });
+        error(ErrorCode::conflict, [&] { service.start(admin, first); });
+        check(service.reconcile(admin, first).state == NetworkState::running, "concurrent reconciliation does not enter backend");
+        check(service.stop(admin, second).state == NetworkState::stopped, "independent network stops during blocked refresh");
+        backend.proceed.release(); refresh.get();
+    } catch (...) { backend.proceed.release(); refresh.wait(); throw; }
+    check(backend.refreshes == 4, "refresh serialized with same-network operations");
+    backend.exit_during_refresh = true; seconds = 25;
+    check(service.reconcile(admin, first).state == NetworkState::failed && backend.recoveries == 0,
+        "post-refresh health checked even when refresh did not throw");
+    seconds = 30;
+    check(service.reconcile(admin, first).state == NetworkState::running && backend.recoveries == 1,
+        "unhealthy refresh uses recovery rather than retrying live update");
+    backend.exit_during_refresh = false;
+    Gate occupied, proceed, completed;
+    TaskLimits limits; limits.workers = 1; limits.queued = 2;
+    TaskService workers(limits);
+    workers.post(admin, [&](bool discarded) { if (!discarded) { occupied.release(); proceed.wait(); } });
+    occupied.wait(); seconds = 40;
+    try {
+        service.schedule_reconcile(workers);
+        for (int i = 0; i < 20; ++i) { ++seconds; service.schedule_reconcile(workers); }
+        workers.post(admin, [&](bool discarded) { if (!discarded) completed.release(); });
+        error(ErrorCode::resource_exhausted, [&] { workers.post(admin, [](bool) {}); });
+        service.stop(admin, first);
+        proceed.release(); completed.wait(); workers.shutdown();
+        check(service.get(admin, first).state == NetworkState::stopped, "queued maintenance cannot resurrect explicit stop");
+        configs.update(admin, configuration);
+    } catch (...) { proceed.release(); workers.shutdown(); throw; }
+    check(service.shutdown().empty(), "refresh contract shutdown");
+    for (const char* name : {"networks.json", "networks.json.bak"}) unlinkat(directory.get(), name, 0);
+    check(rmdir(path.c_str()) == 0, "refresh contract reclaimed");
 }
 void real_network_parallel_and_start_cleanup() {
     const auto path = work + "/parallel";
@@ -851,6 +958,7 @@ int main(int argc, char** argv) {
         {"managed_dhcp_owner_death_and_daemon_recovery", managed_dhcp_daemon_recovery},
         {"typed_helper_inventory_compatibility", typed_helper_inventory},
         {"network_autostart_queue_and_stop", network_autostart_queue_and_stop},
+        {"network_live_refresh_retry_and_serialization", network_live_refresh_retry_and_serialization},
         {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup},
         {"real_switch_owner_sigkill", real_switch_owner_death},
         {"switch_inventory_sigkill_boundaries", switch_inventory_crash_boundaries},

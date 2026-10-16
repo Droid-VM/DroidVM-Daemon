@@ -21,6 +21,7 @@ struct NetworkService::Slot {
     std::unique_ptr<NetworkRuntimeLease> lease;
     std::unique_ptr<network::Backend> backend;
     Clock::time_point next_recovery{};
+    Clock::time_point next_refresh{};
 };
 NetworkService::NetworkService(NetworkConfigService& configs, Factory factory, Now now)
     : configs_(configs), factory_(std::move(factory)), now_(std::move(now)) {
@@ -78,6 +79,7 @@ NetworkView NetworkService::start_impl(const CallContext& caller, const std::str
         target->backend->start(target->lease->config());
         if (!target->backend->healthy()) throw std::runtime_error("Network backend is not ready");
         target->next_recovery = {};
+        target->next_refresh = now_() + std::chrono::seconds(5);
         state(*target, NetworkState::running, true);
     } catch (const std::exception& error) {
         std::string detail = error.what();
@@ -108,7 +110,24 @@ NetworkView NetworkService::reconcile(const CallContext& caller, const std::stri
     if (!operation.owns_lock()) return view(*target);
     { std::lock_guard lock(mutex_); if (shutting_down_) return view(*target); }
     if (!view(*target).desired_running || !target->backend || !target->lease) return view(*target);
-    if (target->backend->healthy()) return view(*target);
+    if (target->backend->healthy()) {
+        if (now_() < target->next_refresh) return view(*target);
+        try {
+            target->backend->refresh();
+            if (!target->backend->healthy()) throw std::runtime_error("Network backend became unavailable during refresh");
+            const auto previous = view(*target);
+            // An unchanged poll must not generate a new observable revision.
+            if (previous.state != NetworkState::running || !previous.error.empty() || previous.tools != target->backend->tools())
+                state(*target, NetworkState::running, true);
+        } catch (const std::exception& error) {
+            state(*target, NetworkState::failed, true, error.what());
+            // A control-plane failure can invalidate a still-live process.
+            // Keep the same backoff before rebuilding it as after recovery.
+            if (!target->backend->healthy()) target->next_recovery = now_() + std::chrono::seconds(5);
+        }
+        target->next_refresh = now_() + std::chrono::seconds(5);
+        return view(*target);
+    }
     if (now_() < target->next_recovery) {
         if (view(*target).state != NetworkState::failed)
             state(*target, NetworkState::failed, true, "Network backend exited; recovery retry deferred");
@@ -119,8 +138,10 @@ NetworkView NetworkService::reconcile(const CallContext& caller, const std::stri
     try {
         target->backend->recover(target->lease->config());
         if (!target->backend->healthy()) throw std::runtime_error("Recovered network is not ready");
+        target->next_refresh = now_() + std::chrono::seconds(5);
         state(*target, NetworkState::running, true);
     } catch (const std::exception& error) { state(*target, NetworkState::failed, true, error.what()); }
+    target->next_recovery = now_() + std::chrono::seconds(5);
     return view(*target);
 }
 Json::Value NetworkService::shutdown() {

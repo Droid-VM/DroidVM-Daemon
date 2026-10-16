@@ -32,6 +32,8 @@ public:
     NetworkView start(const CallContext& caller, const std::string& id);
     NetworkView stop(const CallContext& caller, const std::string& id);
     // Owner schedules bounded worker ticks; no hidden unbounded watchdog thread.
+    // Healthy backends refresh every five seconds. Refresh failures retain the
+    // config lease and retry; unhealthy backends recover with the same backoff.
     NetworkView reconcile(const CallContext& caller, const std::string& id);
     Json::Value tool_log(const CallContext& caller, const std::string& id, const std::string& key);
     void schedule_reconcile(TaskService& workers); // event-loop caller, no backend I/O

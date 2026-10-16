@@ -11,6 +11,12 @@ public:
     virtual ~Backend() = default;
     virtual void start(const Json::Value& config) = 0;
     virtual bool healthy() const = 0;
+    // Bounded periodic I/O on the same worker/operation lease as start/stop.
+    // Refresh live routing/PD state or verify the helper control plane here.
+    // A throw retains the backend and its config lease for retry. Mark the
+    // backend unhealthy only if recovery must rebuild it, rather than retrying
+    // a transient reconciliation failure against the existing data path.
+    virtual void refresh() {}
     virtual void recover(const Json::Value& config) = 0;
     virtual void stop() = 0;
     virtual Json::Value tools() const { return Json::Value(Json::arrayValue); }

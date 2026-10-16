@@ -19,6 +19,17 @@ Gvswitch::Gvswitch(std::string executable, SwitchRuntime& runtime)
 }
 Gvswitch::~Gvswitch() { try { stop(); } catch (...) {} }
 bool Gvswitch::healthy() const { return ready_ && process_.status().running; }
+void Gvswitch::refresh() {
+    try {
+        if (!healthy() || !client_) throw std::runtime_error("gvswitch is not ready");
+        const auto response = client_->request(HttpMethod::get, "/api/v1/ports", {}, {std::chrono::seconds(2), {}});
+        if (!response.success() || !wire::parse(response.body).isArray() || !process_.status().running)
+            throw std::runtime_error("gvswitch control plane is not ready");
+    } catch (...) {
+        ready_ = false;
+        throw;
+    }
+}
 Json::Value Gvswitch::tools() const {
     Json::Value result(Json::arrayValue), tool;
     const auto status = process_.status();
