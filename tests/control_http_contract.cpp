@@ -4,6 +4,8 @@
 #include "network/links.h"
 #include "network/helper_config.h"
 #include "services/network_config.h"
+#include "services/network.h"
+#include "network/gvswitch.h"
 #include "runtime/managed_process.h"
 #include "common/identity.h"
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <signal.h>
 
 using namespace droidvm;
 using namespace droidvm::network;
@@ -349,10 +352,155 @@ void real_bridgedhcp() {
     for (const char* name : {"s", "key", "config", "state", "pd-config", "networks.json", "networks.json.bak", "network-links.json", "network-links.json.bak"}) unlinkat(dir.get(), name, 0);
     check(rmdir(path.c_str()) == 0, "bridgedhcp test files removed");
 }
+std::string switch_directory(const std::string& parent) {
+    DIR* scan = opendir(parent.c_str()); check(scan, "scan isolated lifecycle directory");
+    std::string found;
+    while (const auto* entry = readdir(scan)) if (std::string_view(entry->d_name).starts_with("gv-")) {
+        if (!found.empty()) { closedir(scan); throw std::runtime_error("ambiguous test switch directory"); }
+        found = parent + "/" + entry->d_name;
+    }
+    closedir(scan); check(!found.empty(), "real switch created private directory"); return found;
+}
+void await_exit(Gvswitch& backend) {
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (backend.status().running && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+    check(!backend.status().running, "owned helper death observed");
+}
+void real_network_lifecycle() {
+    const auto path = work + "/lifecycle";
+    check(mkdir(path.c_str(), 0700) == 0, "create lifecycle case directory");
+    Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    NetworkConfigService configs(dir.get(), getuid());
+    auto configuration = wire::parse(R"({"schema":2,"name":"lifecycle","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
+    configuration["id"] = random_id(true);
+    const auto id = configs.create(admin, configuration);
+    Gvswitch* backend = nullptr;
+    bool missing = false, unready = false;
+    auto now = NetworkService::Clock::now();
+    NetworkService service(configs, [&](const Json::Value&) {
+        auto result = std::make_unique<Gvswitch>(unready ? path + "/unready" : binaries + (missing ? "/absent-helper" : "/gvswitch"), dir.get());
+        backend = result.get(); return result;
+    }, [&] { return now; });
+    error(ErrorCode::permission_denied, [&] { service.start(owner, id); });
+    auto existing_lease = configs.prepare_runtime(admin, id);
+    error(ErrorCode::conflict, [&] { service.start(admin, id); });
+    check(service.get(admin, id).state == NetworkState::stopped && backend == nullptr,
+        "runtime lease conflict preserves error code without creating backend");
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    existing_lease.reset();
+    missing = true;
+    error(ErrorCode::unavailable, [&] { service.start(admin, id); });
+    check(service.get(admin, id).state == NetworkState::stopped && !service.get(admin, id).error.empty(), "exec failure cleans resources and reports STOPPED with error");
+    configs.update(admin, configuration); // failed start released lease after cleanup
+    missing = false;
+    write_file(path + "/unready", "#!/system/bin/sh\nexec /system/bin/sleep 30\n");
+    check(chmod((path + "/unready").c_str(), 0700) == 0, "make readiness deadline fixture executable");
+    unready = true;
+    const auto waiting = std::chrono::steady_clock::now();
+    error(ErrorCode::unavailable, [&] { service.start(admin, id); });
+    check(std::chrono::steady_clock::now() - waiting >= 4900ms && std::chrono::steady_clock::now() - waiting < 7s &&
+        service.get(admin, id).state == NetworkState::stopped, "live process without API fails bounded readiness and is cleaned up");
+    unready = false;
+    check(service.start(admin, id).state == NetworkState::running && backend->healthy(), "real API readiness precedes RUNNING");
+    const auto first_generation = backend->status().generation;
+    check(service.start(admin, id).state == NetworkState::running && backend->status().generation == first_generation, "duplicate healthy start is idempotent");
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    check(backend->signal(SIGKILL), "kill only held test switch pidfd"); await_exit(*backend);
+    error(ErrorCode::unavailable, [&] { service.start(admin, id); });
+    check(service.reconcile(admin, id).state == NetworkState::running && backend->status().generation > first_generation,
+        "real switch crash recovers without dropping configuration lease");
+    auto directory = switch_directory(path);
+    write_file(directory + "/retained", "unknown file must survive cleanup");
+    check(backend->signal(SIGKILL), "kill recovery helper"); await_exit(*backend);
+    now += 5s;
+    check(service.reconcile(admin, id).state == NetworkState::failed, "cleanup failure blocks recovery");
+    const auto failed_generation = service.get(admin, id).generation;
+    check(service.reconcile(admin, id).generation == failed_generation, "failed recovery respects retry budget");
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    check(unlink((directory + "/retained").c_str()) == 0, "remove test-owned cleanup obstruction");
+    now += 5s;
+    check(service.reconcile(admin, id).state == NetworkState::running, "recovery retries after cleanup becomes possible");
+    directory = switch_directory(path);
+    write_file(directory + "/retained", "stop failure");
+    error(ErrorCode::io_error, [&] { service.stop(admin, id); });
+    check(service.get(admin, id).state == NetworkState::failed && !service.get(admin, id).desired_running && !backend->status().running,
+        "stop failure is visible after process is reaped");
+    now += 10s;
+    check(service.reconcile(admin, id).state == NetworkState::failed, "watchdog never resurrects explicitly stopped network");
+    configuration["id"] = random_id(true); configuration["name"] = "independent";
+    const auto second = configs.create(admin, configuration);
+    check(service.start(admin, second).state == NetworkState::running, "independent network starts despite cleanup failure");
+    check(service.shutdown().size() == 1 && service.get(admin, second).state == NetworkState::stopped,
+        "shutdown reports failed cleanup and still stops independent network");
+    check(unlink((directory + "/retained").c_str()) == 0, "resolve original cleanup obstruction");
+    check(service.shutdown().empty() && service.get(admin, id).state == NetworkState::stopped, "shutdown cleanup can be retried");
+    error(ErrorCode::unavailable, [&] { service.start(admin, second); });
+    configs.update(admin, configuration); // all leases released after successful cleanup
+    for (const char* file : {"networks.json", "networks.json.bak", "unready"}) unlinkat(dir.get(), file, 0);
+    check(rmdir(path.c_str()) == 0, "lifecycle leaves no runtime directories");
+}
+void real_network_parallel_and_start_cleanup() {
+    const auto path = work + "/parallel";
+    check(mkdir(path.c_str(), 0700) == 0, "create parallel lifecycle directory");
+    Fd dir(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    NetworkConfigService configs(dir.get(), getuid());
+    auto configuration = wire::parse(R"({"schema":2,"name":"gated","bridge_name":"test","bridge_type":"gvisor","l3":{"vlans":[]}})");
+    configuration["id"] = random_id(true);
+    const auto first = configs.create(admin, configuration);
+    auto second_config = configuration; second_config["id"] = random_id(true); second_config["name"] = "independent";
+    const auto second = configs.create(admin, second_config);
+    Gate entered, proceed;
+    bool fail_after_ready = false;
+    struct ObservedBackend final : Backend {
+        Gvswitch real;
+        Gate& entered;
+        Gate& proceed;
+        const bool& fail;
+        std::string path;
+        ObservedBackend(const std::string& executable, int directory, Gate& entered, Gate& proceed, const bool& fail, std::string path)
+            : real(executable, directory), entered(entered), proceed(proceed), fail(fail), path(std::move(path)) {}
+        void start(const Json::Value& config) override {
+            entered.release(); proceed.wait(); real.start(config);
+            if (fail) {
+                write_file(switch_directory(path) + "/retained", "injected post-readiness failure");
+                throw std::runtime_error("injected post-readiness start failure");
+            }
+        }
+        bool healthy() const override { return real.healthy(); }
+        void recover(const Json::Value& config) override { real.recover(config); }
+        void stop() override { real.stop(); }
+    };
+    NetworkService service(configs, [&](const Json::Value& config) -> std::unique_ptr<Backend> {
+        if (config["name"] == "gated") return std::make_unique<ObservedBackend>(binaries + "/gvswitch", dir.get(), entered, proceed, fail_after_ready, path);
+        return std::make_unique<Gvswitch>(binaries + "/gvswitch", dir.get());
+    });
+    auto startup = std::async(std::launch::async, [&] { return service.start(admin, first); });
+    entered.wait();
+    check(service.get(admin, first).state == NetworkState::starting, "queries observe STARTING without waiting for backend I/O");
+    error(ErrorCode::conflict, [&] { service.start(admin, first); });
+    error(ErrorCode::conflict, [&] { service.stop(admin, first); });
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    check(service.start(admin, second).state == NetworkState::running, "independent network completes while first is blocked");
+    proceed.release();
+    check(startup.get().state == NetworkState::running, "blocked startup eventually reaches real readiness");
+    service.stop(admin, first); service.stop(admin, second);
+    fail_after_ready = true;
+    error(ErrorCode::unavailable, [&] { service.start(admin, first); });
+    check(service.get(admin, first).state == NetworkState::failed && !service.get(admin, first).desired_running,
+        "start cleanup failure retained as FAILED, not STOPPED");
+    error(ErrorCode::conflict, [&] { configs.update(admin, configuration); });
+    const auto directory = switch_directory(path);
+    check(unlink((directory + "/retained").c_str()) == 0, "resolve failed-start obstruction");
+    check(service.stop(admin, first).state == NetworkState::stopped, "explicit stop retries failed-start cleanup");
+    check(service.shutdown().empty(), "parallel lifecycle shutdown complete");
+    for (const char* file : {"networks.json", "networks.json.bak"}) unlinkat(dir.get(), file, 0);
+    check(rmdir(path.c_str()) == 0, "parallel lifecycle leaves no resources");
+}
 }
 int main(int argc, char** argv) {
     if (argc == 3) { binaries = argv[1]; work = argv[2]; }
-    if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp}});
+    if (!binaries.empty()) return run({{"real_gvswitch_control", real_gvswitch}, {"real_bridgedhcp_control", real_bridgedhcp},
+        {"real_network_lifecycle", real_network_lifecycle}, {"real_network_parallel_and_start_cleanup", real_network_parallel_and_start_cleanup}});
     return run({{"framing_and_methods", valid_framing_and_methods}, {"malformed_and_truncated", malformed_and_truncated},
         {"limits_and_injection", limits_and_injection}, {"whole_request_deadline_and_cancel", deadline_and_cancellation},
         {"concurrent_connections_and_fd_cleanup", concurrent_connections_and_fd_cleanup}});
