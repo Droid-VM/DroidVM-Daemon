@@ -19,4 +19,7 @@ std::optional<std::string> host_soc_name();
 std::optional<std::vector<int>> app_groups(uid_t uid, const std::string& cache);
 std::vector<CpuCore> cpu_cores(const std::string& root = "/sys/devices/system/cpu");
 std::string system_property(const char* name);
+// CrosvmBackendInstance.prepareGpuCgroup without a shell: the cpuset path
+// crosvm may join, or empty (soft failure, reason in warning).
+std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::string& warning);
 }

@@ -125,6 +125,14 @@ int main(int argc, char** argv) {
                     row["status"] = "ok";
                     report.append(row); continue;
                 }
+                if (test["op"].asString() == "gpu_cgroup") {
+                    std::string warning;
+                    const auto path = droidvm::vm::prepare_gpu_cgroup(value, warning);
+                    row["path"] = path ? Json::Value(*path) : Json::Value();
+                    row["warning"] = warning;
+                    row["status"] = "ok";
+                    report.append(row); continue;
+                }
                 if (test["op"].asString() == "gvswitch") {
                     row["helper"] = droidvm::network::gvswitch_config(value);
                     row["status"] = "ok";

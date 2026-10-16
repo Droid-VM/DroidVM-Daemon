@@ -404,6 +404,10 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
                                    plan.uefi ? (plan.vars.empty() ? edk2_vars() : plan.vars) : std::string()});
     auto host = facts;
     host.data_dir = context_.data_dir;
+    // crosvm opens <cgroup>/tasks and never creates it; the flag needs this first.
+    std::string cgroup_warning;
+    run.gpu_cgroup_path = prepare_gpu_cgroup(config, cgroup_warning);
+    if (!cgroup_warning.empty()) context_.warn("VM " + id_ + ": " + cgroup_warning);
     const auto command = crosvm_command(config, run, plan, host);
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.

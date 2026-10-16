@@ -4,6 +4,7 @@
 #include "host_facts.h"
 #include "build_metadata.h"
 #include "qcom_chips.h"
+#include "vm/command_common.h"
 #include "store/network_config.h"
 #include <algorithm>
 #include <cerrno>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <dirent.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <regex>
@@ -204,5 +206,50 @@ HostFacts probe_host(const HostProbe& probe) {
     host.system_vulkan_hal = vulkan_hal();
     host.viosnd_dump_exists = exists("/data/local/tmp/viosnd_dump");
     return host;
+}
+}
+namespace droidvm::vm {
+namespace {
+void write_text(const std::string& path, const std::string& value) {
+    std::ofstream out(path);
+    out << value << '\n';
+}
+}
+std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::string& warning) {
+    warning.clear();
+    if (!config::boolean(config, "gpu_cgroup_enabled") || !command::screen_enabled(config, "gpu-0")) return {};
+    const auto& stored = config::member(config, "gpu_cgroup_path");
+    const auto path = command::trim(stored.isString() ? stored.asString() : "/dev/cpuset/gpuworker");
+    const auto cpus = command::trim(config::string(config, "gpu_cgroup_cpus"));
+    if (path.empty() || path[0] != '/') { warning = "gpu-cgroup-path is not an absolute path: '" + path + "'; skipping"; return {}; }
+    if (cpus.empty()) { warning = "gpu_cgroup_cpus is empty; cannot set up cpuset, skipping"; return {}; }
+    // File.getParent; mems is copied from it (one NUMA node on Android).
+    auto parent = path.substr(0, path.find_last_of('/'));
+    if (path == "/") parent = "/dev/cpuset";
+    else if (parent.empty()) parent = "/";
+    auto failed = [&](const std::string& detail) -> std::optional<std::string> {
+        warning = "Failed to set up gpuworker cpuset at " + path + " (cpus=" + cpus + "): " + detail;
+        return {};
+    };
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    struct stat info{};
+    if (stat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) return failed("mkdir failed");
+    // cgroupfs files report size 0, so the script's [ ! -s ] always rewrites mems.
+    for (const char* name : {"mems", "cpuset.mems"}) {
+        const auto file = path + "/" + name;
+        if (stat(file.c_str(), &info) != 0 || info.st_size != 0) continue;
+        auto value = command::trim(read_text(parent + "/" + name).value_or(""));
+        if (value.empty()) value = "0";
+        write_text(file, value);
+    }
+    for (const char* name : {"cpus", "cpuset.cpus"}) {
+        const auto file = path + "/" + name;
+        if (access(file.c_str(), F_OK) == 0) write_text(file, cpus);
+    }
+    auto current = read_text(path + "/cpus");
+    if (!current) current = read_text(path + "/cpuset.cpus");
+    if (!current || command::trim(*current).empty()) return failed("cpus not set");
+    return path;
 }
 }
