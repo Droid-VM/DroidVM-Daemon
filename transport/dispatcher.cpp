@@ -7,6 +7,7 @@
 #include "vm/crosvm_command.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <array>
 #include <limits>
 
@@ -21,7 +22,43 @@ bool host_command(const std::string& command) {
 }
 constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status",
     "vm_start", "vm_stop", "vm_stop_all", "vm_reboot", "vm_suspend", "vm_resume", "vm_control", "vm_console_list",
-    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info"};
+    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info", "vm_input"};
+// android.util.Base64.decode(NO_WRAP) of a client's evdev bytes.
+std::string base64_decode(const std::string& text) {
+    std::string out;
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (const char c : text) {
+        int value;
+        if (c >= 'A' && c <= 'Z') value = c - 'A';
+        else if (c >= 'a' && c <= 'z') value = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') value = c - '0' + 52;
+        else if (c == '+') value = 62;
+        else if (c == '/') value = 63;
+        else if (c == '=') break;
+        else if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        else throw std::invalid_argument("bad base-64");
+        buffer = buffer << 6 | static_cast<uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out += static_cast<char>((buffer >> bits) & 0xff); }
+    }
+    return out;
+}
+// JSONObject.optInt: numbers truncate, numeric strings parse as double.
+int legacy_int(const Json::Value& request, const char* key, int fallback) {
+    if (!request.isMember(key)) return fallback;
+    const auto& value = request[key];
+    double number;
+    if (value.isNumeric() && !value.isBool()) number = value.asDouble();
+    else if (value.isString()) {
+        try { size_t used = 0; const auto text = value.asString(); number = std::stod(text, &used); if (used != text.size()) return fallback; }
+        catch (const std::exception&) { return fallback; }
+    } else return fallback;
+    if (std::isnan(number)) return 0;
+    if (number >= 2147483647.0) return 2147483647;
+    if (number <= -2147483648.0) return -2147483647 - 1;
+    return static_cast<int>(number);
+}
 // JSONObject.optBoolean: a boolean, or the strings "true"/"false" in any case.
 bool legacy_flag(const Json::Value& request, const char* key) {
     if (!request.isMember(key)) return false;
@@ -248,6 +285,13 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
                     if (info->type == "LocalSocketConsoleStream") data["ready"] = false;
                 }
             }
+        } else if (command == "vm_input") {
+            const auto id = legacy_id(request, "vm_id");
+            if (id.empty()) { result["message"] = "missing vm_id"; return result; }
+            const auto screen = legacy_id(request, "screen");
+            const auto channel = legacy_int(request, "channel", -1);
+            const auto data = base64_decode(legacy_id(request, "data"));
+            result["delivered"] = vms_->runtime(caller, id)->write_input(screen, channel, data);
         } else if (command == "vm_start" || command == "vm_stop" || command == "vm_reboot" || command == "vm_suspend" ||
                    command == "vm_resume" || command == "vm_control") {
             const auto id = legacy_id(request, "vm_id");
@@ -285,7 +329,7 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
     } catch (const ServiceError& error) {
         // Only RequestException texts reach a legacy client.
         if (error.code() == ErrorCode::not_found && (command == "vm_get" || command == "vm_status" || command == "vm_start" || command == "vm_stop" ||
-            command == "vm_reboot" || command == "vm_suspend" || command == "vm_resume" || command == "vm_control")) result["message"] = error.what();
+            command == "vm_reboot" || command == "vm_suspend" || command == "vm_resume" || command == "vm_control" || command == "vm_input")) result["message"] = error.what();
         else if (error.code() == ErrorCode::conflict && command == "vm_create") result["message"] = "failed to create VM";
         else if ((error.code() == ErrorCode::not_found || error.code() == ErrorCode::conflict) && command == "vm_modify") result["message"] = "failed to modify VM";
         else if (error.code() == ErrorCode::unavailable && command == "vm_delete") result["message"] = error.what();
@@ -329,7 +373,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["vm_inventory"] = true;
                 result["vm_runtime"] = true;
                 result["vm_runtime_backends"] = Json::Value(Json::arrayValue);
-                result["vm_runtime_backends"].append("crosvm"); // no QEMU, NIC attachment or input bridge yet
+                result["vm_runtime_backends"].append("crosvm"); // no QEMU yet
                 result["service_api_minor"] = 6;
             }
         }

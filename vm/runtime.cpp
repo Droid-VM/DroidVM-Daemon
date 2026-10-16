@@ -408,8 +408,9 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     host.data_dir = context_.data_dir;
     const auto command = crosvm_command(config, run, plan, host);
     if (command.input_bridge) {
-        failure = "display input setup failed: the native display input bridge is not available in the native daemon yet";
-        return false;
+        // crosvm is the client of these sockets; they must exist before it starts.
+        try { input_.listen(command.input_sockets); }
+        catch (const std::invalid_argument& error) { failure = std::string("display input setup failed: ") + error.what(); return false; }
     }
     if (command.strace_dir) {
         std::error_code error;
@@ -488,6 +489,7 @@ void VmRuntime::reap_and_cleanup() {
     for (auto& [name, log] : logs_) log->close();
 }
 void VmRuntime::cleanup_backend() {
+    input_.release();
     std::lock_guard lock(state_mutex_);
     if (control_socket_) { unlink(control_socket_->c_str()); control_socket_.reset(); }
     serials_.clear();

@@ -578,6 +578,11 @@ struct Builder {
         args.push_back("--input");
         args.push_back("mouse[path=" + socket_path("", "ms", false) + "]");
         const auto& natives = launch.native_input_screens;
+        // NativeDisplayInputBridge.bindAll order: channel, then its screens.
+        for (const auto& id : launch.touch_screens) launch.input_sockets.push_back({id, 0, socket_path(id, "mt", true)});
+        for (const auto& id : natives) launch.input_sockets.push_back({id, 1, socket_path(id, "kbd", true)});
+        launch.input_sockets.push_back({"", 2, socket_path("", "ms", false)});
+        for (const auto& id : natives) launch.input_sockets.push_back({id, 3, socket_path(id, "tab", true)});
         for (const auto& id : launch.touch_screens) {
             args.push_back("--input");
             args.push_back("multi-touch[path=" + socket_path(id, "mt", true) + ",name=DroidVM Touch (" + id + ")]");

@@ -2,6 +2,7 @@
 #pragma once
 #include "vm/boot_plan.h"
 #include "vm/console.h"
+#include "vm/input_bridge.h"
 #include "vm/hugepage.h"
 #include "network/switch_runtime.h"
 #include "runtime/child.h"
@@ -54,6 +55,7 @@ public:
     bool suspend();
     bool resume();
     bool control(const std::string& command);
+    bool write_input(const std::string& screen, int channel, std::string_view data) { return input_.write(screen, channel, data); }
     void clear_logs();
     std::vector<std::string> streams() const;
     ConsoleLog* log(const std::string& stream) const;
@@ -76,6 +78,7 @@ private:
     std::atomic<int64_t> pid_{-1};
     std::optional<std::string> control_socket_, boot_entry_;
     std::vector<Serial> serials_;
+    InputBridge input_;
     network::SwitchRuntime::Allocation identity_;
     std::atomic<bool> stopped_by_user_{false}, reboot_requested_{false}, reading_{true};
     bool pin_retry_used_ = false, worker_ = false;

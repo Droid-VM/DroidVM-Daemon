@@ -65,6 +65,8 @@ struct CrosvmRun {
     std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved
     std::map<std::string, VncRun> vnc; // per screen id, overrides screens.<id>.vnc
 };
+// NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3.
+struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
     std::vector<std::string> argv;
     // NativeProcess.Builder.environment calls in order; later keys win when merged.
@@ -73,6 +75,7 @@ struct CrosvmLaunch {
     std::optional<int64_t> udmabuf_limit_mb; // applyGfxstreamEnv's size_limit_mb write, left to the caller
     bool input_bridge = false; // isInputBridgeNeeded()
     std::vector<std::string> touch_screens, native_input_screens; // touchscreenScreens()/nativeInputScreens()
+    std::vector<InputSocket> input_sockets; // every socket the input bridge pre-binds
 };
 // Expects droidvm::config::migrate_vm output. Throws std::runtime_error or
 // std::invalid_argument where the Java start would fail.
