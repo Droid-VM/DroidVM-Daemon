@@ -332,7 +332,7 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
                     data["type"] = info->type; data["name"] = stream; data["path"] = log->path();
                     data["length"] = Json::UInt64(log->size()); data["readable"] = info->readable; data["writable"] = info->writable;
                     if (info->fd_pipe) { data["read_fd"] = info->read_fd; data["write_fd"] = info->write_fd; data["ready"] = info->read_fd >= 0 || info->write_fd >= 0; }
-                    if (info->type == "LocalSocketConsoleStream") data["ready"] = false;
+                    if (info->type == "LocalSocketConsoleStream") data["ready"] = info->ready;
                 }
             }
         } else if (command == "vm_input") {
@@ -424,7 +424,8 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["vm_inventory"] = true;
                 result["vm_runtime"] = true;
                 result["vm_runtime_backends"] = Json::Value(Json::arrayValue);
-                result["vm_runtime_backends"].append("crosvm"); // no QEMU yet
+                result["vm_runtime_backends"].append("crosvm");
+                result["vm_runtime_backends"].append("qemu");
                 result["vm_auto_up"] = true;
                 result["service_api_minor"] = 8;
             }

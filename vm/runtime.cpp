@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Port of daemon/vm/VMInstance's lifecycle and CrosvmBackendInstance.start/
-// cleanup/runControlCommand. QEMU, NIC attachment and the native display
-// input bridge are refused with an explicit console message for now.
+// Port of daemon/vm/VMInstance's lifecycle and the crosvm/QEMU backend
+// instances' start, cleanup and runControlCommand.
 #include "runtime.h"
 #include "vm/boot_plan.h"
 #include "vm/crosvm_command.h"
+#include "vm/qemu_command.h"
 #include "vm/host_facts.h"
 #include "runtime/helper_identity.h"
 #include "services/legacy_events.h"
@@ -371,11 +371,8 @@ void VmRuntime::run() {
     fire("exited");
 }
 bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::string& failure) {
-    if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) == "QEMU") {
-        failure = "QEMU backend is not available in the native daemon yet";
-        return false;
-    }
     mkdir(context_.run_dir.c_str(), 0700);
+    if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) == "QEMU") return launch_qemu(config, plan, failure);
     CrosvmRun run;
     {
         std::lock_guard lock(state_mutex_);
@@ -413,16 +410,66 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         try { input_.listen(command.input_sockets); }
         catch (const std::invalid_argument& error) { failure = std::string("display input setup failed: ") + error.what(); return false; }
     }
-    if (command.strace_dir) {
-        std::error_code error;
-        std::filesystem::remove_all(*command.strace_dir, error);
-        std::filesystem::create_directory(*command.strace_dir, error);
-    }
     if (command.udmabuf_limit_mb) {
         glob_t matches{};
         if (glob("/sys/module/udmabuf*/parameters/size_limit_mb", 0, nullptr, &matches) == 0)
             for (size_t i = 0; i < matches.gl_pathc; ++i) write_quiet(matches.gl_pathv[i], std::to_string(*command.udmabuf_limit_mb));
         globfree(&matches);
+    }
+    return spawn(command.argv, command.env, command.strace_dir, "crosvm", failure);
+}
+bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std::string& failure) {
+    auto host = probe_host({context_.owner, context_.run_dir + "/app-gids", context_.optimize_sdcard(),
+                            plan.uefi ? (plan.vars.empty() ? edk2_vars() : plan.vars) : std::string()});
+    host.data_dir = context_.data_dir;
+    auto run = qemu_sockets(config, host);
+    run.file_length = [](const std::string& path) -> int64_t { struct stat info{}; return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) ? info.st_size : 0; };
+    QemuLaunch command;
+    try { command = qemu_command(config, run, plan, host); }
+    catch (const std::exception& error) { failure = error.what(); return false; }
+    {
+        std::lock_guard lock(state_mutex_);
+        serials_.clear(); sockets_.clear();
+        for (const auto& path : {run.qmp_socket_path, run.uart_socket_path, run.agent_socket_path})
+            if (path) { unlink(path->c_str()); sockets_.push_back(*path); }
+        qemu_ = true;
+        control_socket_ = run.qmp_socket_path;
+    }
+    if (!spawn(command.argv, command.env, command.strace_dir, "qemu", failure)) return false;
+    // agent0 is declared before the blocking UART chardev: connect it first so
+    // no hvc0 boot output races ahead of the reader.
+    auto connect_stream = [&](const char* stream, const std::string& path) {
+        for (int attempt = 0;; ++attempt) {
+            Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+            sockaddr_un address{};
+            address.sun_family = AF_UNIX;
+            if (socket_fd.get() >= 0 && path.size() < sizeof(address.sun_path)) {
+                std::copy(path.begin(), path.end(), address.sun_path);
+                if (connect(socket_fd.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+                    Fd writer(fcntl(socket_fd.get(), F_DUPFD_CLOEXEC, 0));
+                    std::lock_guard lock(state_mutex_);
+                    serials_.push_back({stream, std::move(socket_fd), std::move(writer), Fd(), Fd()});
+                    return true;
+                }
+            }
+            if (attempt >= 50) return false;
+            std::this_thread::sleep_for(100ms);
+        }
+    };
+    if (command.agent && run.agent_socket_path && !connect_stream("agent", *run.agent_socket_path)) {
+        failure = "failed to connect agent socket after multiple attempts, giving up"; kill_process(); return false;
+    }
+    if (run.uart_socket_path && !connect_stream("uart", *run.uart_socket_path)) {
+        failure = "failed to connect UART socket after multiple attempts, giving up"; kill_process(); return false;
+    }
+    return true;
+}
+bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<std::pair<std::string, std::string>>& env,
+                      const std::optional<std::string>& strace_dir, const char* label, std::string& failure) {
+    if (strace_dir) {
+        std::error_code error;
+        std::filesystem::remove_all(*strace_dir, error);
+        std::filesystem::create_directory(*strace_dir, error);
     }
     // VMBackendInstance.cleanUpMemory.
     write_quiet("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
@@ -431,8 +478,8 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     write_quiet("/proc/sys/vm/drop_caches", "3");
     write_quiet("/proc/sys/vm/compact_memory", "1");
     ChildOptions options;
-    options.argv = command.argv;
-    options.environment = merged_environment(command.env);
+    options.argv = argv;
+    options.environment = merged_environment(env);
     options.limits = {{RLIMIT_NOFILE, 65536, 65536}, {RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY}};
     {
         std::lock_guard lock(state_mutex_);
@@ -451,7 +498,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         process_ = std::move(process);
         for (auto& serial : serials_) { serial.remote_write = Fd(); serial.remote_read = Fd(); }
     } catch (const std::exception& error) {
-        failure = std::string("Failed to start crosvm process: ") + error.what();
+        failure = std::string("Failed to start ") + label + " process: " + error.what();
         return false;
     }
     return true;
@@ -493,6 +540,8 @@ void VmRuntime::cleanup_backend() {
     input_.release();
     std::lock_guard lock(state_mutex_);
     if (control_socket_) { unlink(control_socket_->c_str()); control_socket_.reset(); }
+    for (const auto& path : sockets_) unlink(path.c_str());
+    sockets_.clear(); qemu_ = false;
     serials_.clear();
     if (!identity_.name.empty() && context_.identities) {
         try { context_.identities->cleanup(identity_.name); identity_.directory = Fd(); identity_.name.clear(); } catch (const std::exception&) {}
@@ -510,7 +559,52 @@ void VmRuntime::kill_process() {
     std::lock_guard lock(state_mutex_);
     if (process_) process_->signal(SIGKILL);
 }
+// QemuBackendInstance.sendQMP: greeting, qmp_capabilities, one command.
+int VmRuntime::send_qmp(const std::string& command) {
+    Json::Value request;
+    if (command == "stop") request["execute"] = "quit";
+    else if (command == "powerbtn") request["execute"] = "system_powerdown";
+    else if (command == "sleepbtn") { request["execute"] = "human-monitor-command"; request["arguments"]["command-line"] = "system_sleepbutton"; }
+    else if (command == "resume") request["execute"] = "cont";
+    else if (command == "suspend") request["execute"] = "stop";
+    else return -1;
+    std::optional<std::string> path;
+    { std::lock_guard lock(state_mutex_); path = control_socket_; }
+    if (!path) return -1;
+    Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (socket_fd.get() < 0 || path->size() >= sizeof(address.sun_path)) return -1;
+    std::copy(path->begin(), path->end(), address.sun_path);
+    timeval timeout{5, 0};
+    setsockopt(socket_fd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket_fd.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    if (connect(socket_fd.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) return -1;
+    char buffer[4096];
+    auto receive = [&]() -> ssize_t { ssize_t count; do count = recv(socket_fd.get(), buffer, sizeof(buffer), 0); while (count < 0 && errno == EINTR); return count; };
+    auto send_line = [&](const Json::Value& value) {
+        Json::StreamWriterBuilder builder; builder["indentation"] = "";
+        const auto text = Json::writeString(builder, value) + "\n";
+        return ::send(socket_fd.get(), text.data(), text.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(text.size());
+    };
+    if (receive() <= 0) return -1;
+    Json::Value capabilities;
+    capabilities["execute"] = "qmp_capabilities";
+    if (!send_line(capabilities)) return -1;
+    receive();
+    if (!send_line(request)) return -1;
+    const auto count = receive();
+    if (count <= 0) return -1;
+    Json::CharReaderBuilder reader_builder;
+    std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
+    Json::Value response;
+    std::string error;
+    if (!reader->parse(buffer, buffer + count, &response, &error) || !response.isObject()) return -1;
+    if (response.isMember("return")) return 0;
+    return response.isMember("error") ? -1 : 0;
+}
 int VmRuntime::send_control(const std::string& command) {
+    if (qemu_) return send_qmp(command);
     const char* request = command == "stop" ? "Exit" : command == "powerbtn" ? "Powerbtn" : command == "sleepbtn" ? "Sleepbtn" :
         command == "resume" ? "ResumeVcpus" : command == "suspend" ? "SuspendVcpus" : nullptr;
     std::optional<std::string> path;
@@ -578,7 +672,10 @@ std::optional<VmRuntime::StreamInfo> VmRuntime::stream_info(const std::string& s
     const bool running = process_ != nullptr;
     if (stream == "stdout" || stream == "stderr") { info.type = "InputConsoleStream"; info.readable = running; }
     else if (stream == "stdio") { info.type = "SimpleConsoleStream"; info.readable = true; }
-    else if (stream == "uart" || stream == "agent") { info.type = "LocalSocketConsoleStream"; }
+    else if (stream == "uart" || stream == "agent") {
+        info.type = "LocalSocketConsoleStream";
+        for (const auto& serial : serials_) if (serial.stream == stream) info.readable = info.writable = info.ready = true;
+    }
     else {
         info.type = "FDPipeConsoleStream"; info.fd_pipe = true;
         for (const auto& serial : serials_) if (serial.stream == stream) {

@@ -41,7 +41,7 @@ struct RuntimeContext {
 // watched on a worker thread that publishes every transition as an event.
 class VmRuntime : public std::enable_shared_from_this<VmRuntime> {
 public:
-    struct StreamInfo { std::string type; bool readable = false, writable = false; int read_fd = -1, write_fd = -1; bool fd_pipe = false; };
+    struct StreamInfo { std::string type; bool readable = false, writable = false; int read_fd = -1, write_fd = -1; bool fd_pipe = false, ready = false; };
     VmRuntime(std::string id, Json::Value config, const RuntimeContext& context);
     ~VmRuntime();
     const std::string& id() const { return id_; }
@@ -79,6 +79,8 @@ private:
     std::unique_ptr<Child> process_;
     std::atomic<int64_t> pid_{-1};
     std::optional<std::string> control_socket_, boot_entry_;
+    bool qemu_ = false; // control_socket_ is a QMP socket
+    std::vector<std::string> sockets_; // QEMU chardev sockets removed at cleanup
     std::vector<Serial> serials_;
     InputBridge input_;
     network::SwitchRuntime::Allocation identity_;
@@ -93,6 +95,10 @@ private:
     void cleanup_taps();
     void run();
     bool launch(const Json::Value& config, const BootPlan& plan, std::string& failure);
+    bool launch_qemu(const Json::Value& config, const BootPlan& plan, std::string& failure);
+    bool spawn(const std::vector<std::string>& argv, const std::vector<std::pair<std::string, std::string>>& env,
+               const std::optional<std::string>& strace_dir, const char* label, std::string& failure);
+    int send_qmp(const std::string& command);
     void reap_and_cleanup();
     void finish_stopped(int code);
     void cleanup_backend();
