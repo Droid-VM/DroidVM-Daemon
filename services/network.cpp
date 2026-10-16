@@ -97,6 +97,8 @@ NetworkView NetworkService::start_impl(const CallContext& caller, const std::str
 }
 NetworkView NetworkService::stop(const CallContext& caller, const std::string& id) {
     auto target = slot(caller, id);
+    if (in_use_) if (const auto vm = in_use_(view(*target).id); !vm.empty())
+        throw ServiceError(ErrorCode::conflict, "Network is in use by running VM " + vm);
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
     state(*target, NetworkState::stopping, false);
@@ -166,6 +168,29 @@ Json::Value NetworkService::shutdown() {
         }
     }
     return failures;
+}
+void NetworkService::attach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap) {
+    auto target = slot(caller, id);
+    if (view(*target).state != NetworkState::running) {
+        try { start(caller, id); }
+        catch (const ServiceError& error) { throw ServiceError(error.code(), "Failed to start network " + id + ": " + error.what()); }
+        if (view(*target).state != NetworkState::running)
+            throw ServiceError(ErrorCode::unavailable, "Network " + id + " still not running after start (state=" + network_state_name(view(*target).state) + ")");
+    }
+    std::lock_guard operation(target->operation);
+    if (!target->backend || !target->backend->healthy()) throw ServiceError(ErrorCode::unavailable, "Network " + id + " is not running");
+    target->backend->attach(nic, tap);
+}
+void NetworkService::detach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap) {
+    auto target = slot(caller, id);
+    std::lock_guard operation(target->operation);
+    if (target->backend) target->backend->detach(nic, tap);
+}
+Json::Value NetworkService::forward_failures(const CallContext& caller, const std::string& id) {
+    auto target = slot(caller, id);
+    std::unique_lock operation(target->operation, std::try_to_lock);
+    if (!operation.owns_lock() || !target->backend) return Json::Value(Json::objectValue);
+    return target->backend->forward_failures();
 }
 void NetworkService::schedule_reconcile(TaskService& workers) {
     std::string id;

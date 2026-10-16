@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <sched.h>
+#include <sys/mount.h>
 #include "contracts.h"
 #include "forwarding_contract.h"
 #include "firewall_contract.h"
@@ -1122,6 +1124,54 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    // Test harness: run argv[3..] as the only process of a private network
+    // namespace whose sysfs reflects it (OwnedLinks reads identities there).
+    if (argc >= 4 && std::string_view(argv[1]) == "--netns-exec") {
+        if (unshare(CLONE_NEWNET | CLONE_NEWNS) != 0 || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0 ||
+            mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) return 70;
+        Netbox(argv[2]).state("lo", true);
+        execv(argv[3], argv + 3);
+        return 71;
+    }
+    // Test harness: accept on host loopback and connect each client to a
+    // port on the loopback of the network namespace of pid argv[2].
+    if (argc == 4 && std::string_view(argv[1]) == "--netns-relay") {
+        const auto target = std::string("/proc/") + argv[2] + "/ns/net";
+        const auto port = static_cast<uint16_t>(std::stoi(argv[3]));
+        Fd listener(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+        sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t length = sizeof(local);
+        if (listener.get() < 0 || bind(listener.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0 ||
+            listen(listener.get(), 16) != 0 || getsockname(listener.get(), reinterpret_cast<sockaddr*>(&local), &length) != 0) return 70;
+        std::cout << "relay port=" << ntohs(local.sin_port) << std::endl;
+        for (;;) {
+            const int client = accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0) { if (errno == EINTR) continue; return 71; }
+            std::thread([client, target, port] {
+                Fd inbound(client);
+                Fd ns(open(target.c_str(), O_RDONLY | O_CLOEXEC));
+                if (ns.get() < 0 || setns(ns.get(), CLONE_NEWNET) != 0) return;
+                Fd outbound(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+                sockaddr_in remote{}; remote.sin_family = AF_INET; remote.sin_port = htons(port); remote.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (outbound.get() < 0 || connect(outbound.get(), reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) return;
+                pollfd fds[2] = {{inbound.get(), POLLIN, 0}, {outbound.get(), POLLIN, 0}};
+                char buffer[65536];
+                for (;;) {
+                    if (poll(fds, 2, -1) < 0) { if (errno == EINTR) continue; return; }
+                    for (int i = 0; i < 2; ++i) {
+                        if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                        const auto count = read(fds[i].fd, buffer, sizeof(buffer));
+                        if (count <= 0) return;
+                        for (ssize_t sent = 0; sent < count;) {
+                            const auto written = write(fds[1 - i].fd, buffer + sent, static_cast<size_t>(count - sent));
+                            if (written <= 0) return;
+                            sent += written;
+                        }
+                    }
+                }
+            }).detach();
+        }
+    }
     if (argc == 4 && std::string_view(argv[1]) == "--linux-backend-pd-crash") return linux_backend_pd_crash_child(argv[2], argv[3]);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-backend") return linux_backend_namespace_child(argv[2], argv[3], argv[4]);
     if (argc == 5 && std::string_view(argv[1]) == "--linux-firewall-forwards") return firewall_namespace_child(argv[2], argv[3], argv[4], FirewallSuite::forwards);

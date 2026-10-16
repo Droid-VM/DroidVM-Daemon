@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 
 extern char** environ;
@@ -204,10 +205,9 @@ bool VmRuntime::start_locked(bool relaunch) {
         relaunch = state_ == State::rebooting;
         idle_.wait_for(state, 1s, [&] { return !worker_; });
         if (worker_) return false;
-        // setupTaps: networks need the native NIC attachment, not ported yet.
-        if (config::member(config_, "networks").isArray() && !config_["networks"].empty()) return false;
-        resolve_vnc(config_);
     }
+    if (!setup_taps()) return false;
+    { std::lock_guard state(state_mutex_); resolve_vnc(config_); }
     try {
         if (!relaunch) reboot_requested_ = false;
         stopped_by_user_ = false;
@@ -225,11 +225,52 @@ bool VmRuntime::start_locked(bool relaunch) {
         { std::lock_guard state(state_mutex_); worker_ = true; }
         std::thread([self = shared_from_this()] { self->run(); }).detach();
     } catch (const std::exception&) {
+        cleanup_taps();
         cleanup_backend();
         set_state(State::stopped);
         return false;
     }
     return true;
+}
+bool VmRuntime::setup_taps() {
+    const auto config = this->config();
+    const auto& nets = config::member(config, "networks");
+    if (!nets.isArray() || nets.empty()) return true;
+    if (!context_.attach_nic) return false; // "has networks but no network store"
+    std::vector<std::tuple<std::string, Json::Value, std::string>> created;
+    try {
+        for (Json::ArrayIndex i = 0; i < nets.size(); ++i) {
+            auto nic = nets[i];
+            const auto network = config::string(nic, "network_id");
+            if (network.empty()) continue;
+            auto tap = config::string(nic, "tap_name");
+            if (tap.empty()) {
+                tap = "vm" + id_.substr(0, 8) + "-" + std::to_string(i);
+                nic["tap_name"] = tap;
+                std::lock_guard lock(state_mutex_);
+                config_["networks"][i]["tap_name"] = tap;
+            }
+            context_.attach_nic(network, nic, tap);
+            created.emplace_back(network, nic, tap);
+        }
+    } catch (const std::exception& error) {
+        if (auto* stdio = log("stdio")) stdio->append(std::string("network setup failed: ") + error.what() + "\n");
+        for (const auto& [network, nic, tap] : created) try { context_.detach_nic(network, nic, tap); } catch (const std::exception&) {}
+        return false;
+    }
+    return true;
+}
+void VmRuntime::cleanup_taps() {
+    if (!context_.detach_nic) return;
+    const auto config = this->config();
+    const auto& nets = config::member(config, "networks");
+    if (!nets.isArray()) return;
+    for (const auto& nic : nets) {
+        const auto tap = config::string(nic, "tap_name");
+        if (tap.empty()) continue;
+        try { context_.detach_nic(config::string(nic, "network_id"), nic, tap); }
+        catch (const std::exception& error) { context_.warn("VM " + id_ + ": detaching " + tap + " failed: " + error.what()); }
+    }
 }
 void VmRuntime::run() {
     auto stdio = [&](const std::string& text) { if (auto* log = this->log("stdio")) log->append(text); };
@@ -305,6 +346,7 @@ void VmRuntime::run() {
         }
     }
     if (stopped_by_user_ && code != 0) exit_code_ = 0;
+    cleanup_taps();
     cleanup_backend();
     std::lock_guard lock(lock_);
     if (restart && !stopped_by_user_ && !context_.shutting_down()) {
@@ -455,6 +497,7 @@ void VmRuntime::cleanup_backend() {
 }
 void VmRuntime::finish_stopped(int code) {
     exit_code_ = code;
+    cleanup_taps();
     cleanup_backend();
     { std::lock_guard state(state_mutex_); worker_ = false; }
     set_state(State::stopped);

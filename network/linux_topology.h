@@ -17,12 +17,14 @@ public:
     void start(Json::Value config, const std::string& mac);
     void stop(); // throws and keeps ownership if any cleanup is incomplete
     void verify() const;
+    // An access VLAN missing from the config, created as an L2-only segment.
+    std::string ensure_vlan(int vid);
     const std::vector<std::string>& devices() const { return devices_; }
 private:
     const Netbox& netbox_;
     OwnedLinks& links_;
     Observer observer_;
-    std::string owner_;
+    std::string owner_, bridge_;
     std::vector<std::string> devices_;
     void disable_ra(const std::string& name);
     void point(const char* stage) { if (observer_) observer_(stage); }

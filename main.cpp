@@ -17,6 +17,7 @@
 #include "services/vm.h"
 #include "services/legacy_events.h"
 #include "vm/hugepage.h"
+#include "vm/nic.h"
 #include "build_metadata.h"
 #include <fstream>
 #include <sys/stat.h>
@@ -180,6 +181,27 @@ int main(int argc, char** argv) {
                 context.cache_dir = (data / "cache").string();
                 context.run_dir = (data / "run").string();
                 context.lbx = (data / "bin/lbx").string();
+                const droidvm::CallContext internal{"vm-runtime", true, true, true};
+                context.attach_nic = [&, internal](const std::string& network, const Json::Value& nic, const std::string& tap) {
+                    Json::Value config;
+                    try { config = networks->get(internal, network); }
+                    catch (const droidvm::ServiceError& error) {
+                        if (error.code() == droidvm::ErrorCode::not_found) throw std::runtime_error("Network " + network + " not found");
+                        throw;
+                    }
+                    droidvm::config::validate_network(config);
+                    // Start first, as setupTap; then sanitizedFor and validate.
+                    if (network_runtime->get(internal, network).state != droidvm::NetworkState::running) network_runtime->start(internal, network);
+                    std::vector<std::string> dropped;
+                    auto sane = droidvm::vm::sanitize_nic(nic, config, dropped);
+                    droidvm::vm::validate_nic(sane, config);
+                    network_runtime->attach_nic(internal, network, sane, tap);
+                };
+                context.detach_nic = [&, internal](const std::string& network, const Json::Value& nic, const std::string& tap) {
+                    if (networks->exists(internal, network)) network_runtime->detach_nic(internal, network, nic, tap);
+                    else owned_links->cleanup(network + "/" + tap); // network gone: remove the TAP directly
+                };
+                context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
                 vms = std::make_unique<droidvm::VmService>(files.get(), context);
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
@@ -193,8 +215,10 @@ int main(int argc, char** argv) {
                             return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime);
                         return std::make_unique<droidvm::network::LinuxBridge>(droidvm::network::LinuxBridge::Resources{
                             *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, pd_ownership, *owned_ports, *owned_pbridge, switch_runtime,
-                            (binaries / "bridgedhcp").string(), (binaries / "pbridge").string(), files.get()});
+                            (binaries / "bridgedhcp").string(), (binaries / "pbridge").string(), files.get(),
+                            [&](const Json::Value& network) { return vms->statics(network); }});
                     });
+                network_runtime->set_in_use([&](const std::string& network) { return vms->running_vm_using(network); });
                 network_runtime->request_autostart({"network-autostart", true, true, true});
                 host_ipv4 = std::make_unique<droidvm::network::HostIpv4Watch>(*netbox, switch_runtime, [&](const std::vector<std::string>& addresses) {
                     linux_firewall.set_host_ipv4(addresses);

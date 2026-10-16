@@ -5,6 +5,8 @@
 #include "store/network_config.h"
 #include "services/context.h"
 #include "common/wire.h"
+#include "vm/nic.h"
+#include <bit>
 
 namespace droidvm::network {
 namespace {
@@ -68,7 +70,7 @@ void LinuxBridge::start_dhcp(std::map<int, std::string> uplinks) {
         pd_registered_ = true; resources_.pd.acquire(config::uuid(config_), vlan.vlan, vlan.table, at->second);
     }
     uplinks_ = uplinks;
-    dhcp_needed_ = dhcp_.start(config_, {}, std::move(uplinks));
+    dhcp_needed_ = dhcp_.start(config_, resources_.statics ? resources_.statics(config_) : std::map<int, DhcpStatics>{}, std::move(uplinks));
 }
 void LinuxBridge::start(const Json::Value& config) {
     if (running_ || routing_ || !firewall_owner_.empty() || pd_registered_ || pbridge_registered_)
@@ -87,6 +89,9 @@ void LinuxBridge::start(const Json::Value& config) {
         } else if (pseudo_) start_pbridge();
         else resources_.ports.attach(plan.owner, uplink_, plan.bridge);
         running_ = true; rebuild_ = false;
+        // A rebuild re-plugs the VM TAPs it kept (crosvm still holds them).
+        for (const auto& [tap, nic] : attached_) plug(tap, nic);
+        if (l3_ && !attached_.empty()) publish_leases();
     } catch (const std::exception& error) {
         const std::string detail = error.what();
         try { stop(); }
@@ -143,7 +148,98 @@ void LinuxBridge::recover(const Json::Value& config) {
         // survive in state, and the PD registration stays with the network.
         topology_.verify(); dhcp_.restart(); return;
     }
-    stop(); start(config);
+    retain_taps_ = true;
+    try { stop(); } catch (...) { retain_taps_ = false; throw; }
+    retain_taps_ = false;
+    start(config);
+}
+void LinuxBridge::plug(const std::string& tap, const Json::Value& nic) {
+    const auto bridge = config::string(config_, "bridge_name");
+    std::string target = bridge;
+    const auto& vlan = config::member(nic, "vlan_id");
+    if (l3_ && (vlan.type() == Json::intValue || vlan.type() == Json::uintValue) && vlan.isInt64()) {
+        const int vid = std::bit_cast<int32_t>(static_cast<uint32_t>(vlan.asInt64()));
+        if (vid != 4095) target = vid == 0 ? bridge : topology_.ensure_vlan(vid);
+    }
+    resources_.links.require_owned(tap_owner(tap), tap);
+    resources_.netbox.master(tap, target);
+    // Port flags only warn in the legacy backend.
+    if (config::boolean(nic, "isolated")) try { resources_.netbox.isolated(tap, true); } catch (const std::exception&) {}
+    const auto mac = config::string(nic, "mac_address");
+    if (config::boolean(nic, "mac_security") && !mac.empty()) {
+        try { resources_.netbox.locked(tap, true); resources_.netbox.fdb(tap, mac); }
+        catch (const std::exception&) { try { resources_.netbox.locked(tap, false); } catch (const std::exception&) {} }
+    }
+    try { resources_.netbox.state(tap, true); } catch (const std::exception&) {}
+}
+void LinuxBridge::publish_leases() {
+    if (dhcp_needed_ && resources_.statics)
+        for (auto& [vlan, statics] : resources_.statics(config_)) dhcp_.set_statics(vlan, std::move(statics));
+    // installNicForwards: invalid forwards are skipped and reported per TAP.
+    std::vector<LinuxPortForward> forwards;
+    std::map<std::string, std::vector<std::string>> failures;
+    for (auto [tap, nic] : attached_) {
+        const auto* vlan = vm::nic_dhcp_vlan(nic, config_);
+        if (!vlan) continue;
+        const auto& ipv4 = config::member(*vlan, "ipv4");
+        auto& lease = nic["dhcp4_lease"];
+        if (!lease.isObject()) lease = Json::Value(Json::objectValue);
+        if (!config::boolean(lease, "enabled") || config::string(ipv4, "cidr").empty() ||
+            !config::boolean(config::member(ipv4, "dhcp"), "enabled") || !config::boolean(ipv4, "snat")) continue;
+        const auto offset = config::integer(lease, "offset", 64);
+        try {
+            const auto prefix = config::NetworkPrefix::parse(config::string(ipv4, "cidr"), false);
+            const int64_t total = int64_t(1) << (32 - prefix.prefix());
+            if (offset <= 0 || offset >= total - 1) continue; // invalid lease offset skips its forwards
+        } catch (const std::exception&) { continue; }
+        for (const auto& forward : vm::nic_forwards(nic, "dhcp4_lease")) {
+            try { vm::validate_forward(forward); }
+            catch (const std::exception& error) { failures[tap].push_back(forward.host + ":" + forward.guest + " (" + error.what() + ")"); continue; }
+            for (const auto& protocol : forward.protocols())
+                forwards.push_back({tap, static_cast<int>(config::integer(*vlan, "vlan_id")), offset, protocol,
+                    static_cast<uint16_t>(vm::forward_port(forward.host, true)), static_cast<uint16_t>(vm::forward_port(forward.host, false)),
+                    static_cast<uint16_t>(vm::forward_port(forward.guest, true)), static_cast<uint16_t>(vm::forward_port(forward.guest, false))});
+        }
+    }
+    failures_ = std::move(failures);
+    try { resources_.firewall.set_forwards(firewall_owner_, std::move(forwards)); }
+    catch (const std::exception& error) {
+        // The coordinator keeps the desired forwards and retries on refresh.
+        failures_["firewall"].push_back(error.what());
+    }
+}
+void LinuxBridge::release_tap(const std::string& tap) {
+    // The bridge belongs to the network owner: leave it before deleting.
+    try { resources_.links.require_owned(tap_owner(tap), tap); resources_.netbox.nomaster(tap); } catch (const std::exception&) {}
+    const auto rows = resources_.links.cleanup(tap_owner(tap));
+    if (!rows.empty()) throw ServiceError(ErrorCode::io_error, "VM TAP cleanup incomplete: " + wire::stringify(rows));
+}
+void LinuxBridge::attach(const Json::Value& nic, const std::string& tap) {
+    if (!running_) throw ServiceError(ErrorCode::unavailable, "Network " + config::string(config_, "name") + " is not running");
+    if (attached_.contains(tap)) detach(attached_.at(tap), tap);
+    for (const auto& row : resources_.netbox.links())
+        if (config::string(row, "ifname") == tap) throw ServiceError(ErrorCode::conflict, "TAP " + tap + " already exists");
+    resources_.links.tap(tap_owner(tap), tap);
+    try {
+        plug(tap, nic);
+        attached_[tap] = nic;
+        if (l3_) publish_leases();
+    } catch (...) {
+        attached_.erase(tap);
+        try { release_tap(tap); } catch (const std::exception&) {}
+        throw;
+    }
+}
+void LinuxBridge::detach(const Json::Value&, const std::string& tap) {
+    if (!attached_.erase(tap)) return;
+    failures_.erase(tap);
+    if (l3_ && running_) try { publish_leases(); } catch (const std::exception&) {}
+    release_tap(tap);
+}
+Json::Value LinuxBridge::forward_failures() const {
+    Json::Value result(Json::objectValue);
+    for (const auto& [tap, rows] : failures_) for (const auto& row : rows) result[tap].append(row);
+    return result;
 }
 void LinuxBridge::stop() {
     running_ = false;
@@ -151,6 +247,12 @@ void LinuxBridge::stop() {
     auto attempt = [&](auto&& step) {
         try { step(); } catch (const std::exception& error) { failures.append(error.what()); }
     };
+    // VM TAPs leave the bridge first; a rebuild keeps them for re-plugging.
+    for (const auto& [tap, nic] : attached_) attempt([&] {
+        if (retain_taps_) { resources_.netbox.nomaster(tap); return; }
+        release_tap(tap);
+    });
+    if (!retain_taps_) attached_.clear();
     // Detach a foreign uplink first: it quiesces external traffic and must
     // leave before the bridge can be released.
     if (!l3_ && !firewall_owner_.empty()) attempt([&] { resources_.ports.release(firewall_owner_); });

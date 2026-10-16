@@ -8,6 +8,7 @@
 #include "pd_ownership.h"
 #include "ports.h"
 #include "pbridge.h"
+#include <functional>
 #include <memory>
 
 namespace droidvm::network {
@@ -31,6 +32,8 @@ public:
         std::string dhcp_executable;
         std::string pbridge_executable;
         int dhcp_state_directory;
+        // BridgeDhcp.buildStatics: leases of every known VM NIC on this network.
+        std::function<std::map<int, DhcpStatics>(const Json::Value&)> statics = {};
     };
     explicit LinuxBridge(Resources resources);
     void start(const Json::Value& config) override;
@@ -41,6 +44,9 @@ public:
     void stop() override;
     Json::Value tools() const override;
     Json::Value tool_log(const std::string& key) const override;
+    void attach(const Json::Value& nic, const std::string& tap) override;
+    void detach(const Json::Value& nic, const std::string& tap) override;
+    Json::Value forward_failures() const override;
 private:
     Resources resources_;
     LinuxTopology topology_;
@@ -54,6 +60,13 @@ private:
     bool running_ = false, dhcp_needed_ = false, rebuild_ = false, pd_registered_ = false, l3_ = true;
     bool pseudo_ = false, pbridge_registered_ = false;
     std::string uplink_; // resolved L2 uplink
+    std::map<std::string, Json::Value> attached_; // TAP -> sanitized NIC
+    std::map<std::string, std::vector<std::string>> failures_; // legacy forward_failures
+    bool retain_taps_ = false; // recover keeps VM TAPs (crosvm holds them open)
+    std::string tap_owner(const std::string& tap) const { return firewall_owner_ + "/" + tap; }
+    void plug(const std::string& tap, const Json::Value& nic);
+    void publish_leases();
+    void release_tap(const std::string& tap);
     void start_pbridge();
     void start_dhcp(std::map<int, std::string> uplinks);
 };

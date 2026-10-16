@@ -2,6 +2,8 @@
 #pragma once
 #include "context.h"
 #include "vm/runtime.h"
+#include "network/helper_config.h"
+#include <map>
 #include <json/json.h>
 #include <atomic>
 #include <memory>
@@ -33,6 +35,9 @@ public:
     // The VM's runtime; not_found carries the legacy "VM not found: <id>".
     std::shared_ptr<vm::VmRuntime> runtime(const CallContext& caller, const std::string& id) const;
     void stop_all(); // stopAll: refuses further starts
+    // BridgeDhcp.buildStatics over every known VM, for each VLAN of the network.
+    std::map<int, network::DhcpStatics> statics(const Json::Value& network) const;
+    std::string running_vm_using(const std::string& network) const; // empty when none
     size_t loaded() const { return loaded_; }
     const std::string& load_error() const { return load_error_; }
 private:

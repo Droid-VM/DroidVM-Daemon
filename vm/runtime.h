@@ -31,6 +31,9 @@ struct RuntimeContext {
     std::string lbx;
     std::function<bool()> shutting_down = [] { return false; };
     std::function<bool()> optimize_sdcard = [] { return true; };
+    // NetworkInstance.attachNic/detachNic; attach throws with the legacy text.
+    std::function<void(const std::string& network, const Json::Value& nic, const std::string& tap)> attach_nic, detach_nic;
+    std::function<void(const std::string&)> warn = [](const std::string&) {}; // daemon log
 };
 // One VMInstance: its config, console streams and at most one VMM process.
 // Lifecycle calls serialize on one lock like startLock; the process is
@@ -81,6 +84,8 @@ private:
     void fire(const std::string& event, const Json::Value& extra = Json::Value());
     void create_streams();
     bool start_locked(bool relaunch);
+    bool setup_taps();
+    void cleanup_taps();
     void run();
     bool launch(const Json::Value& config, const BootPlan& plan, std::string& failure);
     void reap_and_cleanup();

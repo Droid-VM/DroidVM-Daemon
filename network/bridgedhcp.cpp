@@ -21,7 +21,10 @@ BridgeDhcp::BridgeDhcp(std::string executable, SwitchRuntime& runtime, int state
         throw std::invalid_argument("bridgedhcp executable must be an absolute path");
     struct stat info{};
     require(state_directory_.get() >= 0 && fstat(state_directory_.get(), &info) == 0, "hold DHCP state directory");
-    if (!S_ISDIR(info.st_mode) || info.st_uid != runtime.owner() || (info.st_mode & 0022))
+    // Android app directories are 0771 with the app's own group; only a foreign
+    // writer (world, or a group other than the app's) breaks privacy.
+    if (!S_ISDIR(info.st_mode) || info.st_uid != runtime.owner() || (info.st_mode & 0002) ||
+        ((info.st_mode & 0020) && info.st_gid != runtime.owner()))
         throw std::invalid_argument("DHCP state directory must be private to its owner");
 }
 BridgeDhcp::~BridgeDhcp() { try { stop(); } catch (...) {} }

@@ -2,6 +2,7 @@
 #pragma once
 #include <json/json.h>
 #include <string>
+#include <stdexcept>
 
 namespace droidvm::network {
 // Called serially on a worker for one network. start/recover return only after
@@ -20,6 +21,11 @@ public:
     virtual void recover(const Json::Value& config) = 0;
     virtual void stop() = 0;
     virtual Json::Value tools() const { return Json::Value(Json::arrayValue); }
+    // VM NIC attachment of a sanitized, validated NIC config. A throw leaves
+    // no TAP behind; per-forward failures are recorded, never thrown.
+    virtual void attach(const Json::Value&, const std::string&) { throw std::runtime_error("VM attachment is not supported by this network"); }
+    virtual void detach(const Json::Value&, const std::string&) {}
+    virtual Json::Value forward_failures() const { return Json::Value(Json::objectValue); }
     virtual Json::Value tool_log(const std::string&) const { return {}; }
 };
 }

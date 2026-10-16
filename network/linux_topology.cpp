@@ -4,6 +4,7 @@
 #include "store/network_config.h"
 #include "services/context.h"
 #include "common/wire.h"
+#include <algorithm>
 #include <bit>
 #include <fcntl.h>
 #include <regex>
@@ -45,7 +46,7 @@ void LinuxTopology::start(Json::Value configuration, const std::string& mac) {
     }
     for (const auto& row : netbox_.links()) if (names.contains(config::string(row, "ifname")))
         throw ServiceError(ErrorCode::conflict, "Linux topology interface already exists: " + config::string(row, "ifname"));
-    owner_ = owner;
+    owner_ = owner; bridge_ = bridge;
     try {
         links_.bridge(owner_, bridge); devices_.push_back(bridge);
         links_.require_owned(owner_, bridge); netbox_.mac(bridge, mac);
@@ -80,6 +81,17 @@ void LinuxTopology::start(Json::Value configuration, const std::string& mac) {
         catch (const std::exception& cleanup) { throw ServiceError(ErrorCode::io_error, detail + "; cleanup: " + cleanup.what()); }
         throw;
     }
+}
+std::string LinuxTopology::ensure_vlan(int vid) {
+    if (owner_.empty()) throw ServiceError(ErrorCode::unavailable, "Linux topology is stopped");
+    const auto device = OwnedLinks::vlan_device(bridge_, vid), leg = OwnedLinks::vlan_leg(bridge_, vid);
+    if (std::find(devices_.begin(), devices_.end(), device) != devices_.end()) return device;
+    links_.bridge(owner_, device); devices_.push_back(device);
+    links_.vlan(owner_, bridge_, leg, vid); devices_.push_back(leg);
+    links_.require_owned(owner_, leg); links_.require_owned(owner_, device);
+    netbox_.master(leg, device);
+    netbox_.state(leg, true); netbox_.state(device, true);
+    return device;
 }
 void LinuxTopology::verify() const {
     if (owner_.empty()) throw ServiceError(ErrorCode::unavailable, "Linux topology is stopped");

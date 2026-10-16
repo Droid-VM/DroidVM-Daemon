@@ -2,6 +2,9 @@
 #include "vm.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
+#include "vm/nic.h"
+#include <bit>
+#include <regex>
 #include "common/fd.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -166,6 +169,61 @@ bool VmService::remove(const CallContext& caller, const std::string& id) {
     std::lock_guard lock(mutex_);
     std::erase_if(entries_, [&](const Entry& entry) { return entry.vm == target; });
     return true;
+}
+std::map<int, network::DhcpStatics> VmService::statics(const Json::Value& network) const {
+    std::map<int, network::DhcpStatics> result;
+    const auto& vlans = config::member(config::member(network, "l3"), "vlans");
+    if (!vlans.isArray()) return result;
+    static const std::regex mac_pattern("([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}");
+    const auto id = config::uuid(network);
+    std::lock_guard lock(mutex_);
+    for (const auto& vlan : vlans) {
+        if (!vlan.isObject()) continue;
+        const int vid = std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(vlan, "vlan_id")));
+        auto& statics = result[vid];
+        const auto& ipv4 = config::member(vlan, "ipv4");
+        const auto& ipv6 = config::member(vlan, "ipv6");
+        const bool dhcp4 = !config::string(ipv4, "cidr").empty() && config::boolean(config::member(ipv4, "dhcp"), "enabled");
+        const bool dhcp6 = (config::string(ipv6, "source") == "dhcp_pd" || !config::string(ipv6, "cidr").empty()) &&
+            config::boolean(config::member(ipv6, "dhcp"), "enabled");
+        for (const auto& entry : entries_) {
+            const auto config = entry.vm->config();
+            const auto& nics = config::member(config, "networks");
+            if (!nics.isArray()) continue;
+            for (Json::ArrayIndex i = 0; i < nics.size(); ++i) {
+                auto nic = nics[i];
+                const auto mac = config::string(nic, "mac_address");
+                if (config::string(nic, "network_id") != id || mac.empty()) continue;
+                const auto* nic_vlan = vm::nic_dhcp_vlan(nic, network);
+                if (!nic_vlan || std::bit_cast<int32_t>(static_cast<uint32_t>(config::integer(*nic_vlan, "vlan_id"))) != vid) continue;
+                // bridgedhcp refuses a malformed binding; the legacy push logged it per VM.
+                if (!std::regex_match(mac, mac_pattern)) continue;
+                for (const bool v6 : {false, true}) {
+                    const auto& lease = config::member(nic, v6 ? "dhcp6_lease" : "dhcp4_lease");
+                    if (!config::boolean(lease, "enabled") || !(v6 ? dhcp6 : dhcp4)) continue;
+                    const auto offset = config::integer(lease, "offset", 64);
+                    if (offset <= 0) continue;
+                    Json::Value row;
+                    row["id"] = entry.id + "-" + std::to_string(i);
+                    row["mac"] = mac;
+                    row["offset"] = Json::Int64(offset);
+                    (v6 ? statics.ipv6 : statics.ipv4).append(std::move(row));
+                }
+            }
+        }
+    }
+    return result;
+}
+std::string VmService::running_vm_using(const std::string& network) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& entry : entries_) {
+        if (entry.vm->state() == VmState::stopped) continue;
+        const auto config = entry.vm->config();
+        const auto& nics = config::member(config, "networks");
+        if (nics.isArray()) for (const auto& nic : nics)
+            if (config::string(nic, "network_id") == network) return config::string(config, "name");
+    }
+    return {};
 }
 void VmService::stop_all() {
     shutting_down_->store(true);
