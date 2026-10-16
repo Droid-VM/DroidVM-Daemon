@@ -14,6 +14,7 @@
 #include "network/ports.h"
 #include "network/pbridge.h"
 #include "network/host_watch.h"
+#include "services/vm.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -139,8 +140,12 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::NetworkHostService> host_network;
             std::unique_ptr<droidvm::NetworkService> network_runtime;
             std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
+            std::unique_ptr<droidvm::VmService> vms;
             if (layout) {
                 files = layout->open_files();
+                vms = std::make_unique<droidvm::VmService>(files.get());
+                if (log && !vms->load_error().empty() && vms->load_error() != "absent")
+                    log->write("WARN", "VM inventory not loaded: " + vms->load_error());
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
                 host_network = std::make_unique<droidvm::NetworkHostService>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
@@ -166,7 +171,7 @@ int main(int argc, char** argv) {
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();

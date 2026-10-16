@@ -12,6 +12,8 @@ std::string string(const Json::Value& object, const char* key, std::string fallb
 bool boolean(const Json::Value& object, const char* key, bool fallback = false);
 int64_t integer(const Json::Value& object, const char* key, int64_t fallback = 0);
 int schema(const Json::Value& object);
+// Long.parseLong(text, 10), including Character.digit's Unicode digits.
+int64_t java_long(std::string_view text);
 std::string uuid(const Json::Value& object);
 Json::Value default_vlan(int id);
 // Unsupported future schemas are not interpreted. The store must retain their

@@ -2,6 +2,7 @@
 #include "dispatcher.h"
 #include "common/wire.h"
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <limits>
 
@@ -13,6 +14,10 @@ constexpr std::array network_commands{"network_create", "network_modify", "netwo
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
 bool host_command(const std::string& command) {
     return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
+}
+constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status"};
+bool vm_command(const std::string& command) {
+    return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
 constexpr std::array runtime_commands{"network_start", "network_stop", "network_status", "network_tool_log"};
 bool runtime_command(const std::string& command) {
@@ -69,11 +74,11 @@ Json::Value snapshot_json(const SnapshotPage& page) {
     for (const auto& row : page.items) items.append(wire::parse(row));
     return value;
 }
-std::string legacy_id(const Json::Value& request) {
+std::string legacy_id(const Json::Value& request, const char* key = "network_id") {
     // JSONObject.optString distinguishes an absent key from JSONObject.NULL
     // and stringifies other JSON values. DataItem's strict accessor is different.
-    if (!request.isMember("network_id")) return {};
-    const auto& value = request["network_id"];
+    if (!request.isMember(key)) return {};
+    const auto& value = request[key];
     if (value.isString()) return value.asString();
     Json::StreamWriterBuilder builder;
     builder["indentation"] = "";
@@ -82,7 +87,7 @@ std::string legacy_id(const Json::Value& request) {
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (host_network_ && host_command(command)) ||
+    return (host_network_ && host_command(command)) || (vms_ && vm_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
@@ -90,6 +95,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     Json::Value result;
     result["success"] = false;
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
+    if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
     try {
         if (host_command(command) && host_network_) {
             result["data"] = command == "network_list_uplinks" ? host_network_->uplinks(caller) :
@@ -152,6 +158,39 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         return result;
     } catch (...) { result["message"] = "internal error"; return result; }
 }
+Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    Json::Value result;
+    result["success"] = false;
+    try {
+        if (command == "vm_create" || command == "vm_modify") {
+            if (!request.isMember("config")) { result["message"] = "missing config"; return result; }
+            result["vm_id"] = command == "vm_create" ? vms_->create(caller, request["config"]) : vms_->modify(caller, request["config"]);
+        } else if (command == "vm_list") {
+            result["data"] = vms_->list(caller);
+        } else {
+            const auto id = legacy_id(request, "vm_id");
+            if (id.empty()) { result["message"] = "missing vm_id"; return result; }
+            if (command == "vm_get") result["data"] = vms_->get(caller, id);
+            else if (command == "vm_exists") { result["vm_id"] = id; result["exists"] = vms_->exists(caller, id); }
+            else if (command == "vm_delete") result["existed"] = vms_->remove(caller, id);
+            else {
+                std::string state = vm_state_name(vms_->state(caller, id));
+                for (auto& c : state) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                result["vm_id"] = id; result["state"] = state;
+            }
+        }
+        result["success"] = true;
+        return result;
+    } catch (const ServiceError& error) {
+        // Only RequestException texts reach a legacy client.
+        if (error.code() == ErrorCode::not_found && (command == "vm_get" || command == "vm_status")) result["message"] = error.what();
+        else if (error.code() == ErrorCode::conflict && command == "vm_create") result["message"] = "failed to create VM";
+        else if ((error.code() == ErrorCode::not_found || error.code() == ErrorCode::conflict) && command == "vm_modify") result["message"] = "failed to modify VM";
+        else if (error.code() == ErrorCode::unavailable && command == "vm_delete") result["message"] = error.what();
+        else result["message"] = "internal error";
+        return result;
+    } catch (...) { result["message"] = "internal error"; return result; }
+}
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end()) {
         auto result = system_.execute(session.caller, command, request);
@@ -183,6 +222,12 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["service_api_minor"] = 4;
             }
             if (host_network_) result["service_api_minor"] = 5;
+            if (vms_) {
+                for (const auto* name : vm_commands) result["commands"].append(name);
+                result["vm_inventory"] = true;
+                result["vm_runtime"] = false;
+                result["service_api_minor"] = 6;
+            }
         }
         return result;
     }

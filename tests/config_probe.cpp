@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "store/network_config.h"
+#include "store/vm_config.h"
 #include "store/json_file.h"
 #include "common/wire.h"
 #include "network/helper_config.h"
@@ -19,6 +20,12 @@ int main(int argc, char** argv) {
             row["name"] = test["name"];
             try {
                 auto value = test["config"];
+                if (test["op"].asString() == "vm") {
+                    row["config"] = droidvm::config::migrate_vm(value);
+                    row["reloaded"] = droidvm::config::migrate_vm(droidvm::wire::parse(droidvm::config::encode_json(row["config"])));
+                    row["status"] = "ok";
+                    report.append(row); continue;
+                }
                 if (test["op"].asString() == "gvswitch") {
                     row["helper"] = droidvm::network::gvswitch_config(value);
                     row["status"] = "ok";

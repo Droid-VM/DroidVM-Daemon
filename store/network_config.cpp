@@ -82,6 +82,9 @@ int64_t java_integer(std::string_view value, int radix, uint64_t maximum) {
     return negative ? -static_cast<int64_t>(result) : static_cast<int64_t>(result);
 }
 int decimal(std::string_view value) { return static_cast<int>(java_integer(value, 10, INT32_MAX)); }
+}
+int64_t java_long(std::string_view text) { return java_integer(text, 10, INT64_MAX); }
+namespace {
 uint32_t ipv4(std::string_view text) {
     uint32_t result = 0;
     for (int part = 0; part < 4; ++part) {
