@@ -15,7 +15,7 @@ void require(bool ok, const char* operation) {
 }
 std::string kind(const Json::Value& entry) { return entry.get("kind", "gvswitch").asString(); }
 const char* prefix(const std::string& kind) {
-    return kind == "gvswitch" ? "gv-" : kind == "pbridge" ? "pb-" : kind == "netbox-monitor" ? "nm-" : kind == "bridgedhcp" ? "dh-" : nullptr;
+    return kind == "gvswitch" ? "gv-" : kind == "pbridge" ? "pb-" : kind == "netbox-monitor" ? "nm-" : kind == "bridgedhcp" ? "dh-" : kind == "vm" ? "vm-" : nullptr;
 }
 bool valid_name(const std::string& name, const std::string& kind) {
     return name.size() == 35 && name.starts_with(prefix(kind)) &&
@@ -71,7 +71,7 @@ void SwitchRuntime::allocate(const std::string& owner, Allocation& allocation, K
     if (owner.empty() || owner.size() > 128 || owner.find('\0') != std::string::npos)
         throw std::invalid_argument("invalid switch runtime owner");
     const std::string type = helper_kind == Kind::gvswitch ? "gvswitch" : helper_kind == Kind::pbridge ? "pbridge" :
-        helper_kind == Kind::monitor ? "netbox-monitor" : "bridgedhcp";
+        helper_kind == Kind::monitor ? "netbox-monitor" : helper_kind == Kind::vm ? "vm" : "bridgedhcp";
     const auto name = prefix(type) + random_id(false);
     {
         std::lock_guard lock(mutex_);

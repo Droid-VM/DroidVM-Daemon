@@ -834,4 +834,22 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
     builder.environment(launch);
     return launch;
 }
+bool resolves_to_gunyah(const Json::Value& item, const HostFacts& host) {
+    // VMHypervisor.resolveConfigured with optEnum (unknown names are AUTO);
+    // both backends prefer KVM, then Gunyah.
+    const auto configured = java_enum(item, "hypervisor", "AUTO", hypervisors);
+    if (configured != "AUTO") return configured == "GUNYAH";
+    if (host.has_kvm) return false;
+    return host.has_gunyah;
+}
+std::string screen_transport_cap(const Json::Value& config, const std::string& id) {
+    const auto screen = find_screen(config, id.c_str());
+    if (!screen) return transport_default(id, "NONE");
+    return transport_cap(*screen);
+}
+int64_t boot_guest_prealloc_mb(const Json::Value& item) {
+    const auto pool = boot_guest_pool_mb(item);
+    if (pool <= 0) return 0;
+    return std::max<int64_t>(std::min<int64_t>(integer(item, "gpu_guest_prealloc_mb", pool), pool), 0);
+}
 }

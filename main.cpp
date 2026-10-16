@@ -15,6 +15,11 @@
 #include "network/pbridge.h"
 #include "network/host_watch.h"
 #include "services/vm.h"
+#include "services/legacy_events.h"
+#include "vm/hugepage.h"
+#include "build_metadata.h"
+#include <fstream>
+#include <sys/stat.h>
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -141,9 +146,41 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::NetworkService> network_runtime;
             std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
             std::unique_ptr<droidvm::VmService> vms;
+            droidvm::LegacyEvents legacy_events;
+            droidvm::vm::HugepagePool hugepages;
+            // The kernel keeps a reserve target after an owner dies; only a target this
+            // daemon recorded in its run directory is ours to drop on startup.
+            const auto pool_record = layout ? (std::filesystem::absolute(data_directory) / "run/vm-pool-target").string() : std::string();
+            if (layout) {
+                std::ifstream recorded(pool_record);
+                long long pages = 0;
+                if (recorded >> pages && pages > 0 && hugepages.resizable()) hugepages.set_reserved(0);
+                std::filesystem::remove(pool_record);
+            }
+            droidvm::vm::PoolReservations pool([&](int64_t pages) {
+                const bool done = hugepages.set_reserved(pages);
+                if (pages > 0) std::ofstream(pool_record, std::ios::trunc) << pages;
+                else std::filesystem::remove(pool_record);
+                return done;
+            });
             if (layout) {
                 files = layout->open_files();
-                vms = std::make_unique<droidvm::VmService>(files.get());
+                droidvm::vm::RuntimeContext context;
+                context.identities = &switch_runtime;
+                context.events = &legacy_events;
+                context.pool = &pool;
+                context.owner = layout->owner();
+                const auto data = std::filesystem::absolute(data_directory);
+                // Legacy argv spells paths from /data/data/<package>; keep that when it is this directory.
+                struct stat mine{}, legacy{};
+                const auto legacy_data = std::string("/data/data/") + DROIDVM_PACKAGE_NAME;
+                const bool same = stat(data.c_str(), &mine) == 0 && stat(legacy_data.c_str(), &legacy) == 0 &&
+                    mine.st_dev == legacy.st_dev && mine.st_ino == legacy.st_ino;
+                context.data_dir = same ? std::string() : data.string();
+                context.cache_dir = (data / "cache").string();
+                context.run_dir = (data / "run").string();
+                context.lbx = (data / "bin/lbx").string();
+                vms = std::make_unique<droidvm::VmService>(files.get(), context);
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
@@ -171,10 +208,12 @@ int main(int argc, char** argv) {
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events);
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();
+            // VMs leave before USB/networks: their taps and devices go with them.
+            if (vms) vms->stop_all();
             if (host_ipv4) host_ipv4->stop();
             if (network_runtime) {
                 const auto failures = network_runtime->shutdown();

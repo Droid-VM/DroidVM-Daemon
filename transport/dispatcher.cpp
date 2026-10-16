@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "dispatcher.h"
 #include "common/wire.h"
+#include "store/network_config.h"
+#include "store/vm_config.h"
+#include "vm/console.h"
+#include "vm/crosvm_command.h"
 #include <algorithm>
 #include <cctype>
 #include <array>
@@ -15,7 +19,19 @@ constexpr std::array host_commands{"network_list_interfaces", "network_list_upli
 bool host_command(const std::string& command) {
     return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
 }
-constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status"};
+constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status",
+    "vm_start", "vm_stop", "vm_stop_all", "vm_reboot", "vm_suspend", "vm_resume", "vm_control", "vm_console_list",
+    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info"};
+// JSONObject.optBoolean: a boolean, or the strings "true"/"false" in any case.
+bool legacy_flag(const Json::Value& request, const char* key) {
+    if (!request.isMember(key)) return false;
+    const auto& value = request[key];
+    if (value.isBool()) return value.asBool();
+    if (!value.isString()) return false;
+    auto text = value.asString();
+    for (auto& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return text == "true";
+}
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
@@ -167,6 +183,91 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
             result["vm_id"] = command == "vm_create" ? vms_->create(caller, request["config"]) : vms_->modify(caller, request["config"]);
         } else if (command == "vm_list") {
             result["data"] = vms_->list(caller);
+        } else if (command == "vm_stop_all") {
+            vms_->stop_all();
+        } else if (command.starts_with("vm_console_") || command == "vm_vnc_info") {
+            const auto id = legacy_id(request, "vm_id");
+            const auto stream = legacy_id(request, "stream");
+            if (id.empty()) { result["message"] = "missing vm_id"; return result; }
+            if (stream.empty() && (command == "vm_console_info" || command == "vm_console_write" || command == "vm_console_clear")) {
+                result["message"] = "missing stream"; return result;
+            }
+            std::shared_ptr<vm::VmRuntime> target;
+            try { target = vms_->runtime(caller, id); }
+            catch (const ServiceError& error) {
+                if (error.code() != ErrorCode::not_found) throw;
+                result["message"] = "VM not found"; return result;
+            }
+            if (command == "vm_console_list") {
+                result["data"] = Json::Value(Json::arrayValue);
+                for (const auto& name : target->streams()) result["data"].append(name);
+            } else if (command == "vm_vnc_info") {
+                const auto config = target->config();
+                const auto screen = legacy_id(request, "screen");
+                std::string found;
+                for (const char* candidate : {"gpu-0", "simplefb"}) {
+                    const auto& row = config::member(config::member(config, "screens"), candidate);
+                    if (!row.isObject() || !config::boolean(row, "enabled") ||
+                        config::java_enum(row, "exporter", "NONE", {"NATIVE", "VNC", "NONE"}) != "VNC") continue;
+                    if (screen.empty() || screen == candidate) { found = candidate; break; }
+                }
+                if (found.empty()) { result["message"] = "VNC is not enabled for this VM"; return result; }
+                const auto& vnc = config::member(config["screens"][found], "vnc");
+                const auto host = config::string(vnc, "host");
+                result["screen"] = found;
+                result["host"] = host.empty() ? "127.0.0.1" : host;
+                result["port"] = Json::Int64(config::integer(vnc, "port", -1));
+                result["password"] = config::string(vnc, "password");
+                result["transport_cap"] = vm::screen_transport_cap(config, found);
+                // The wildcard bind is reached at the phone's own filtered address.
+                if (host == "0.0.0.0" && host_ipv4_) {
+                    const auto addresses = host_ipv4_->current();
+                    if (!addresses.empty()) result["remote_host"] = addresses.front();
+                }
+            } else if (command == "vm_console_history") {
+                result["vm_id"] = id;
+                if (!stream.empty()) {
+                    auto* log = target->log(stream);
+                    if (!log) { result["message"] = "stream not found"; return result; }
+                    result[stream] = vm::url_encode_bytes(log->contents());
+                } else {
+                    for (const auto& name : target->streams()) if (auto* log = target->log(name)) result[name] = vm::url_encode_bytes(log->contents());
+                }
+            } else {
+                auto* log = target->log(stream);
+                if (!log) { result["message"] = "stream not found"; return result; }
+                if (command == "vm_console_clear") log->clear();
+                else if (command == "vm_console_write") {
+                    if (!target->write(stream, legacy_id(request, "data"))) { result["message"] = "failed to write to stream"; return result; }
+                } else {
+                    const auto info = target->stream_info(stream);
+                    auto& data = result["data"];
+                    data["type"] = info->type; data["name"] = stream; data["path"] = log->path();
+                    data["length"] = Json::UInt64(log->size()); data["readable"] = info->readable; data["writable"] = info->writable;
+                    if (info->fd_pipe) { data["read_fd"] = info->read_fd; data["write_fd"] = info->write_fd; data["ready"] = info->read_fd >= 0 || info->write_fd >= 0; }
+                    if (info->type == "LocalSocketConsoleStream") data["ready"] = false;
+                }
+            }
+        } else if (command == "vm_start" || command == "vm_stop" || command == "vm_reboot" || command == "vm_suspend" ||
+                   command == "vm_resume" || command == "vm_control") {
+            const auto id = legacy_id(request, "vm_id");
+            if (id.empty()) { result["message"] = "missing vm_id"; return result; }
+            auto target = vms_->runtime(caller, id);
+            bool done = false;
+            if (command == "vm_start") {
+                if (legacy_flag(request, "clear_logs_before_start") && target->state() == VmState::stopped) target->clear_logs();
+                const auto entry = legacy_id(request, "boot_entry");
+                done = target->start(entry.empty() ? std::nullopt : std::optional(entry));
+                if (!done) { result["message"] = "failed to start VM"; return result; }
+            } else if (command == "vm_control") {
+                const auto cmd = legacy_id(request, "cmd");
+                if (cmd.empty()) { result["message"] = "missing cmd"; return result; }
+                if (!target->control(cmd)) { result["message"] = "failed to send command"; return result; }
+            } else {
+                done = command == "vm_stop" ? target->stop() : command == "vm_reboot" ? target->reboot() :
+                    command == "vm_suspend" ? target->suspend() : target->resume();
+                if (!done) { result["message"] = "failed to " + command.substr(3) + " VM"; return result; }
+            }
         } else {
             const auto id = legacy_id(request, "vm_id");
             if (id.empty()) { result["message"] = "missing vm_id"; return result; }
@@ -183,7 +284,8 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
         return result;
     } catch (const ServiceError& error) {
         // Only RequestException texts reach a legacy client.
-        if (error.code() == ErrorCode::not_found && (command == "vm_get" || command == "vm_status")) result["message"] = error.what();
+        if (error.code() == ErrorCode::not_found && (command == "vm_get" || command == "vm_status" || command == "vm_start" || command == "vm_stop" ||
+            command == "vm_reboot" || command == "vm_suspend" || command == "vm_resume" || command == "vm_control")) result["message"] = error.what();
         else if (error.code() == ErrorCode::conflict && command == "vm_create") result["message"] = "failed to create VM";
         else if ((error.code() == ErrorCode::not_found || error.code() == ErrorCode::conflict) && command == "vm_modify") result["message"] = "failed to modify VM";
         else if (error.code() == ErrorCode::unavailable && command == "vm_delete") result["message"] = error.what();
@@ -225,7 +327,9 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (vms_) {
                 for (const auto* name : vm_commands) result["commands"].append(name);
                 result["vm_inventory"] = true;
-                result["vm_runtime"] = false;
+                result["vm_runtime"] = true;
+                result["vm_runtime_backends"] = Json::Value(Json::arrayValue);
+                result["vm_runtime_backends"].append("crosvm"); // no QEMU, NIC attachment or input bridge yet
                 result["service_api_minor"] = 6;
             }
         }

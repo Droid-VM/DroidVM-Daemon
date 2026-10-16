@@ -41,15 +41,18 @@ Json::Value parse_strict(const std::string& text) {
     return value;
 }
 }
-const char* vm_state_name(VmState state) { return state_names[static_cast<size_t>(state)]; }
-VmService::VmService(int files_directory) {
+VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) {
+    auto flag = shutting_down_;
+    auto outer = context_.shutting_down;
+    context_.shutting_down = [flag, outer] { return flag->load() || outer(); };
+}
+VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
     try {
         const auto document = parse_strict(read_file(files_directory, "vms.json"));
         const auto& rows = config::member(document, "vms");
         if (!rows.isNull() && !rows.isArray()) throw std::runtime_error("vms is not an array");
         for (const auto& row : rows) {
             if (!row.isObject()) throw std::runtime_error("entry is not an object");
-            Entry entry;
             if (row.isMember("state")) {
                 // VMInstance validates a persisted state; a restarted daemon
                 // never adopts a running process, so the entry is stopped.
@@ -57,15 +60,15 @@ VmService::VmService(int files_directory) {
                 for (const auto* name : state_names) known = known || row["state"] == name;
                 if (!known) throw std::runtime_error("invalid state");
             }
-            entry.config = config::migrate_vm(row);
-            entry.id = config::uuid(entry.config);
-            add(std::move(entry));
+            auto config = config::migrate_vm(row);
+            add(config::uuid(config), std::move(config));
         }
         loaded_ = entries_.size();
     } catch (const std::exception& error) {
         entries_.clear(); loaded_ = 0; load_error_ = error.what();
     }
 }
+VmService::~VmService() { try { stop_all(); } catch (...) {} }
 std::optional<std::string> VmService::canonical(const std::string& id) {
     Json::Value value;
     value["id"] = id;
@@ -77,47 +80,43 @@ const VmService::Entry* VmService::find(const std::string& id) const {
     for (const auto& entry : entries_) if (entry.id == *key) return &entry;
     return nullptr;
 }
-void VmService::add(Entry entry) {
-    const auto& name = config::member(entry.config, "name");
+void VmService::add(const std::string& id, Json::Value config) {
+    const auto& name = config::member(config, "name");
     // IllegalArgumentException in DataStore.add: never a legacy business message.
     if (!name.isString()) throw ServiceError(ErrorCode::invalid_argument, "Config name cannot be null");
     for (const auto& other : entries_) {
-        if (other.id == entry.id) throw ServiceError(ErrorCode::invalid_argument, "Config ID already exists: " + entry.id);
-        if (config::member(other.config, "name") == name) throw ServiceError(ErrorCode::invalid_argument, "Config name already exists: " + name.asString());
+        if (other.id == id) throw ServiceError(ErrorCode::invalid_argument, "Config ID already exists: " + id);
+        if (config::member(other.vm->config(), "name") == name) throw ServiceError(ErrorCode::invalid_argument, "Config name already exists: " + name.asString());
     }
-    entries_.push_back(std::move(entry));
+    entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, std::move(config), context_)});
 }
 Json::Value VmService::list(const CallContext& caller) const {
     access(caller);
     std::lock_guard lock(mutex_);
     Json::Value rows(Json::arrayValue);
     for (const auto& entry : entries_) {
-        auto row = entry.config;
-        row["state"] = vm_state_name(entry.state);
-        row["pid"] = -1;
-        row["streams"] = config::vm_streams(entry.config);
+        auto row = entry.vm->config();
+        row["state"] = vm_state_name(entry.vm->state());
+        row["pid"] = Json::Int64(entry.vm->pid());
+        row["streams"] = Json::Value(Json::arrayValue);
+        for (const auto& name : entry.vm->streams()) row["streams"].append(name);
         rows.append(std::move(row));
     }
     return rows;
 }
-Json::Value VmService::get(const CallContext& caller, const std::string& id) const {
-    access(caller);
-    std::lock_guard lock(mutex_);
-    const auto* entry = find(id);
-    if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
-    return entry->config;
-}
+Json::Value VmService::get(const CallContext& caller, const std::string& id) const { return runtime(caller, id)->config(); }
 bool VmService::exists(const CallContext& caller, const std::string& id) const {
     access(caller);
     std::lock_guard lock(mutex_);
     return find(id) != nullptr;
 }
-VmState VmService::state(const CallContext& caller, const std::string& id) const {
+VmState VmService::state(const CallContext& caller, const std::string& id) const { return runtime(caller, id)->state(); }
+std::shared_ptr<vm::VmRuntime> VmService::runtime(const CallContext& caller, const std::string& id) const {
     access(caller);
     std::lock_guard lock(mutex_);
     const auto* entry = find(id);
     if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
-    return entry->state;
+    return entry->vm;
 }
 std::string VmService::create(const CallContext& caller, Json::Value value) {
     access(caller);
@@ -126,7 +125,7 @@ std::string VmService::create(const CallContext& caller, Json::Value value) {
     std::lock_guard lock(mutex_);
     for (const auto& entry : entries_) if (entry.id == id) throw ServiceError(ErrorCode::conflict, "VM " + id + " already exists");
     config["id"] = id;
-    add({id, std::move(config), VmState::stopped});
+    add(id, std::move(config));
     return id;
 }
 std::string VmService::modify(const CallContext& caller, Json::Value value) {
@@ -137,28 +136,45 @@ std::string VmService::modify(const CallContext& caller, Json::Value value) {
     auto at = entries_.begin();
     while (at != entries_.end() && at->id != id) ++at;
     if (at == entries_.end()) throw ServiceError(ErrorCode::not_found, "VM " + id + " not found");
-    if (at->state != VmState::stopped) throw ServiceError(ErrorCode::conflict, "VM " + id + " is not stopped, cannot modify");
+    if (at->vm->state() != VmState::stopped) throw ServiceError(ErrorCode::conflict, "VM " + id + " is not stopped, cannot modify");
     config["id"] = id;
-    // removeById + add re-appends the entry. Unlike the legacy store, a
-    // rejected duplicate name restores the previous entry in place.
+    // removeById + add re-appends a rebuilt instance. Unlike the legacy store,
+    // a rejected duplicate name restores the previous entry in place.
     const auto index = at - entries_.begin();
     auto previous = std::move(*at);
     entries_.erase(at);
-    try { add({id, std::move(config), VmState::stopped}); }
+    try { add(id, std::move(config)); }
     catch (...) { entries_.insert(entries_.begin() + index, std::move(previous)); throw; }
     return id;
 }
 bool VmService::remove(const CallContext& caller, const std::string& id) {
     access(caller);
-    std::lock_guard lock(mutex_);
-    const auto key = canonical(id);
-    if (!key) return false;
-    for (auto at = entries_.begin(); at != entries_.end(); ++at) {
-        if (at->id != *key) continue;
-        if (at->state != VmState::stopped) throw ServiceError(ErrorCode::unavailable, "Failed to stop VM: " + id);
-        entries_.erase(at);
-        return true;
+    std::shared_ptr<vm::VmRuntime> target;
+    {
+        std::lock_guard lock(mutex_);
+        const auto* entry = find(id);
+        if (!entry) return false;
+        target = entry->vm;
     }
-    return false;
+    // The legacy check stops the VM and then reports the successful stop as
+    // a failure (inverted condition); here a failed stop is the failure.
+    if (target->state() != VmState::stopped) {
+        if (!target->stop() && target->state() != VmState::stopped) throw ServiceError(ErrorCode::unavailable, "Failed to stop VM: " + id);
+        target->shutdown();
+        if (target->state() != VmState::stopped) throw ServiceError(ErrorCode::unavailable, "Failed to stop VM: " + id);
+    }
+    std::lock_guard lock(mutex_);
+    std::erase_if(entries_, [&](const Entry& entry) { return entry.vm == target; });
+    return true;
+}
+void VmService::stop_all() {
+    shutting_down_->store(true);
+    std::vector<std::shared_ptr<vm::VmRuntime>> targets;
+    { std::lock_guard lock(mutex_); for (const auto& entry : entries_) targets.push_back(entry.vm); }
+    for (auto& target : targets) if (target->state() != VmState::stopped) target->stop();
+    for (auto& target : targets) target->shutdown();
+    // VMInstanceStore.stopAll ends with clear(); the store accepts no starts afterwards.
+    std::lock_guard lock(mutex_);
+    entries_.clear();
 }
 }
