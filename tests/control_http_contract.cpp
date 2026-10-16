@@ -487,9 +487,13 @@ void managed_dhcp_daemon_recovery() {
     }
     check(poll(&death, 1, 0) > 0 && access(("/sys/class/net/" + bridge).c_str(), F_OK) < 0,
         "actual daemon reclaims DHCP process before its Linux topology");
-    check(config::JsonFile(run_dir.get(), "network-runtime.json", getuid()).load()->value["switches"].empty() &&
-        config::JsonFile(run_dir.get(), "network-links.json", getuid()).load()->value["links"].empty(), "both startup inventories empty");
+    // The live daemon may already own its host address monitor.
+    bool recovered = true;
+    for (const auto& row : config::JsonFile(run_dir.get(), "network-runtime.json", getuid()).load()->value["switches"])
+        recovered = recovered && row["kind"] == "netbox-monitor";
+    check(recovered && config::JsonFile(run_dir.get(), "network-links.json", getuid()).load()->value["links"].empty(), "both startup inventories empty");
     check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon exits normally");
+    check(config::JsonFile(run_dir.get(), "network-runtime.json", getuid()).load()->value["switches"].empty(), "daemon exit releases its monitor identity");
     for (const char* name : {"network-links.json", "network-links.json.bak", "network-runtime.json", "network-runtime.json.bak", "droidvmd.lock"}) unlinkat(run_dir.get(), name, 0);
     for (const char* name : {"networks.json", "networks.json.bak"}) unlinkat(files.get(), name, 0);
     unlinkat(files.get(), BridgeDhcp::state_file(network).c_str(), 0);

@@ -941,6 +941,7 @@ void daemon_linux_topology_recovery() {
         check(daemon.signal(SIGTERM) && daemon.communicate({}, 5s).exit_code == 128 + SIGTERM, "recovery daemon stops normally");
         for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/network-rules.json", "run/network-rules.json.bak",
                                 "run/network-routes.json", "run/network-routes.json.bak",
+                                "run/network-runtime.json", "run/network-runtime.json.bak", // host address monitor
                                 "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
             unlink((test.path + "/" + name).c_str());
         for (const char* name : {"run", "bin", "cache", "files"}) check(rmdir((test.path + "/" + name).c_str()) == 0, "remove isolated daemon topology directory");

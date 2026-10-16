@@ -13,6 +13,7 @@
 #include "network/pd_ownership.h"
 #include "network/ports.h"
 #include "network/pbridge.h"
+#include "network/host_watch.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -137,6 +138,7 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::NetworkConfigService> networks;
             std::unique_ptr<droidvm::NetworkHostService> host_network;
             std::unique_ptr<droidvm::NetworkService> network_runtime;
+            std::unique_ptr<droidvm::network::HostIpv4Watch> host_ipv4;
             if (layout) {
                 files = layout->open_files();
                 networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer);
@@ -152,16 +154,23 @@ int main(int argc, char** argv) {
                             (binaries / "bridgedhcp").string(), (binaries / "pbridge").string(), files.get()});
                     });
                 network_runtime->request_autostart({"network-autostart", true, true, true});
+                host_ipv4 = std::make_unique<droidvm::network::HostIpv4Watch>(*netbox, switch_runtime, [&](const std::vector<std::string>& addresses) {
+                    linux_firewall.set_host_ipv4(addresses);
+                    std::string text;
+                    for (const auto& address : addresses) text += (text.empty() ? "" : ",") + address;
+                    if (log) log->write("INFO", "host IPv4 set [" + text + "]");
+                });
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
                 if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
             }
             droidvm::TaskService tasks;
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get());
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();
+            if (host_ipv4) host_ipv4->stop();
             if (network_runtime) {
                 const auto failures = network_runtime->shutdown();
                 if (!failures.empty()) throw std::runtime_error("Network shutdown incomplete: " + droidvm::wire::stringify(failures));

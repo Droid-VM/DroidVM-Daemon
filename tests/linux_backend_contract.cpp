@@ -8,6 +8,11 @@
 #include "network/pd_ownership.h"
 #include "network/ports.h"
 #include "network/host_discovery.h"
+#include "network/host_watch.h"
+#include "network/netlink.h"
+#include <linux/if_addr.h>
+#include "services/tasks.h"
+#include <set>
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include "services/network.h"
@@ -164,6 +169,17 @@ pid_t helper_pid(const std::string& prefix) {
     }
     closedir(dir); return result;
 }
+std::vector<pid_t> monitor_pids(const std::string& tool) {
+    DIR* dir = opendir("/proc"); check(dir, "open process table");
+    std::vector<pid_t> result;
+    while (const auto* entry = readdir(dir)) {
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        std::ifstream file(std::string("/proc/") + entry->d_name + "/cmdline");
+        std::string text((std::istreambuf_iterator<char>(file)), {});
+        if (text.starts_with(tool + std::string(1, '\0') + "monitor-addr" + std::string(1, '\0'))) result.push_back(std::stoi(entry->d_name));
+    }
+    closedir(dir); return result;
+}
 void service_lifecycle() {
     Fixture fixture("lb-service");
     auto now = NetworkService::Clock::now();
@@ -245,10 +261,14 @@ void actual_daemon() {
         Child daemon(launch); Fd tap;
         ip = ready(daemon, tap);
         check(ip.starts_with("198.18.210."), "production factory serves real DHCP");
+        const auto monitors = monitor_pids(path + "/bin/netbox");
+        check(monitors.size() == 1, "daemon runs one host address monitor");
         check(daemon.signal(SIGKILL) && daemon.communicate({}, 5s).exit_code == -SIGKILL, "kill daemon with live Linux network");
+        check(kill(monitors[0], 0) == 0, "killed daemon orphaned its host address monitor");
         const auto rejected = Child(launch).communicate({}, 20s);
         check(rejected.exit_code == 1 && rejected.error.find("Network link recovery incomplete") != std::string::npos,
             "startup refuses readiness while a foreign port is still attached");
+        check(monitor_pids(path + "/bin/netbox").empty(), "startup reclaims the orphaned monitor by its helper identity");
         Fd run(open((path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         Iptables iptables; OwnedFirewall firewall(run.get(), getuid(), iptables);
         check(!released(firewall.inventory()), "firewall guards survive until links are recovered");
@@ -258,6 +278,7 @@ void actual_daemon() {
         check(ready(daemon, tap) == ip, "recovered daemon restarts network and keeps lease");
         tap = Fd();
         check(daemon.signal(SIGTERM) && daemon.communicate({}, 10s).exit_code == 128 + SIGTERM, "daemon stops Linux network on SIGTERM");
+        check(monitor_pids(path + "/bin/netbox").empty(), "daemon shutdown stops its host address monitor");
     }
     Fd run(open((path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     Iptables iptables; OwnedFirewall firewall(run.get(), getuid(), iptables);
@@ -681,6 +702,93 @@ void pd_daemon_recovery() {
     for (const char* dir : {"/run", "/cache", "/files", "/bin"}) remove_files(path + dir);
     check(unlink((path + "/fixture.apk").c_str()) == 0 && rmdir(path.c_str()) == 0, "PD daemon fixture reclaimed");
 }
+// The tagged /32 shape pbridge parks on an uplink; system ip cannot set it.
+bool fixture_tagged(const std::string& link) { return !Netbox(netbox_path).addresses(link, pbridge_offload_metric).empty(); }
+void proxy_address(const std::string& link, const char* address) {
+    NetlinkMessage<ifaddrmsg> request;
+    request.header.nlmsg_type = RTM_NEWADDR; request.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+    request.payload.ifa_family = AF_INET; request.payload.ifa_prefixlen = 32;
+    request.payload.ifa_index = if_nametoindex(link.c_str());
+    in_addr value{}; check(inet_pton(AF_INET, address, &value) == 1, "parse proxy address");
+    const uint32_t metric = pbridge_offload_metric, flags = IFA_F_NOPREFIXROUTE;
+    request.attribute(IFA_LOCAL, &value, sizeof(value)); request.attribute(IFA_ADDRESS, &value, sizeof(value));
+    request.attribute(IFA_RT_PRIORITY, &metric, sizeof(metric)); request.attribute(IFA_FLAGS, &flags, sizeof(flags));
+    netlink_exchange(request.header);
+    check(fixture_tagged(link), "tagged proxy address installed");
+}
+void host_ipv4_watch() {
+    const auto name = "eth" + random_id(false).substr(0, 6), peer = "hw" + random_id(false).substr(0, 6);
+    ip({"link", "add", name, "type", "veth", "peer", "name", peer});
+    Fixture fixture("lb-host-watch");
+    fixture.netbox.state(name, true); fixture.netbox.state(peer, true);
+    // One registered network with a forward gives the host set DNAT to scope.
+    const auto config = network_config("lbw" + random_id(false).substr(0, 8));
+    const LinuxPortForward forward{"tapguest", 0, 2, "tcp", 40000, 40000, 45679, 45679};
+    fixture.coordinator.set(config); fixture.coordinator.set_forwards(config["id"].asString(), {forward});
+    std::mutex mutex;
+    size_t applies = 0;
+    // Real time plus a skew the test advances to reach the backstop poll.
+    std::atomic<int64_t> skew{0};
+    HostIpv4Watch watch(fixture.netbox, fixture.runtime, [&](const std::vector<std::string>& hosts) {
+        fixture.coordinator.set_host_ipv4(hosts); std::lock_guard lock(mutex); ++applies;
+    }, [&] { return HostIpv4Watch::Clock::now() + std::chrono::milliseconds(skew.load()); });
+    TaskService workers;
+    auto nat = [&](const std::vector<std::string>& hosts) {
+        std::vector<OwnedFirewall::Rule> rows;
+        for (const auto& row : linux_firewall_plan(config, {}, {forward}, hosts).nat4) rows.push_back({config["id"].asString() + "/" + row.key, row.rule});
+        return rows;
+    };
+    auto settle = [&](const std::set<std::string>& want, std::chrono::milliseconds budget) {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < budget) {
+            watch.schedule(workers);
+            const auto hosts = watch.current();
+            if (std::set<std::string>(hosts.begin(), hosts.end()) == want &&
+                fixture.firewall.matches_table(LinuxFirewall::owner_key, false, "nat", nat(hosts)))
+                return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+            std::this_thread::sleep_for(50ms);
+        }
+        std::string seen; for (const auto& host : watch.current()) seen += host + " ";
+        std::lock_guard lock(mutex);
+        throw std::runtime_error("host IPv4 watch deadline; current: " + seen + "applies " + std::to_string(applies) +
+            " ready " + std::to_string(fixture.coordinator.ready()) + " nat " + wire::stringify(fixture.firewall.inventory()["rules"].size()));
+    };
+    const auto tool = netbox_path;
+    for (int i = 0; i < 60 && monitor_pids(tool).empty(); ++i) { watch.schedule(workers); std::this_thread::sleep_for(50ms); }
+    const auto first = monitor_pids(tool);
+    check(first.size() == 1 && fixture.runtime.inventory()["switches"].size() == 1, "watch runs one monitor with a helper identity");
+    settle({}, 1000ms); std::this_thread::sleep_for(500ms); // let the monitor subscribe
+    fixture.netbox.address(name, "198.18.240.1/24", true);
+    check(settle({"198.18.240.1"}, 3000ms) < 3s, "monitor event scopes DNAT well before the backstop poll");
+    // Separate subnets: deleting a primary also deletes its secondaries.
+    // Excluded by the shared policy: a non-allowlisted interface and a
+    // pbridge-tagged proxy address. The later event proves both were seen.
+    fixture.netbox.address(peer, "198.18.240.2/24", true);
+    proxy_address(name, "198.18.240.50");
+    fixture.netbox.address(name, "198.18.241.3/24", true);
+    settle({"198.18.240.1", "198.18.241.3"}, 3000ms);
+    check(watch.signal_monitor(SIGKILL), "kill host address monitor");
+    std::this_thread::sleep_for(200ms);
+    fixture.netbox.address(name, "198.18.240.1/24", false);
+    skew += 6000;
+    settle({"198.18.241.3"}, 3000ms);
+    const auto second = monitor_pids(tool);
+    check(second.size() == 1 && second != first && fixture.runtime.inventory()["switches"].size() == 1,
+        "backstop poll catches the missed change and restarts the monitor");
+    std::this_thread::sleep_for(500ms);
+    fixture.netbox.address(name, "198.18.242.4/24", true);
+    check(settle({"198.18.241.3", "198.18.242.4"}, 3000ms) < 3s, "restarted monitor streams changes again");
+    size_t before;
+    { std::lock_guard lock(mutex); before = applies; }
+    skew += 6000;
+    for (int i = 0; i < 20; ++i) { watch.schedule(workers); std::this_thread::sleep_for(50ms); }
+    { std::lock_guard lock(mutex); check(applies == before, "unchanged backstop polls do not republish the firewall"); }
+    workers.shutdown(); watch.stop();
+    check(monitor_pids(tool).empty() && fixture.runtime.inventory()["switches"].empty(), "watch stop reaps the monitor and its identity");
+    fixture.coordinator.remove(config["id"].asString());
+    fixture.finish();
+    fixture.netbox.delete_link(name);
+}
 }
 int linux_backend_pd_crash_child(const std::string& netbox, const std::string& path) {
     netbox_path = netbox;
@@ -714,6 +822,7 @@ int linux_backend_namespace_child(const std::string& netbox, const std::string& 
         {"direct_l2_uplink_datapath_and_reattach", l2_direct_uplink},
         {"actual_daemon_l2_port_recovery", [] { l2_daemon_recovery(false); }},
         {"pbridge_mac_nat_proxy_and_helper_death_cleanup", pbridge_pseudo_uplink},
-        {"actual_daemon_pbridge_recovery", [] { l2_daemon_recovery(true); }}});
+        {"actual_daemon_pbridge_recovery", [] { l2_daemon_recovery(true); }},
+        {"host_ipv4_watch_scopes_dnat_and_restarts_monitor", host_ipv4_watch}});
 }
 }
