@@ -142,7 +142,8 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
+    return (display_attach_ && command == "display_attach") ||
+        (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
@@ -152,6 +153,13 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     if (!caller.authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
     if (vms_ && vm_command(command)) return execute_vm(caller, command, request);
     if (keyboard_ && keyboard_command(command)) return execute_keyboard(caller, command, request);
+    if (display_attach_ && command == "display_attach") {
+        const auto nonce = legacy_id(request, "nonce");
+        if (nonce.empty()) { result["message"] = "missing nonce"; return result; }
+        // Broadcast failures are logged only, as NativeDisplayBinder.attach.
+        try { display_attach_(nonce); } catch (...) { result["message"] = "internal error"; return result; }
+        result["success"] = true; return result;
+    }
     try {
         if (host_command(command) && host_network_) {
             result["data"] = command == "network_list_uplinks" ? host_network_->uplinks(caller) :
@@ -480,6 +488,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : keyboard_commands) result["commands"].append(name);
                 result["keyboard_grab"] = true;
                 result["service_api_minor"] = 9;
+            }
+            if (display_attach_) {
+                result["commands"].append("display_attach");
+                result["native_display_binder"] = true;
+                result["service_api_minor"] = 10;
             }
         }
         return result;

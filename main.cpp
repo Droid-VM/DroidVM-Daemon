@@ -19,6 +19,7 @@
 #include "input/keyboard_grab.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
+#include "display_broker.h"
 #endif
 #include <fcntl.h>
 #include "vm/command_common.h"
@@ -51,6 +52,7 @@ int main(int argc, char** argv) {
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
         int write_delay_ms = 0;
 #endif
+        std::string display_package = DROIDVM_PACKAGE_NAME;
 #ifdef DROIDVM_KEYBOARD_FIXTURE
         std::string keyboard_name; // the only keyboard this test daemon may see
 #endif
@@ -68,6 +70,7 @@ int main(int argc, char** argv) {
             else if (arg == "--apk" && i + 1 < argc) apk = argv[++i];
 #ifdef DROIDVM_KEYBOARD_FIXTURE
             else if (arg == "--test-keyboard-name" && i + 1 < argc) keyboard_name = argv[++i];
+            else if (arg == "--test-display-package" && i + 1 < argc) display_package = argv[++i];
 #endif
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
             else if (arg == "--test-write-delay-ms" && i + 1 < argc) {
@@ -292,6 +295,27 @@ int main(int argc, char** argv) {
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
+#ifdef DROIDVM_PLATFORM_SERVICES
+            std::unique_ptr<droidvm::platform::DisplayBroker> display;
+            if (vms) {
+                droidvm::platform::DisplayBroker::Hooks hooks;
+                const droidvm::CallContext internal{"display-broker", true, true, true};
+                hooks.state = [&, internal](const std::string& vm) -> std::optional<std::string> {
+                    try { return std::string(droidvm::vm_state_name(vms->state(internal, vm))); } catch (const std::exception&) { return std::nullopt; }
+                };
+                hooks.write_input = [&, internal](const std::string& vm, const std::string& screen, int channel, std::string_view data) {
+                    try {
+                        auto target = vms->runtime(internal, vm);
+                        return target->state() == droidvm::VmState::running && target->write_input(screen, channel, data);
+                    } catch (const std::exception&) { return false; }
+                };
+                hooks.keyboard = keyboard.get();
+                hooks.package = display_package;
+                hooks.log = [&](const std::string& level, const std::string& text) { if (log) log->write(level.c_str(), "NativeDisplayBinder: " + text); };
+                display = std::make_unique<droidvm::platform::DisplayBroker>(std::move(hooks));
+                dispatcher.set_display_attach([&](const std::string& nonce) { display->attach(nonce); });
+            }
+#endif
             const auto result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             // Task teardown completes while both the instance lock and log are held.
             tasks.shutdown();

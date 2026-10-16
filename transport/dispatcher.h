@@ -34,6 +34,8 @@ public:
         // Server.run: VMs come up behind the socket, after the network auto-up.
         if (vms_ && !vms_swept_ && (!runtime_ || runtime_->autostart_settled())) { vms_swept_ = true; vms_->auto_up_async(); }
     }
+    // NativeDisplayBinder.attach, where the platform Binder services exist.
+    void set_display_attach(std::function<void(const std::string& nonce)> attach) { display_attach_ = std::move(attach); }
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
     TaskService& workers() { return tasks_; }
@@ -50,6 +52,7 @@ private:
     VmService* vms_;
     LegacyEvents* events_;
     input::KeyboardGrab* keyboard_;
+    std::function<void(const std::string&)> display_attach_;
     bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);
     Json::Value execute_keyboard(const CallContext& caller, const std::string& command, const Json::Value& request);

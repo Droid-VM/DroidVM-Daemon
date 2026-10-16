@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "audio_table.h"
 #include "service_manager.h"
+#include "broadcast.h"
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -37,9 +38,7 @@ void publish(int directory, const std::string& table) {
 AudioTable::~AudioTable() { stop(); }
 bool AudioTable::start(int run_directory, Log log) {
     stop();
-    auto start_pool = reinterpret_cast<void (*)()>(dlsym(RTLD_DEFAULT, "ABinderProcess_startThreadPool"));
-    if (!start_pool) return false;
-    start_pool();
+    if (!start_binder_pool()) return false;
     directory_ = fcntl(run_directory, F_DUPFD_CLOEXEC, 0);
     if (directory_ < 0) return false;
     log_ = std::move(log);
