@@ -131,6 +131,11 @@ target_compile_options(droidvmd PRIVATE -Wall -Wextra -Werror)
 
 option(DROIDVM_BUILD_SERVICE_TESTS "Build standalone service contract tests" OFF)
 if(DROIDVM_BUILD_SERVICE_TESTS)
+    add_executable(droidvm_vm_config_fixture tests/vm_config_fixture.cpp runtime/instance.cpp services/system.cpp
+        transport/dispatcher.cpp transport/requests.cpp transport/server.cpp)
+    target_include_directories(droidvm_vm_config_fixture PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_link_libraries(droidvm_vm_config_fixture PRIVATE droidvm_network_backend droidvm_runtime droidvm_input droidvm_usb droidvm_pkg)
+    target_compile_options(droidvm_vm_config_fixture PRIVATE -Wall -Wextra -Werror)
     add_executable(droidvm_vm_inventory_contract tests/vm_inventory_contract.cpp services/system.cpp transport/dispatcher.cpp)
     target_include_directories(droidvm_vm_inventory_contract PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(droidvm_vm_inventory_contract PRIVATE droidvm_network_backend droidvm_vm_config droidvm_input droidvm_usb droidvm_pkg)
