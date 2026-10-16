@@ -51,6 +51,7 @@ public:
     // delete with id. A target may occur once; replacements retain list order.
     Snapshot apply(const CallContext& caller, const std::string& expected_revision, const Json::Value& operations);
 private:
+    friend class ConfigurationService;
     config::JsonFile file_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;

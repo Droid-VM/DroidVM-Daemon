@@ -161,6 +161,7 @@ void VmService::require_legacy_writer() const {
 }
 Json::Value VmService::list(const CallContext& caller) const {
     access(caller);
+    auto admission = ConfigurationGate::enter(context_.configuration_gate);
     std::lock_guard lock(mutex_);
     Json::Value rows(Json::arrayValue);
     for (const auto& entry : entries_) {
@@ -173,7 +174,11 @@ Json::Value VmService::list(const CallContext& caller) const {
     }
     return rows;
 }
-Json::Value VmService::get(const CallContext& caller, const std::string& id) const { return runtime(caller, id)->config(); }
+Json::Value VmService::get(const CallContext& caller, const std::string& id) const {
+    access(caller);
+    auto admission = ConfigurationGate::enter(context_.configuration_gate);
+    return runtime(caller, id)->config();
+}
 bool VmService::exists(const CallContext& caller, const std::string& id) const {
     access(caller);
     std::lock_guard lock(mutex_);

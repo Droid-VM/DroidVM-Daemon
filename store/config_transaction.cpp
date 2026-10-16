@@ -10,7 +10,6 @@
 namespace droidvm::config {
 namespace {
 constexpr const char* journal = "config-transaction.json";
-constexpr std::array targets{"vms.json", "networks.json", "disks.json"};
 size_t limit(const std::string& name) {
     if (name == "vms.json") return 16u << 20;
     if (name == "networks.json" || name == "disks.json") return 8u << 20;
@@ -22,10 +21,20 @@ void require(bool ok, const char* message) {
     if (!ok) throw std::system_error(errno, std::generic_category(), message);
 }
 }
-ConfigTransaction::ConfigTransaction(int directory, uid_t owner, Observer observer)
-    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), owner_(owner), observer_(std::move(observer)) {
+ConfigTransaction::ConfigTransaction(int directory, uid_t owner, Observer observer, std::vector<std::string> targets)
+    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), owner_(owner), observer_(std::move(observer)), targets_(std::move(targets)) {
     require(directory_.get() >= 0, "duplicate transaction directory");
+    if (targets_.empty() || targets_.size() > 3) throw std::invalid_argument("Invalid owned transaction targets");
+    std::set<std::string> seen;
+    for (const auto& name : targets_) {
+        limit(name);
+        if (!seen.insert(name).second) throw std::invalid_argument("Duplicate owned transaction target");
+    }
     recover();
+}
+size_t ConfigTransaction::target_limit(const std::string& name) const {
+    for (const auto& target : targets_) if (target == name) return limit(name);
+    throw std::invalid_argument("Configuration transaction target is not owned");
 }
 void ConfigTransaction::sync() { require(fsync(directory_.get()) == 0, "sync configuration transaction"); }
 void ConfigTransaction::remove(const std::string& name) {
@@ -40,7 +49,7 @@ void ConfigTransaction::remove(const std::string& name) {
 }
 void ConfigTransaction::cleanup() {
     // Only after the decision's absence is durable may staged documents vanish.
-    for (const auto* name : targets) {
+    for (const auto& name : targets_) {
         // Reuse JsonFile's narrowly scoped abandoned temporary reclamation.
         JsonFile file(directory_.get(), staged(name), owner_, {}, limit(name), JsonSyntax::strict);
         remove(staged(name)); remove(staged(name) + ".bak"); remove(staged(name) + ".corrupt");
@@ -64,7 +73,7 @@ void ConfigTransaction::recover_unlocked() {
     pending_ = true;
     const auto& manifest = loaded->value;
     if (loaded->recovered || manifest.size() != 2 || manifest["version"] != 1
-        || !manifest["targets"].isArray() || manifest["targets"].empty() || manifest["targets"].size() > targets.size())
+        || !manifest["targets"].isArray() || manifest["targets"].empty() || manifest["targets"].size() > targets_.size())
         throw std::runtime_error("Invalid configuration transaction decision");
     std::set<std::string> names;
     std::vector<Update> updates;
@@ -72,7 +81,7 @@ void ConfigTransaction::recover_unlocked() {
     // staging backups: they could belong to an earlier, unrelated transaction.
     for (const auto& entry : manifest["targets"]) {
         if (!entry.isString()) throw std::runtime_error("Invalid transaction target");
-        auto name = entry.asString(); const auto capacity = limit(name);
+        auto name = entry.asString(); const auto capacity = target_limit(name);
         if (!names.insert(name).second) throw std::runtime_error("Duplicate transaction target");
         JsonFile file(directory_.get(), staged(name), owner_, {}, capacity, JsonSyntax::strict);
         auto value = file.load();
@@ -100,12 +109,12 @@ void ConfigTransaction::recover_unlocked() {
 void ConfigTransaction::commit(const std::vector<Update>& updates) {
     std::lock_guard lock(mutex_);
     if (pending_) throw TransactionError("Recover pending configuration transaction before writing", true);
-    if (updates.empty() || updates.size() > targets.size()) throw std::invalid_argument("Invalid transaction participant count");
+    if (updates.empty() || updates.size() > targets_.size()) throw std::invalid_argument("Invalid transaction participant count");
     Json::Value manifest;
     manifest["version"] = 1; manifest["targets"] = Json::Value(Json::arrayValue);
     std::set<std::string> names;
     for (const auto& update : updates) {
-        const auto capacity = limit(update.name);
+        const auto capacity = target_limit(update.name);
         if (!names.insert(update.name).second) throw std::invalid_argument("Duplicate transaction target");
         // All malformed/oversized documents fail before staging or target IO.
         parse_json(encode_json(update.document, capacity));

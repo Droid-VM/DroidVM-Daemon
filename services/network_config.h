@@ -58,6 +58,7 @@ public:
     bool recovered() const;
     size_t inactive() const;
 private:
+    friend class ConfigurationService;
     struct State {
         Json::Value document;
         std::map<std::string, Json::ArrayIndex> ids;

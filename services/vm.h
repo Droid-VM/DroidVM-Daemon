@@ -66,6 +66,7 @@ public:
     size_t loaded() const { return loaded_; }
     const std::string& load_error() const { return load_error_; }
 private:
+    friend class ConfigurationService;
     struct Entry { std::string id; std::shared_ptr<vm::VmRuntime> vm; Json::Value definition; };
     class ConfigUpdate;
     vm::RuntimeContext context_;

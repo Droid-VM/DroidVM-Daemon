@@ -119,6 +119,7 @@ public:
     void shutdown();
 private:
     struct Impl;
+    friend class ConfigurationService;
     std::unique_ptr<Impl> impl_;
     std::shared_ptr<ConfigurationGate> config_gate_;
 };

@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include "network_config.h"
+#include "vm_config.h"
+#include "store/config_transaction.h"
+
+namespace droidvm {
+class VmService;
+// Construct before serving, under the daemon Instance lock. Inventory must be
+// empty; inventory, events and this service must share the SAME gate. The owner
+// keeps inventory/events alive until this coordinator is destroyed.
+// Claims both legacy ownership gates and replays the journal BEFORE loading.
+class ConfigurationService {
+public:
+    ConfigurationService(int directory, uid_t owner, std::shared_ptr<ConfigurationGate> gate,
+        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer = {});
+    VmConfigService& vms() { return *vms_; }
+    NetworkConfigService& networks() { return *networks_; }
+    // Internal service primitive: target network must already be stopped and
+    // every affected VM must admit a stopped edit. No runtime stop side effects.
+    // One exact VM revision and exact network config protect the confirmation.
+    VmConfigService::Snapshot remove_network(const CallContext& caller, const std::string& vm_revision,
+        const Json::Value& expected_network);
+    // Only an administrator may retry durable redo; this does not resubmit a
+    // deletion against a newer baseline. Failure keeps the common gate closed.
+    void recover(const CallContext& caller);
+private:
+    std::shared_ptr<ConfigurationGate> gate_;
+    std::unique_ptr<config::ConfigTransaction> journal_;
+    std::unique_ptr<NetworkConfigService> networks_;
+    std::unique_ptr<VmConfigService> vms_;
+    std::shared_ptr<VmConfigSnapshot> pending_vm_;
+    std::shared_ptr<NetworkConfigService::State> pending_network_;
+    void publish_pending();
+};
+}

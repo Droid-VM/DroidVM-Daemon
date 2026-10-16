@@ -251,6 +251,31 @@ void transaction_capacity_and_aliases() {
         check(unlinkat(temp.directory.get(), alias, 0) == 0, "remove alias fixture");
     }
 }
+void transaction_owned_targets() {
+    Temporary temp;
+    JsonFile vm(temp.directory.get(), "vms.json", getuid()); vm.save(value(1));
+    JsonFile disk(temp.directory.get(), "disks.json", getuid()); disk.save(value(1));
+    {
+        ConfigTransaction restricted(temp.directory.get(), getuid(), {}, {"vms.json", "networks.json"});
+        bool refused = false;
+        try { restricted.commit({{"vms.json", value(2)}, {"disks.json", value(2)}}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "unowned participant rejected before staging");
+    }
+    {
+        ConfigTransaction interrupted(temp.directory.get(), getuid(), [](const char* stage, size_t) {
+            if (std::string_view(stage) == "decision_synced") throw std::runtime_error("interrupt before installs");
+        });
+        try { interrupted.commit({{"vms.json", value(2)}, {"disks.json", value(2)}}); }
+        catch (const TransactionError& error) { check(error.decided, "intent persisted"); }
+    }
+    bool refused = false;
+    try { ConfigTransaction restricted(temp.directory.get(), getuid(), {}, {"vms.json", "networks.json"}); }
+    catch (const TransactionError& error) { refused = error.decided; }
+    check(refused && vm.load()->value == value(1) && disk.load()->value == value(1), "recovery validates ownership before changing any target");
+    ConfigTransaction recovered(temp.directory.get(), getuid());
+    check(vm.load()->value == value(2) && disk.load()->value == value(2), "owned recovery retains staged documents after refusal");
+}
 void bounds_and_path_refusal() {
     Temporary temp;
     JsonFile file(temp.directory.get(), "networks.json", getuid());
@@ -281,5 +306,6 @@ int main() {
                 {"transaction_failure_redo_and_writer_gate", transaction_failures_and_recovery},
                 {"transaction_validation_and_missing_stage", transaction_validation_and_missing_stage},
                 {"transaction_full_capacity_and_aliases", transaction_capacity_and_aliases},
+                {"transaction_owned_targets", transaction_owned_targets},
                 {"bounded_io_symlink_hardlink_fifo", bounds_and_path_refusal}});
 }

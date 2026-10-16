@@ -40,6 +40,10 @@ public:
         // Only restore after durable recovery AND coherent domain publication.
         void require_recovery() { std::lock_guard lock(gate_->mutex_); gate_->failed_ = true; }
         void recovered() { std::lock_guard lock(gate_->mutex_); gate_->failed_ = false; }
+        void require_available() {
+            std::lock_guard lock(gate_->mutex_);
+            if (gate_->failed_) throw ServiceError(ErrorCode::unavailable, "Configuration recovery required");
+        }
     private:
         friend class ConfigurationGate;
         explicit Transaction(std::shared_ptr<ConfigurationGate> gate) : gate_(std::move(gate)) {}

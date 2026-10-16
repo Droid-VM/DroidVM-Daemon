@@ -3,6 +3,9 @@
 #include "config_gate_contract.h"
 #include "common/identity.h"
 #include "services/vm.h"
+#include "services/configuration.h"
+#include "store/network_config.h"
+#include "store/vm_ownership.h"
 #include "transport/dispatcher.h"
 #include <atomic>
 #include <dirent.h>
@@ -93,6 +96,167 @@ void configuration_gate_domains_and_recovery() {
         "gate alone never changes configuration");
     check(!runtime->start() && fixture.starts == 1, "recovered runtime reaches normal admission");
     tasks.release_snapshot(admin, old_view.id);
+}
+struct Coordinated {
+    Fd directory;
+    std::shared_ptr<ConfigurationGate> gate = std::make_shared<ConfigurationGate>();
+    TaskService tasks{{}, [] { return TaskService::Clock::now(); }, {}, gate};
+    VmService inventory;
+    ConfigurationService service;
+    static vm::RuntimeContext context(Fixture& fixture, const std::shared_ptr<ConfigurationGate>& gate) {
+        auto result = fixture.context; result.configuration_gate = gate; return result;
+    }
+    explicit Coordinated(Fixture& fixture, config::ConfigTransaction::Observer observer = {})
+        : directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)), inventory(context(fixture, gate)),
+          service(directory.get(), getuid(), gate, inventory, tasks, std::move(observer)) {}
+};
+struct DeletionInput {
+    Json::Value network;
+    VmConfigService::Snapshot baseline;
+    std::string vm_id, unrelated_id;
+};
+DeletionInput seed_deletion(Coordinated& c) {
+    auto network = config("target"); network["schema"] = 2; network["bridge_name"] = "brtest";
+    c.service.networks().create(admin, network);
+    auto other = config("other network"); other["schema"] = 2; other["bridge_name"] = "brother";
+    c.service.networks().create(admin, other);
+    auto row = config("referencing VM"), unrelated = config("unrelated VM");
+    Json::Value nic; nic["network_id"] = network["id"]; nic["opaque"] = "retain elsewhere";
+    row["networks"] = Json::Value(Json::arrayValue); row["networks"].append(nic);
+    nic["network_id"] = other["id"]; row["networks"].append(nic);
+    row["opaque"] = "VM extension";
+    auto document = c.service.vms().snapshot(admin)->document;
+    document["root_extension"] = "preserve";
+    document["vms"].append(row); document["vms"].append(unrelated);
+    auto saved = c.service.vms().replace(admin, c.service.vms().snapshot(admin)->revision, document);
+    return {network, saved, row["id"].asString(), unrelated["id"].asString()};
+}
+void coordinated_network_delete() {
+    Fixture fixture;
+    Coordinated c(fixture);
+    auto input = seed_deletion(c);
+    auto old = c.inventory.runtime(admin, input.vm_id);
+    auto unchanged = c.inventory.runtime(admin, input.unrelated_id);
+    auto view = c.tasks.vm_config_snapshot(admin);
+    const auto result = c.service.remove_network(admin, input.baseline->revision, input.network);
+    check(result->revision != input.baseline->revision && result->persisted && !result->durability_uncertain,
+        "deletion returns a new durable VM revision");
+    check(result->document["root_extension"] == "preserve" && result->document["vms"][0]["opaque"] == "VM extension"
+        && result->document["vms"][0]["networks"].size() == 1
+        && result->document["vms"][0]["networks"][0]["opaque"] == "retain elsewhere", "only target NICs removed");
+    check(!c.service.networks().exists(admin, input.network["id"].asString()) && c.service.networks().list(admin).size() == 1,
+        "network list changed in same transaction");
+    check(c.inventory.runtime(admin, input.vm_id) != old && c.inventory.runtime(admin, input.unrelated_id) == unchanged,
+        "affected runtime replaced and unrelated runtime retained");
+    check(!old->start() && fixture.starts == 0, "pre-transaction runtime cannot start after deletion");
+    check(c.tasks.snapshot_page(admin, view.id, 0).id == view.id, "old fixed view survives coherent replacement");
+    c.tasks.release_snapshot(admin, view.id);
+    check(config::JsonFile(c.directory.get(), "vms.json", getuid(), {}, VmConfigService::max_bytes).load()->value == result->document,
+        "VM file matches published revision");
+    check(config::JsonFile(c.directory.get(), "networks.json", getuid()).load()->value["networks"].size() == 1,
+        "network file matches published removal");
+    error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, input.network); });
+    error(ErrorCode::not_found, [&] { c.service.remove_network(admin, result->revision, input.network); });
+}
+void coordinated_delete_rejections() {
+    Fixture fixture;
+    Coordinated c(fixture);
+    auto input = seed_deletion(c);
+    error(ErrorCode::unauthenticated, [&] { c.service.remove_network({}, input.baseline->revision, input.network); });
+    error(ErrorCode::permission_denied, [&] { c.service.remove_network(owner, input.baseline->revision, input.network); });
+    auto stale = input.network; stale["name"] = "stale";
+    error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, stale); });
+    {
+        auto runtime = c.inventory.runtime(admin, input.vm_id);
+        auto lease = runtime->try_edit(); check(bool(lease), "reserve affected VM");
+        error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, input.network); });
+    }
+    check(c.service.vms().snapshot(admin)->revision == input.baseline->revision
+        && c.service.networks().get(admin, input.network["id"].asString()) == input.network, "rejections preserve both stores");
+    {
+        auto lease = c.service.networks().prepare_runtime(admin, input.network["id"].asString());
+        auto current = c.service.networks().get(admin, input.network["id"].asString());
+        error(ErrorCode::conflict, [&] { c.service.remove_network(admin, input.baseline->revision, current); });
+    }
+    check(c.service.vms().snapshot(admin)->revision == input.baseline->revision, "busy network does not remove VM references");
+}
+void coordinated_delete_failure_recovery() {
+    for (const char* boundary : {"before_decision", "participant_synced", "decision_removed"}) {
+        Fixture fixture;
+        bool fail = true;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail && std::string_view(stage) == boundary) throw std::runtime_error("injected coordinated commit failure");
+        });
+        auto input = seed_deletion(c);
+        auto old = c.inventory.runtime(admin, input.vm_id);
+        const bool decided = std::string_view(boundary) != "before_decision";
+        error(decided ? ErrorCode::commit_uncertain : ErrorCode::io_error,
+            [&] { c.service.remove_network(admin, input.baseline->revision, input.network); });
+        if (decided) {
+            error(ErrorCode::unavailable, [&] { c.service.vms().snapshot(admin); });
+            error(ErrorCode::unavailable, [&] { c.service.networks().list(admin); });
+            error(ErrorCode::unavailable, [&] { c.inventory.list(admin); });
+            error(ErrorCode::unavailable, [&] { c.tasks.network_config_document(admin); });
+            error(ErrorCode::unavailable, [&] { c.service.remove_network(admin, input.baseline->revision, input.network); });
+            check(!old->start() && fixture.starts == 0, "uncertain deletion prevents old runtime admission");
+            if (std::string_view(boundary) == "participant_synced")
+                error(ErrorCode::unavailable, [&] { c.service.recover(admin); });
+        } else check(c.service.vms().snapshot(admin)->revision == input.baseline->revision
+            && c.service.networks().get(admin, input.network["id"].asString()) == input.network, "pre-decision IO failure preserves state");
+        fail = false;
+        c.service.recover(admin);
+        auto current = c.service.vms().snapshot(admin);
+        check(current->document["vms"][0]["networks"].size() == (decided ? 1u : 2u), "recovery publishes correct complete generation");
+        check(c.service.networks().exists(admin, input.network["id"].asString()) != decided,
+            "recovery keeps network and NIC outcomes consistent");
+        if (decided) check(!current->durability_uncertain, "recovered transaction is durable");
+    }
+}
+void coordinated_constructor_and_delete_race() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto gate = std::make_shared<ConfigurationGate>();
+    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    {
+        VmService wrong(fixture.context);
+        bool refused = false;
+        try { ConfigurationService service(directory.get(), getuid(), gate, wrong, tasks); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(refused && faccessat(directory.get(), "vms.config-owner", F_OK, 0) != 0,
+            "mismatched gate rejected before ownership or IO");
+    }
+    Coordinated c(fixture);
+    auto input = seed_deletion(c);
+    std::atomic<int> committed{0}, conflicts{0}, failures{0};
+    std::vector<std::thread> writers;
+    for (int i = 0; i < 12; ++i) writers.emplace_back([&] {
+        try { c.service.remove_network(admin, input.baseline->revision, input.network); ++committed; }
+        catch (const ServiceError& error) { if (error.code() == ErrorCode::conflict) ++conflicts; else ++failures; }
+        catch (...) { ++failures; }
+    });
+    for (auto& writer : writers) writer.join();
+    check(committed == 1 && conflicts == 11 && failures == 0, "one conditional delete wins, no rebasing competing callers");
+    check(c.service.vms().snapshot(admin)->document["vms"][0]["networks"].size() == 1
+        && !c.service.networks().exists(admin, input.network["id"].asString()), "concurrent deletion preserves cross-store result");
+}
+void coordinated_delete_restart() {
+    Fixture fixture;
+    std::string id, old_revision;
+    {
+        Coordinated c(fixture, [](const char* stage, size_t) {
+            if (std::string_view(stage) == "participant_synced") throw std::runtime_error("interrupted between files");
+        });
+        auto input = seed_deletion(c); id = input.network["id"].asString(); old_revision = input.baseline->revision;
+        error(ErrorCode::commit_uncertain, [&] { c.service.remove_network(admin, old_revision, input.network); });
+    }
+    Coordinated reopened(fixture);
+    const auto current = reopened.service.vms().snapshot(admin);
+    check(current->revision != old_revision && current->document["vms"][0]["networks"].size() == 1
+        && !reopened.service.networks().exists(admin, id), "startup redo precedes both service loads");
+    bool vm_refused = false, network_refused = false;
+    try { config::require_legacy_vm_config(reopened.directory.get(), getuid()); } catch (...) { vm_refused = true; }
+    try { config::require_legacy_network_config(reopened.directory.get(), getuid()); } catch (...) { network_refused = true; }
+    check(vm_refused && network_refused, "both persistent ownership gates precede transaction recovery");
 }
 void replacement_and_failure() {
     Fixture fixture;
@@ -604,6 +768,11 @@ int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
+        {"coordinated_network_delete", coordinated_network_delete},
+        {"coordinated_delete_rejections", coordinated_delete_rejections},
+        {"coordinated_delete_failure_recovery", coordinated_delete_failure_recovery},
+        {"coordinated_delete_restart", coordinated_delete_restart},
+        {"coordinated_gate_validation_delete_race", coordinated_constructor_and_delete_race},
         {"network_removal_atomic_inventory", network_removal_is_atomic},
         {"conditional_network_config_adapter", conditional_network_adapter},
         {"sixteen_network_removal_start_races", network_removal_races},

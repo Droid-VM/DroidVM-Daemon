@@ -21,18 +21,21 @@ class ConfigTransaction {
 public:
     struct Update { std::string name; Json::Value document; };
     using Observer = std::function<void(const char* stage, size_t participant)>;
-    explicit ConfigTransaction(int directory, uid_t owner, Observer observer = {});
+    explicit ConfigTransaction(int directory, uid_t owner, Observer observer = {},
+        std::vector<std::string> targets = {"vms.json", "networks.json", "disks.json"});
     void commit(const std::vector<Update>& updates);
     void recover();
 private:
     Fd directory_;
     uid_t owner_;
     Observer observer_;
+    std::vector<std::string> targets_;
     std::mutex mutex_;
     bool pending_ = false;
     void recover_unlocked();
     void cleanup();
     void sync();
+    size_t target_limit(const std::string& name) const;
     void remove(const std::string& name);
     void point(const char* stage, size_t participant = 0) { if (observer_) observer_(stage, participant); }
 };
