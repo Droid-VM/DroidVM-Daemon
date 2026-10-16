@@ -19,6 +19,7 @@ struct NetworkService::Slot {
     std::mutex operation, observation;
     NetworkView view;
     std::unique_ptr<NetworkRuntimeLease> lease;
+    std::unique_ptr<network::Forwarding::Lease> forwarding;
     std::unique_ptr<network::Backend> backend;
     Clock::time_point next_recovery{};
     Clock::time_point next_refresh{};
@@ -54,7 +55,7 @@ Json::Value NetworkService::tool_log(const CallContext& caller, const std::strin
 }
 void NetworkService::cleanup(Slot& slot) {
     if (slot.backend) slot.backend->stop();
-    slot.backend.reset(); slot.lease.reset();
+    slot.backend.reset(); slot.forwarding.reset(); slot.lease.reset();
 }
 NetworkView NetworkService::start(const CallContext& caller, const std::string& id) {
     return start_impl(caller, id, false);
@@ -77,6 +78,8 @@ NetworkView NetworkService::start_impl(const CallContext& caller, const std::str
         target->backend = factory_(target->lease->config());
         if (!target->backend) throw std::runtime_error("Network backend unavailable");
         target->backend->start(target->lease->config());
+        if (!target->backend->healthy()) throw std::runtime_error("Network backend is not ready");
+        target->forwarding = forwarding_.acquire(target->lease->config());
         if (!target->backend->healthy()) throw std::runtime_error("Network backend is not ready");
         target->next_recovery = {};
         target->next_refresh = now_() + std::chrono::seconds(5);
@@ -113,6 +116,7 @@ NetworkView NetworkService::reconcile(const CallContext& caller, const std::stri
     if (target->backend->healthy()) {
         if (now_() < target->next_refresh) return view(*target);
         try {
+            if (target->forwarding) forwarding_.refresh();
             target->backend->refresh();
             if (!target->backend->healthy()) throw std::runtime_error("Network backend became unavailable during refresh");
             const auto previous = view(*target);
@@ -138,15 +142,18 @@ NetworkView NetworkService::reconcile(const CallContext& caller, const std::stri
     try {
         target->backend->recover(target->lease->config());
         if (!target->backend->healthy()) throw std::runtime_error("Recovered network is not ready");
-        target->next_refresh = now_() + std::chrono::seconds(5);
+        if (target->forwarding) forwarding_.refresh();
+        if (!target->backend->healthy()) throw std::runtime_error("Recovered network is not ready");
         state(*target, NetworkState::running, true);
     } catch (const std::exception& error) { state(*target, NetworkState::failed, true, error.what()); }
+    target->next_refresh = now_() + std::chrono::seconds(5);
     target->next_recovery = now_() + std::chrono::seconds(5);
     return view(*target);
 }
 Json::Value NetworkService::shutdown() {
     std::vector<std::shared_ptr<Slot>> targets;
     { std::lock_guard lock(mutex_); shutting_down_ = true; for (const auto& [id, target] : slots_) targets.push_back(target); }
+    forwarding_.shutdown();
     Json::Value failures(Json::arrayValue);
     for (auto& target : targets) {
         std::lock_guard operation(target->operation);

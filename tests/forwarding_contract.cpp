@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "forwarding_contract.h"
+#include "contracts.h"
+#include "network/forwarding.h"
+#include "network/netbox.h"
+#include "network/netlink.h"
+#include "services/network.h"
+#include "common/identity.h"
+#include <algorithm>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <linux/neighbour.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+
+namespace droidvm::test {
+namespace {
+using namespace droidvm::network;
+std::string executable, directory;
+const char* forwarding_path(bool ipv6) { return ipv6 ? "/proc/sys/net/ipv6/conf/all/forwarding" : "/proc/sys/net/ipv4/ip_forward"; }
+int read_forwarding(bool ipv6) {
+    Fd file(open(forwarding_path(ipv6), O_RDONLY | O_CLOEXEC));
+    char value[4]{};
+    check(file.get() >= 0 && read(file.get(), value, sizeof(value)) == 2 && (value[0] == '0' || value[0] == '1'), "read real namespace sysctl");
+    return value[0] - '0';
+}
+void set_forwarding(int value) {
+    for (const bool ipv6 : {false, true}) {
+        Fd file(open(forwarding_path(ipv6), O_WRONLY | O_CLOEXEC));
+        if (file.get() < 0) throw std::system_error(errno, std::generic_category(), "open test forwarding reset");
+        const auto count = write(file.get(), value ? "1" : "0", 1);
+        if (count != 1) throw std::system_error(count < 0 ? errno : EIO, std::generic_category(),
+            std::string("write test forwarding reset ") + forwarding_path(ipv6) + " count=" + std::to_string(count));
+    }
+}
+void flags(int expected) { check(read_forwarding(false) == expected && read_forwarding(true) == expected, "dual-stack forwarding state"); }
+Json::Value configuration(const std::string& name) {
+    auto value = wire::parse(R"({"schema":2,"bridge_name":"test","bridge_type":"linux","uplink_mode":"l3","l3":{"vlans":[]}})");
+    value["id"] = random_id(true); value["name"] = name;
+    return value;
+}
+void demand_lifecycle() {
+    set_forwarding(0);
+    int writes = 0;
+    Forwarding forwarding([&](const char* stage) { if (std::string_view(stage).ends_with("_written")) ++writes; });
+    forwarding.refresh(); flags(0);
+    auto network = configuration("forward");
+    auto gvisor = network; gvisor["bridge_type"] = "gvisor";
+    check(!forwarding.acquire(gvisor), "gvisor needs no host forwarding");
+    auto l2 = network; l2["uplink_mode"] = "l2"; l2["l2"]["uplink"] = "Ethernet";
+    check(!forwarding.acquire(l2), "L2 needs no host forwarding"); flags(0);
+    auto first = forwarding.acquire(network); flags(1); check(writes == 2, "first demand enables both families");
+    error(ErrorCode::conflict, [&] { forwarding.acquire(network); });
+    auto second = forwarding.acquire(configuration("second"));
+    forwarding.refresh(); check(writes == 2, "correct sysctl is not rewritten");
+    first.reset(); set_forwarding(0); forwarding.refresh(); flags(1);
+    second.reset(); flags(1); // shared value is never restored over netd
+    set_forwarding(0); forwarding.refresh(); flags(0);
+    first = forwarding.acquire(network); flags(1);
+    forwarding.shutdown(); set_forwarding(0); forwarding.refresh(); flags(0);
+    error(ErrorCode::unavailable, [&] { forwarding.acquire(network); });
+    first.reset(); flags(0);
+    std::unique_ptr<Forwarding::Lease> retained;
+    { Forwarding owner; retained = owner.acquire(network); }
+    set_forwarding(0); retained.reset(); flags(0); // lease may outlive owner
+}
+void partial_failure_retry() {
+    set_forwarding(0);
+    std::string fail = "before_ipv6_write";
+    Forwarding forwarding([&](const char* stage) { if (fail == stage) throw std::runtime_error("injected sysctl failure"); });
+    const auto network = configuration("retry");
+    error(ErrorCode::io_error, [&] { forwarding.acquire(network); });
+    check(read_forwarding(false) == 1 && read_forwarding(true) == 0, "partial enable not reported as readiness or rolled back");
+    set_forwarding(0); forwarding.refresh(); flags(0); // failed acquire left no demand
+    fail.clear(); auto lease = forwarding.acquire(network); flags(1);
+    set_forwarding(0); fail = "before_ipv4_write";
+    error(ErrorCode::io_error, [&] { forwarding.refresh(); });
+    check(read_forwarding(false) == 0 && read_forwarding(true) == 1, "independent family attempted despite first failure");
+    fail.clear(); forwarding.refresh(); flags(1); // refresh failure retained demand
+    lease.reset(); set_forwarding(0); forwarding.refresh(); flags(0);
+}
+uint16_t checksum(const uint8_t* data, size_t size, uint32_t sum = 0) {
+    for (size_t i = 0; i < size; i += 2) sum += (uint32_t(data[i]) << 8) | (i + 1 < size ? data[i + 1] : 0);
+    while (sum >> 16) sum = (sum & 65535) + (sum >> 16);
+    return static_cast<uint16_t>(~sum);
+}
+struct Path {
+    Netbox netbox{executable};
+    Fd input{open_transient_tap("fwin")}, output{open_transient_tap("fwout")};
+    std::array<uint8_t, 6> router{};
+    Path() {
+        check(fcntl(input.get(), F_SETFL, O_NONBLOCK) == 0 && fcntl(output.get(), F_SETFL, O_NONBLOCK) == 0, "nonblocking test TAPs");
+        int header_size = 10;
+        check(ioctl(input.get(), TUNSETVNETHDRSZ, &header_size) == 0 && ioctl(output.get(), TUNSETVNETHDRSZ, &header_size) == 0,
+            "set existing TAP adapter's virtio header size");
+        for (const auto* name : {"fwin", "fwout"}) netbox.state(name, true);
+        netbox.address("fwin", "198.18.201.1/24", true); netbox.address("fwout", "198.18.202.1/24", true);
+        netbox.address("fwin", "fd91:fe21:201::1/64", true); netbox.address("fwout", "fd91:fe21:202::1/64", true);
+        Fd socket(::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+        ifreq request{}; std::copy_n("fwin", 5, request.ifr_name);
+        check(socket.get() >= 0 && ioctl(socket.get(), SIOCGIFHWADDR, &request) == 0, "read ingress TAP MAC");
+        std::copy_n(reinterpret_cast<uint8_t*>(request.ifr_hwaddr.sa_data), 6, router.begin());
+        for (const bool ipv6 : {false, true}) {
+            NetlinkMessage<ndmsg> message;
+            message.header.nlmsg_type = RTM_NEWNEIGH; message.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+            message.payload.ndm_family = ipv6 ? AF_INET6 : AF_INET;
+            message.payload.ndm_ifindex = if_nametoindex("fwout"); message.payload.ndm_state = NUD_PERMANENT;
+            std::array<uint8_t, 16> address{};
+            check(inet_pton(message.payload.ndm_family, ipv6 ? "fd91:fe21:202::2" : "198.18.202.2", address.data()) == 1, "parse peer IP");
+            const uint8_t mac[]{2, 0, 0, 0, 0, 2};
+            message.attribute(NDA_DST, address.data(), ipv6 ? 16 : 4); message.attribute(NDA_LLADDR, mac, sizeof(mac));
+            netlink_exchange(message.header);
+        }
+    }
+    bool packet(bool ipv6, uint8_t sequence) {
+        const size_t ip_size = ipv6 ? 40 : 20, udp = 14 + ip_size;
+        std::vector<uint8_t> packet(udp + 12, 0);
+        auto word = [&](size_t at, uint16_t value) { packet[at] = value >> 8; packet[at + 1] = value & 255; };
+        std::copy(router.begin(), router.end(), packet.begin()); packet[6] = 2; packet[11] = 1;
+        word(12, ipv6 ? 0x86dd : 0x0800);
+        if (ipv6) {
+            packet[14] = 0x60; word(18, 12); packet[20] = 17; packet[21] = 64;
+            check(inet_pton(AF_INET6, "fd91:fe21:201::2", packet.data() + 22) == 1 &&
+                inet_pton(AF_INET6, "fd91:fe21:202::2", packet.data() + 38) == 1, "encode IPv6 packet");
+        } else {
+            packet[14] = 0x45; word(16, ip_size + 12); packet[22] = 64; packet[23] = 17;
+            check(inet_pton(AF_INET, "198.18.201.2", packet.data() + 26) == 1 &&
+                inet_pton(AF_INET, "198.18.202.2", packet.data() + 30) == 1, "encode IPv4 packet");
+            word(24, checksum(packet.data() + 14, ip_size));
+        }
+        word(udp, 45678); word(udp + 2, 45679); word(udp + 4, 12);
+        packet[udp + 8] = 'D'; packet[udp + 9] = 'V'; packet[udp + 10] = 'M'; packet[udp + 11] = sequence;
+        if (ipv6) {
+            const uint32_t pseudo = static_cast<uint16_t>(~checksum(packet.data() + 22, 32));
+            const auto value = checksum(packet.data() + udp, 12, pseudo + 12 + 17);
+            word(udp + 6, value ? value : 65535);
+        }
+        std::vector<uint8_t> frame(10, 0); // no checksum/GSO offload requested
+        frame.insert(frame.end(), packet.begin(), packet.end());
+        check(write(input.get(), frame.data(), frame.size()) == static_cast<ssize_t>(frame.size()), "inject real guest UDP packet");
+        const auto deadline = std::chrono::steady_clock::now() + 300ms;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pollfd readable{output.get(), POLLIN, 0};
+            if (poll(&readable, 1, 20) <= 0) continue;
+            uint8_t buffer[2048]; const auto count = read(output.get(), buffer, sizeof(buffer));
+            const auto* bytes = buffer + 10;
+            if (count != static_cast<ssize_t>(frame.size()) || bytes[12] != packet[12] || bytes[13] != packet[13] ||
+                !std::equal(packet.begin() + udp, packet.end(), bytes + udp)) continue;
+            check(bytes[ipv6 ? 21 : 22] == 63, "kernel routed packet and decremented hop count");
+            return true;
+        }
+        return false;
+    }
+};
+void real_dual_stack_packets() {
+    set_forwarding(0);
+    Path path;
+    check(!path.packet(false, 1) && !path.packet(true, 2), "disabled forwarding drops transit packets");
+    Forwarding forwarding;
+    auto lease = forwarding.acquire(configuration("packets"));
+    check(path.packet(false, 3) && path.packet(true, 4), "enabling forwarding delivers real IPv4 and IPv6 guest packets");
+    set_forwarding(0);
+    check(!path.packet(false, 5) && !path.packet(true, 6), "simulated netd reset interrupts both data paths");
+    forwarding.refresh();
+    check(path.packet(false, 7) && path.packet(true, 8), "watcher refresh restores real dual-stack packet forwarding");
+    lease.reset(); set_forwarding(0); forwarding.refresh();
+    check(!path.packet(false, 9) && !path.packet(true, 10), "no demand does not reenable either data path");
+}
+void service_lifecycle() {
+    set_forwarding(0);
+    Fd files(open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    NetworkConfigService configs(files.get(), getuid());
+    const auto first = configs.create(admin, configuration("service-first"));
+    const auto second = configs.create(admin, configuration("service-second"));
+    struct Candidate final : Backend {
+        bool live = false, fail_stop = false;
+        void start(const Json::Value&) override { flags(0); live = true; }
+        bool healthy() const override { return live; }
+        void recover(const Json::Value&) override { live = true; }
+        void refresh() override { flags(1); }
+        void stop() override { if (fail_stop) throw std::runtime_error("cleanup retained"); live = false; }
+    };
+    std::map<std::string, Candidate*> backends;
+    auto now = NetworkService::Clock::now();
+    NetworkService service(configs, [&](const Json::Value& network) {
+        auto backend = std::make_unique<Candidate>(); backends[network["id"].asString()] = backend.get(); return backend;
+    }, [&] { return now; });
+    check(service.start(admin, first).state == NetworkState::running, "Linux candidate reaches RUNNING after forwarding"); flags(1);
+    set_forwarding(0); now += 5s;
+    check(service.reconcile(admin, first).state == NetworkState::running, "periodic service tick reasserts before backend refresh"); flags(1);
+    set_forwarding(0); service.start(admin, second); flags(1);
+    service.stop(admin, first); set_forwarding(0); now += 5s;
+    service.reconcile(admin, second); flags(1);
+    backends.at(second)->live = false; set_forwarding(0); now += 5s;
+    check(service.reconcile(admin, second).state == NetworkState::running, "backend recovery reasserts forwarding before readiness"); flags(1);
+    backends.at(second)->fail_stop = true;
+    error(ErrorCode::io_error, [&] { service.stop(admin, second); });
+    set_forwarding(0); now += 5s;
+    check(service.reconcile(admin, second).state == NetworkState::failed, "failed explicit stop is not refreshed"); flags(0);
+    backends.at(second)->fail_stop = false; service.stop(admin, second);
+    service.start(admin, first); flags(1);
+    check(service.shutdown().empty(), "service releases forwarding demand on shutdown"); flags(1);
+    set_forwarding(0); service.reconcile(admin, first); flags(0);
+    for (const char* file : {"networks.json", "networks.json.bak"}) unlinkat(files.get(), file, 0);
+}
+}
+void forwarding_namespace_contract(const std::string& netbox, const std::string& work) {
+    const auto path = work + "/forwarding";
+    check(mkdir(path.c_str(), 0700) == 0, "create isolated forwarding fixture");
+    const auto v4 = read_forwarding(false), v6 = read_forwarding(true);
+    ChildOptions options; options.argv = {"/proc/self/exe", "--forwarding-namespace", netbox, path};
+    const auto result = Child(options).communicate({}, 30s);
+    std::cerr << "isolated forwarding contracts: " << result.output << result.error << std::endl;
+    check(!result.timed_out && result.exit_code == 0 && wire::parse(result.output)["passed"] == true, "isolated forwarding contracts pass");
+    check(read_forwarding(false) == v4 && read_forwarding(true) == v6, "host forwarding sysctls unchanged");
+    check(rmdir(path.c_str()) == 0, "forwarding fixture empty");
+}
+int forwarding_namespace_child(const std::string& netbox, const std::string& work) {
+    struct stat before{}, after{};
+    if (stat("/proc/self/ns/net", &before) != 0 || unshare(CLONE_NEWNET) != 0 ||
+        stat("/proc/self/ns/net", &after) != 0 || before.st_ino == after.st_ino) return 70;
+    executable = netbox; directory = work;
+    return run({{"forwarding_demand_and_late_release", demand_lifecycle}, {"partial_failure_and_retry", partial_failure_retry},
+        {"real_ipv4_ipv6_transit_and_reset", real_dual_stack_packets}, {"network_service_forwarding_lifecycle", service_lifecycle}});
+}
+}

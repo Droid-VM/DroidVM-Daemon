@@ -2,6 +2,7 @@
 #pragma once
 #include "network_config.h"
 #include "network/backend.h"
+#include "network/forwarding.h"
 #include <chrono>
 #include <functional>
 #include <deque>
@@ -44,6 +45,7 @@ private:
     NetworkConfigService& configs_;
     Factory factory_;
     Now now_;
+    network::Forwarding forwarding_;
     std::mutex mutex_;
     std::map<std::string, std::shared_ptr<Slot>> slots_;
     bool shutting_down_ = false;

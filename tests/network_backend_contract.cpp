@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contracts.h"
+#include "forwarding_contract.h"
 #include "network/links.h"
 #include "network/linux_topology.h"
 #include "network/policy_rules.h"
@@ -29,6 +30,7 @@ using namespace droidvm::network;
 using namespace droidvm::test;
 namespace {
 std::string executable, work, daemon_executable;
+void forwarding_contract() { forwarding_namespace_contract(executable, work); }
 struct Case {
     std::string name = "dt" + random_id(false).substr(0, 8);
     std::string path = work + "/" + name;
@@ -1111,6 +1113,7 @@ int fake(int argc, char** argv) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--forwarding-namespace") return forwarding_namespace_child(argv[2], argv[3]);
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
     if (argc == 5 && std::string_view(argv[1]) == "--routes-only") {
         executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
@@ -1197,6 +1200,7 @@ int main(int argc, char** argv) {
     executable = argv[1]; work = argv[2]; daemon_executable = argv[3];
     return run({{"bounded_tool_errors_and_literal_argv", adapter_failures}, {"real_bridge_vlan_tap_addresses", real_datapath},
         {"host_address_filtering", host_address_filtering}, {"uplink_snapshot_policy", uplink_snapshot_policy}, {"real_host_discovery", real_host_discovery},
+        {"isolated_forwarding_and_real_dual_stack_packets", forwarding_contract},
         {"routing_table_policy", routing_table_policy}, {"real_dual_stack_policy_chains", real_policy_chains},
         {"ownership_cookie_preserves_kernel_routing", ownership_cookie_routing},
         {"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
