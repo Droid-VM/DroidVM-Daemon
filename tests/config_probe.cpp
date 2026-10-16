@@ -8,6 +8,7 @@
 #include "network/helper_config.h"
 #include "vm/crosvm_command.h"
 #include "vm/host_facts.h"
+#include "vm/qemu_command.h"
 #include <sys/stat.h>
 #include <fstream>
 #include <iostream>
@@ -21,6 +22,17 @@ std::optional<std::string> text(const Json::Value& value, const char* key) {
 void set(const Json::Value& value, const char* key, bool& out) { if (value.isObject() && value[key].isBool()) out = value[key].asBool(); }
 void set(const Json::Value& value, const char* key, std::string& out) { if (auto v = text(value, key)) out = *v; }
 template <typename T> void set(const Json::Value& value, const char* key, T& out) { if (value.isObject() && value[key].isIntegral()) out = static_cast<T>(value[key].asInt64()); }
+std::map<std::string, droidvm::vm::VncRun> vnc_run(const Json::Value& value) {
+    std::map<std::string, droidvm::vm::VncRun> out;
+    if (value.isObject() && value["vnc"].isObject()) for (const auto& id : value["vnc"].getMemberNames()) {
+        const auto& row = value["vnc"][id];
+        auto& vnc = out[id];
+        vnc.host = text(row, "host");
+        vnc.password = text(row, "password");
+        if (row.isObject() && row["port"].isIntegral()) vnc.port = row["port"].asInt64();
+    }
+    return out;
+}
 droidvm::vm::CrosvmRun crosvm_run(const Json::Value& value) {
     droidvm::vm::CrosvmRun run;
     run.control_socket_path = text(value, "control_socket_path");
@@ -32,13 +44,7 @@ droidvm::vm::CrosvmRun crosvm_run(const Json::Value& value) {
         serial.acm_dev_path = text(row, "acm_dev_path");
         run.serials.push_back(std::move(serial));
     }
-    if (value.isObject() && value["vnc"].isObject()) for (const auto& id : value["vnc"].getMemberNames()) {
-        const auto& row = value["vnc"][id];
-        auto& vnc = run.vnc[id];
-        vnc.host = text(row, "host");
-        vnc.password = text(row, "password");
-        if (row.isObject() && row["port"].isIntegral()) vnc.port = row["port"].asInt64();
-    }
+    run.vnc = vnc_run(value);
     return run;
 }
 droidvm::vm::BootPlan crosvm_boot(const Json::Value& value) {
@@ -124,7 +130,7 @@ int main(int argc, char** argv) {
                     row["status"] = "ok";
                     report.append(row); continue;
                 }
-                if (test["op"].asString() == "crosvm") {
+                if (test["op"].asString() == "crosvm" || test["op"].asString() == "qemu") {
                     const auto boot = crosvm_boot(test["boot"]);
                     auto host = crosvm_host(test["host"]);
                     if (test["host"] == "probe") {
@@ -136,7 +142,25 @@ int main(int argc, char** argv) {
                             droidvm::config::boolean(test["app_config"], "optimize_sdcard", true),
                             boot.vars.empty() ? droidvm::vm::edk2_vars() : boot.vars});
                     }
-                    auto launch = droidvm::vm::crosvm_command(droidvm::config::migrate_vm(value), crosvm_run(test["run"]), boot, host);
+                    const auto config = droidvm::config::migrate_vm(value);
+                    droidvm::vm::CrosvmLaunch launch;
+                    if (test["op"].asString() == "crosvm") launch = droidvm::vm::crosvm_command(config, crosvm_run(test["run"]), boot, host);
+                    else {
+                        auto run = test["run"] == "start" ? droidvm::vm::qemu_sockets(config, host) : droidvm::vm::QemuRun{};
+                        if (test["run"].isObject()) {
+                            run.qmp_socket_path = ::text(test["run"], "qmp_socket_path");
+                            run.uart_socket_path = ::text(test["run"], "uart_socket_path");
+                            run.agent_socket_path = ::text(test["run"], "agent_socket_path");
+                            run.vnc = vnc_run(test["run"]);
+                        }
+                        run.file_length = [](const std::string& path) -> int64_t {
+                            struct stat info{};
+                            return stat(path.c_str(), &info) == 0 ? info.st_size : 0;
+                        };
+                        auto qemu = droidvm::vm::qemu_command(config, run, boot, host);
+                        launch.argv = std::move(qemu.argv);
+                        launch.env = std::move(qemu.env);
+                    }
                     // Only prepare_process fixtures run the legacy LD_* setup (it also drops caches).
                     if (!test["prepare_process"].asBool())
                         if (launch.env.size() >= 2 && launch.env[0].first == "LD_PRELOAD" && launch.env[1].first == "LD_LIBRARY_PATH")

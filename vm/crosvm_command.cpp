@@ -2,11 +2,7 @@
 // Port of daemon/vm/backend/CrosvmBackendInstance.buildCommand and the
 // launch environment. DataItem semantics as in store/vm_config.cpp.
 #include "crosvm_command.h"
-#include "store/network_config.h"
-#include "store/vm_config.h"
-#include "build_metadata.h"
-#include <unicode/utf8.h>
-#include <unicode/utf16.h>
+#include "command_common.h"
 #include <algorithm>
 #include <bit>
 #include <climits>
@@ -15,57 +11,20 @@
 
 namespace droidvm::vm {
 namespace {
-using config::boolean;
-using config::integer;
-using config::java_enum;
-using config::member;
-using config::string;
-using Names = std::vector<const char*>;
-const Names hypervisors{"AUTO", "SOFT", "KVM", "GUNYAH", "GENIEZONE"};
-const Names protections{"PROTECTED_NORMAL", "PROTECTED_PROTECTED", "PROTECTED_WITHOUT_FIRMWARE", "PSEUDO_UNPROTECTED"};
-const Names gpu_backends{"NONE", "GPU_2D", "GPU_GFXSTREAM", "GPU_VIRGLRENDERER"};
+using namespace command;
 const Names gpu_apis{"NONE", "VULKAN", "EGL", "OPENGLES", "ANGLE", "VULKAN_SYSTEM", "VULKAN_TURNIP", "VULKAN_PANVK", "DRM2KGSL"};
 const Names gpu_modes{"NONE", "OPENGL", "VULKAN", "NATIVE"};
-const Names exporters{"NATIVE", "VNC", "NONE"};
 const Names blit_providers{"TURNIP", "PANVK", "SYSTEM", "OFF"};
 const Names lend_modes{"DISABLED", "SINGLE", "CHUNKED"};
-const Names disk_buses{"VIRTIO", "SCSI", "PMEM", "PFLASH", "CDROM"};
-const Names dir_caches{"NEVER", "AUTO", "ALWAYS"};
-const Names peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB"};
 const Names sound_modes{"SPEAKER", "MICROPHONE"};
 const Names sound_buffers{"LOW", "NORMAL", "SAFE"};
 const Names sound_underruns{"SILENCE", "REPEAT", "WSOLA", "LPC"};
 const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
-constexpr const char* gpu0 = "gpu-0";
-constexpr const char* simplefb = "simplefb";
 // Guards loops that Java would only finish by exhausting its heap.
 constexpr int64_t max_cpu_entries = 1 << 20;
 
-bool present(const Json::Value& object, const char* key) { return object.isObject() && object.isMember(key); }
 int narrow(int64_t value) { return std::bit_cast<int32_t>(static_cast<uint32_t>(value)); }
-std::string lower(std::string text) {
-    for (auto& c : text) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    return text;
-}
-std::string decimal(int64_t value) { return std::to_string(value); }
-std::string java_bool(bool value) { return value ? "true" : "false"; }
-// StringUtils.pathJoin
-std::string path_join(std::string base, std::string child) {
-    if (!base.empty() && base.back() == '/') base.pop_back();
-    if (!child.empty() && child.front() == '/') child.erase(0, 1);
-    return base + "/" + child;
-}
-template <typename... Rest> std::string path_join(std::string base, std::string child, Rest... rest) {
-    return path_join(path_join(std::move(base), std::move(child)), std::move(rest)...);
-}
-// String.trim
-std::string trim(const std::string& text) {
-    size_t first = 0, last = text.size();
-    while (first < last && static_cast<unsigned char>(text[first]) <= 0x20) ++first;
-    while (last > first && static_cast<unsigned char>(text[last - 1]) <= 0x20) --last;
-    return text.substr(first, last - first);
-}
 // String.split(literal) without trailing empties; callers skip empties anyway.
 std::vector<std::string> split(const std::string& text, char separator) {
     std::vector<std::string> parts;
@@ -87,44 +46,6 @@ std::optional<int32_t> parse_int(const std::string& text) {
     if (!value || *value < INT32_MIN || *value > INT32_MAX) return std::nullopt;
     return static_cast<int32_t>(*value);
 }
-// String.hashCode over UTF-16 units.
-uint32_t java_hash(const std::string& text) {
-    uint32_t hash = 0;
-    int32_t offset = 0, length = static_cast<int32_t>(text.size());
-    while (offset < length) {
-        UChar32 c;
-        U8_NEXT(text.data(), offset, length, c);
-        if (c < 0) c = 0xfffd;
-        if (c > 0xffff) {
-            hash = 31 * hash + U16_LEAD(c);
-            hash = 31 * hash + U16_TRAIL(c);
-        } else hash = 31 * hash + static_cast<uint32_t>(c);
-    }
-    return hash;
-}
-// DataItem iteration: array elements, or object values in the HashMap order a
-// sequentially filled map has. Ties within one bucket fall back to key order,
-// since jsoncpp does not keep the source order.
-std::vector<const Json::Value*> items(const Json::Value& value) {
-    std::vector<const Json::Value*> out;
-    if (value.isArray()) {
-        for (const auto& entry : value) out.push_back(&entry);
-        return out;
-    }
-    if (!value.isObject()) return out;
-    const auto names = value.getMemberNames();
-    uint32_t capacity = 16;
-    while (names.size() > capacity / 4 * 3) capacity *= 2;
-    std::vector<std::pair<uint32_t, size_t>> order;
-    for (size_t i = 0; i < names.size(); ++i) {
-        auto hash = java_hash(names[i]);
-        order.emplace_back((hash ^ (hash >> 16)) & (capacity - 1), i);
-    }
-    std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    for (const auto& [bucket, index] : order) out.push_back(&value[names[index]]);
-    return out;
-}
-
 // --- CpuUtils / CpuPlacementPlan ---
 using CpuList = std::vector<int32_t>;
 CpuList parse_cpu_set(const std::string& spec) {
@@ -253,27 +174,6 @@ void cpu_placement(const Json::Value& item, const HostFacts& host, std::vector<s
 }
 
 // --- VMScreenConfig ---
-struct Screen {
-    std::string id;
-    const Json::Value* item;
-    bool enabled() const { return boolean(*item, "enabled", false); }
-    std::string exporter() const { return java_enum(*item, "exporter", "NONE", exporters); }
-    bool input_enabled() const { return boolean(*item, "input_enabled", true); }
-};
-std::optional<Screen> find_screen(const Json::Value& config, const char* id) {
-    const auto& screens = member(config, "screens");
-    if (!screens.isObject() || !screens[id].isObject()) return std::nullopt;
-    return Screen{id, &screens[id]};
-}
-std::vector<Screen> screens_of(const Json::Value& config) {
-    std::vector<Screen> out;
-    for (const char* id : {gpu0, simplefb}) if (auto screen = find_screen(config, id)) out.push_back(*screen);
-    return out;
-}
-bool screen_enabled(const Json::Value& config, const char* id) {
-    const auto screen = find_screen(config, id);
-    return screen && screen->enabled();
-}
 bool has_gpu_device(const Json::Value& config) { return screen_enabled(config, gpu0); }
 // DisplayTransportCap.optionsFor; tokens double as identities.
 std::vector<const char*> transport_options(const std::string& id, const std::string& exporter) {
@@ -333,19 +233,6 @@ std::string gpu_mode(const Json::Value& item) {
     if (api == "DRM2KGSL") return "NATIVE";
     return "NONE";
 }
-// VMHypervisor.valueOf(hyp.toUpperCase()) + resolveConfigured(CROSVM, ...)
-std::optional<std::string> resolve_hypervisor(const Json::Value& item, const HostFacts& host) {
-    std::string configured = "AUTO";
-    if (member(item, "hypervisor").isString()) {
-        configured = java_enum(item, "hypervisor", "", hypervisors);
-        if (configured.empty()) throw std::invalid_argument("No enum constant VMHypervisor." + member(item, "hypervisor").asString());
-    }
-    if (configured != "AUTO") return configured;
-    if (host.has_kvm) return "KVM";
-    if (host.has_gunyah) return "GUNYAH";
-    if (host.has_gzvm) return "GENIEZONE";
-    return std::nullopt;
-}
 void guest_pool_options(std::string& pre_alloc, const Json::Value& item, int64_t guest_pool) {
     if (guest_pool <= 0) return;
     const auto step = integer(item, "gpu_guest_step_mb", 0);
@@ -377,17 +264,7 @@ struct Builder {
     std::string vm_id() const { return config::uuid(item); }
     std::string run_path() const { return path_join(data_dir, "run"); }
 
-    void strace(CrosvmLaunch& launch) {
-        if (!boolean(item, "strace", false)) return;
-        std::optional<std::string> binary;
-        if (host.strace_prebuilt_exists) binary = path_join(data_dir, "usr", "bin", "strace");
-        else binary = host.strace_in_path;
-        if (!binary) return;
-        const auto dir = path_join(data_dir, "cache", "strace-" + vm_id());
-        launch.strace_dir = dir;
-        for (auto arg : {*binary, std::string("-Tttrvyyff"), std::string("-s"), std::string("8192"), std::string("-o"), path_join(dir, "strace.log")})
-            args.push_back(std::move(arg));
-    }
+    void strace(CrosvmLaunch& launch) { launch.strace_dir = strace_args(item, host, args); }
     void hypervisor_args(const std::string& hypervisor, std::string& def_protected) {
         args.push_back("--hypervisor");
         if (hypervisor == "KVM") { args.push_back("kvm"); return; }
@@ -427,8 +304,7 @@ struct Builder {
         for (const auto* disk : items(item["disks"])) {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
-            constexpr std::string_view prefix = "/storage/emulated/";
-            if (host.optimize_sdcard && path.starts_with(prefix)) path = "/data/media/" + path.substr(prefix.size());
+            path = optimized_path(std::move(path), host);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
             auto arg = path;
@@ -529,20 +405,11 @@ struct Builder {
         }
     }
     std::string vnc_arg(const Screen& screen) const {
-        const auto& vnc = member(*screen.item, "vnc");
-        const auto& stored = vnc.isObject() ? vnc : Json::Value::nullSingleton();
-        auto host_name = string(stored, "host", "");
-        auto port = integer(stored, "port", -1);
-        auto password = string(stored, "password", "");
-        if (const auto at = run.vnc.find(screen.id); at != run.vnc.end()) {
-            if (at->second.host) host_name = *at->second.host;
-            if (at->second.port) port = *at->second.port;
-            if (at->second.password) password = *at->second.password;
-        }
+        const auto vnc = vnc_binding(screen, run.vnc);
         std::string arg;
-        if (!host_name.empty()) arg += "host=" + host_name + ",";
-        arg += "port=" + decimal(std::max<int64_t>(port, 1));
-        if (!password.empty()) arg += ",password=" + password;
+        if (!vnc.host.empty()) arg += "host=" + vnc.host + ",";
+        arg += "port=" + decimal(std::max<int64_t>(vnc.port, 1));
+        if (!vnc.password.empty()) arg += ",password=" + vnc.password;
         arg += ",view-only=" + java_bool(!screen.input_enabled());
         arg += ",screen=" + screen.id;
         return arg;
@@ -696,16 +563,7 @@ struct Builder {
             args.push_back(serial);
         }
     }
-    void extra_options() {
-        if (!present(item, "extra_options")) return;
-        const auto& extra = item["extra_options"];
-        if (extra.isNull()) return;
-        if (!extra.isArray() && !extra.isObject()) throw std::runtime_error("Cannot iterate over extra_options");
-        for (const auto* arg : items(extra)) {
-            if (!arg->isString()) throw std::runtime_error("Expected type STRING");
-            args.push_back(arg->asString());
-        }
-    }
+
     int64_t pflash_block_size() const {
         const auto size = host.pflash_vars_size;
         for (int64_t block : {262144, 65536, 4096}) if (size > 0 && size % block == 0) return block;
@@ -727,7 +585,7 @@ struct Builder {
             args.push_back("--gpu-cgroup-path");
             args.push_back(*run.gpu_cgroup_path);
         }
-        const auto hypervisor = resolve_hypervisor(item, host);
+        const auto hypervisor = resolve_hypervisor(item, host, Backend::crosvm);
         if (!hypervisor) throw std::runtime_error("No supported hypervisor found for CROSVM backend");
         std::string def_protected = "PROTECTED_NORMAL";
         hypervisor_args(*hypervisor, def_protected);
@@ -771,7 +629,7 @@ struct Builder {
         if (launch.input_bridge) inputs(launch);
         peripherals();
         serials();
-        extra_options();
+        extra_options(item, args);
         if (boot.uefi) {
             args.push_back(boot.firmware.empty() ? path_join(data_dir, "/usr/share/droidvm/edk2-gunyah.fd") : boot.firmware);
             if (boot.vars_enabled) {
@@ -784,21 +642,7 @@ struct Builder {
 
     void environment(CrosvmLaunch& launch) const {
         auto& env = launch.env;
-        // VMBackendInstance.prepareProcess
-        env.emplace_back("LD_PRELOAD", path_join(data_dir, "lib", "libsimpledump.so") + ":" + path_join(data_dir, "lib", "libcompat_a" + host.android_release + ".so"));
-        env.emplace_back("LD_LIBRARY_PATH", path_join(data_dir, "usr", "lib"));
-        const auto& configured = member(item, "environment_variables");
-        if (configured.isArray()) {
-            for (const auto& entry : configured) {
-                if (!entry.isString()) continue;
-                const auto raw = trim(entry.asString());
-                const auto separator = raw.find('=');
-                if (separator == std::string::npos || separator == 0) continue;
-                const auto key = trim(raw.substr(0, separator));
-                if (key.empty()) continue;
-                env.emplace_back(key, raw.substr(separator + 1));
-            }
-        }
+        process_environment(item, host, env);
         const auto turnip = path_join(data_dir, "usr", "lib", "libvulkan_freedreno.so");
         // applyGfxstreamEnv
         if (has_gpu_device(item)) {
@@ -832,7 +676,7 @@ struct Builder {
 
 CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, const BootPlan& boot, const HostFacts& host) {
     if (!config.isObject()) throw std::invalid_argument("VM config must be an object");
-    Builder builder{config, run, boot, host, host.data_dir.empty() ? std::string("/data/data/" DROIDVM_PACKAGE_NAME) : host.data_dir, {}};
+    Builder builder{config, run, boot, host, data_dir(host), {}};
     CrosvmLaunch launch;
     builder.command(launch);
     launch.argv = std::move(builder.args);
