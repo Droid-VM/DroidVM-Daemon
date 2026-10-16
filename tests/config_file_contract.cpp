@@ -2,6 +2,7 @@
 #include "contracts.h"
 #include "common/identity.h"
 #include "store/json_file.h"
+#include "store/config_transaction.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -122,6 +123,134 @@ void failed_writes_and_uncertain_commit() {
     try { uncertain.save(value(2)); } catch (const CommitError& error) { installed = error.installed; }
     check(installed && file.load()->value == value(2), "post-rename error reports installed value");
 }
+void transaction_crash_boundaries() {
+    for (const char* stage : {"staged", "before_decision", "decision_value_synced", "decision_before_install",
+            "decision_installed", "decision_synced", "value_synced", "before_install", "installed",
+            "participant_synced", "before_forget", "decision_removed"}) {
+        Temporary temp;
+        for (const char* name : {"vms.json", "networks.json", "disks.json"})
+            JsonFile(temp.directory.get(), name, getuid()).save(value(1));
+        pid_t child = fork();
+        check(child >= 0, "fork transaction crash helper");
+        if (!child) {
+            ConfigTransaction transaction(temp.directory.get(), getuid(), [stage](const char* current, size_t) {
+                if (std::string_view(stage) == current) { kill(getpid(), SIGKILL); _exit(75); }
+            });
+            transaction.commit({{"vms.json", value(2)}, {"networks.json", value(2)}, {"disks.json", value(2)}});
+            _exit(74);
+        }
+        int status = 0;
+        check(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+            "transaction helper killed at requested boundary");
+        ConfigTransaction recovered(temp.directory.get(), getuid());
+        recovered.recover(); // Idempotent and no stale decision resurrection.
+        const std::string_view boundary(stage);
+        int generation = boundary == "staged" || boundary == "before_decision" || boundary == "decision_value_synced"
+            || boundary == "decision_before_install" ? 1 : 2;
+        for (const char* name : {"vms.json", "networks.json", "disks.json"})
+            check(JsonFile(temp.directory.get(), name, getuid()).load()->value == value(generation),
+                "crash recovery exposes one complete generation");
+        recovered.commit({{"vms.json", value(3)}, {"networks.json", value(3)}});
+        ConfigTransaction reopened(temp.directory.get(), getuid());
+        check(JsonFile(temp.directory.get(), "vms.json", getuid()).load()->value == value(3)
+            && JsonFile(temp.directory.get(), "networks.json", getuid()).load()->value == value(3), "later commit survives reopening");
+        DIR* scan = opendir(temp.path.c_str()); check(scan, "scan transaction leftovers");
+        bool orphan = false;
+        while (auto* entry = readdir(scan)) {
+            const std::string_view name(entry->d_name);
+            if (name.starts_with("transaction-") || name.starts_with("config-transaction") || name.ends_with(".tmp")) orphan = true;
+        }
+        closedir(scan); check(!orphan, "recovery reclaims transaction artifacts");
+    }
+}
+void transaction_failures_and_recovery() {
+    for (const char* stage : {"before_decision", "decision_installed", "installed", "participant_synced", "decision_removed"}) {
+        Temporary temp;
+        JsonFile vm(temp.directory.get(), "vms.json", getuid()); vm.save(value(1));
+        JsonFile network(temp.directory.get(), "networks.json", getuid()); network.save(value(1));
+        bool fail = true;
+        ConfigTransaction transaction(temp.directory.get(), getuid(), [&](const char* current, size_t) {
+            if (fail && std::string_view(stage) == current) throw std::runtime_error("injected transaction failure");
+        });
+        const bool decided = std::string_view(stage) != "before_decision";
+        bool rejected = false;
+        try { transaction.commit({{"vms.json", value(2)}, {"networks.json", value(2)}}); }
+        catch (const TransactionError& error) { rejected = error.decided == decided; }
+        check(rejected, "failure distinguishes pre-decision from redo required");
+        if (decided) {
+            rejected = false;
+            try { transaction.commit({{"vms.json", value(3)}}); }
+            catch (const TransactionError& error) { rejected = error.decided; }
+            check(rejected, "pending recovery rejects unrelated commits");
+        } else check(vm.load()->value == value(1) && network.load()->value == value(1), "pre-decision failure leaves all targets old");
+        fail = false; transaction.recover();
+        check(vm.load()->value == value(decided ? 2 : 1) && network.load()->value == value(decided ? 2 : 1),
+            "recovery finishes every participant");
+        transaction.commit({{"vms.json", value(3)}, {"networks.json", value(3)}});
+        check(vm.load()->value == value(3) && network.load()->value == value(3), "writes resume after successful recovery");
+    }
+}
+void transaction_validation_and_missing_stage() {
+    Temporary temp;
+    JsonFile vm(temp.directory.get(), "vms.json", getuid()); vm.save(value(1));
+    JsonFile network(temp.directory.get(), "networks.json", getuid()); network.save(value(1));
+    ConfigTransaction transaction(temp.directory.get(), getuid());
+    auto invalid = value(2); invalid["oversize"] = std::string(8u << 20, 'x');
+    for (auto updates : std::vector<std::vector<ConfigTransaction::Update>>{
+            {{"vms.json", value(2)}, {"../outside.json", value(2)}},
+            {{"vms.json", value(2)}, {"vms.json", value(2)}},
+            {{"vms.json", value(2)}, {"networks.json", invalid}},
+            {{"vms.json", value(2)}, {"networks.json", Json::Value(Json::arrayValue)}}}) {
+        bool rejected = false;
+        try { transaction.commit(updates); } catch (const std::exception&) { rejected = true; }
+        check(rejected && vm.load()->value == value(1) && network.load()->value == value(1), "invalid batch never touches targets");
+    }
+    bool fail = true;
+    ConfigTransaction interrupted(temp.directory.get(), getuid(), [&](const char* stage, size_t) {
+        if (fail && std::string_view(stage) == "decision_synced") throw std::runtime_error("stop before targets");
+    });
+    try { interrupted.commit({{"vms.json", value(2)}, {"networks.json", value(2)}}); }
+    catch (const TransactionError& error) { check(error.decided, "decision retained"); }
+    check(unlinkat(temp.directory.get(), "transaction-networks.json", 0) == 0, "remove staged participant");
+    fail = false;
+    bool rejected = false;
+    try { interrupted.recover(); } catch (const TransactionError& error) { rejected = error.decided; }
+    check(rejected && vm.load()->value == value(1) && network.load()->value == value(1), "missing later stage blocks all recovery writes");
+    JsonFile(temp.directory.get(), "transaction-networks.json", getuid()).save(value(2));
+    interrupted.recover();
+    check(vm.load()->value == value(2) && network.load()->value == value(2), "retained intent permits repair and redo");
+}
+void transaction_capacity_and_aliases() {
+    Temporary temp;
+    ConfigTransaction transaction(temp.directory.get(), getuid());
+    std::vector<ConfigTransaction::Update> updates;
+    for (const char* name : {"vms.json", "networks.json", "disks.json"}) {
+        const size_t capacity = std::string_view(name) == "vms.json" ? 16u << 20 : 8u << 20;
+        auto document = value(1); document["padding"] = "";
+        document["padding"] = std::string(capacity - encode_json(document).size(), 'x');
+        updates.push_back({name, std::move(document)});
+    }
+    transaction.commit(updates);
+    for (const auto& update : updates) {
+        const size_t capacity = update.name == "vms.json" ? 16u << 20 : 8u << 20;
+        JsonFile file(temp.directory.get(), update.name, getuid(), {}, capacity);
+        check(file.load()->value == update.document, "full 32 MiB transaction retains each document capacity");
+    }
+    updates.clear();
+    JsonFile(temp.directory.get(), "outside.json", getuid()).save(value(9));
+    for (const char* alias : {"networks.json", "transaction-networks.json", "config-transaction.json"}) {
+        if (std::string_view(alias) == "networks.json") check(unlinkat(temp.directory.get(), alias, 0) == 0, "remove target for alias fixture");
+        check(symlinkat("outside.json", temp.directory.get(), alias) == 0, "create transaction alias");
+        bool rejected = false;
+        try {
+            ConfigTransaction unsafe(temp.directory.get(), getuid());
+            unsafe.commit({{"vms.json", value(2)}, {"networks.json", value(2)}});
+        } catch (const std::exception&) { rejected = true; }
+        check(rejected, "transaction refuses target, stage and decision aliases");
+        check(JsonFile(temp.directory.get(), "outside.json", getuid()).load()->value == value(9), "alias destination remains unchanged");
+        check(unlinkat(temp.directory.get(), alias, 0) == 0, "remove alias fixture");
+    }
+}
 void bounds_and_path_refusal() {
     Temporary temp;
     JsonFile file(temp.directory.get(), "networks.json", getuid());
@@ -148,5 +277,9 @@ int main() {
     return run({{"json_unknown_int64_backup_recovery", roundtrip_backup_recovery},
                 {"four_process_crash_boundaries", crash_boundaries},
                 {"write_failure_and_post_rename_result", failed_writes_and_uncertain_commit},
+                {"twelve_transaction_sigkill_boundaries", transaction_crash_boundaries},
+                {"transaction_failure_redo_and_writer_gate", transaction_failures_and_recovery},
+                {"transaction_validation_and_missing_stage", transaction_validation_and_missing_stage},
+                {"transaction_full_capacity_and_aliases", transaction_capacity_and_aliases},
                 {"bounded_io_symlink_hardlink_fifo", bounds_and_path_refusal}});
 }

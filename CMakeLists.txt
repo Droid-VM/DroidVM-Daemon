@@ -80,7 +80,7 @@ target_compile_options(droidvm_managed_process PRIVATE -Wall -Wextra -Werror)
 add_library(droidvm_runtime STATIC runtime/layout.cpp runtime/log.cpp)
 target_link_libraries(droidvm_runtime PUBLIC droidvm_child)
 target_compile_options(droidvm_runtime PRIVATE -Wall -Wextra -Werror)
-add_library(droidvm_config STATIC store/network_config.cpp store/json_file.cpp store/vm_config.cpp store/vm_ownership.cpp)
+add_library(droidvm_config STATIC store/network_config.cpp store/json_file.cpp store/config_transaction.cpp store/vm_config.cpp store/vm_ownership.cpp)
 # Android's public ICU digit API (since API 31) matches Java Character.digit;
 # the supported minimum remains API 33. No private/versioned ICU symbol lookup.
 target_link_libraries(droidvm_config PUBLIC droidvm_wire droidvm_identity icu)
