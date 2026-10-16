@@ -10,6 +10,7 @@
 
 namespace droidvm {
 class VmService;
+class VmConfigService;
 class NetworkConfigService;
 class LegacyEvents;
 }
@@ -26,6 +27,7 @@ struct PkgContext {
     TaskService* tasks = nullptr;
     std::string data_dir; // Constants.DATA_DIR; empty = /data/data/<package>
     std::function<void(const char* level, const std::string& text)> log = [](const char*, const std::string&) {};
+    VmConfigService* vm_config = nullptr;
 };
 // Shared task records and a bounded background pool, with the existing legacy
 // broadcasts preserved. The returned ID also works with task_get/task_cancel.

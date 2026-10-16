@@ -5,6 +5,8 @@
 #include "pkg/writer.h"
 #include "pkg/service.h"
 #include "services/legacy_events.h"
+#include "services/vm.h"
+#include "services/network_config.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
@@ -356,6 +358,123 @@ std::vector<Entry> read_path(const std::string& path) {
     FileSource in(path);
     return read_package(in);
 }
+void persistent_import(const std::string& fault) {
+    using namespace std::chrono_literals;
+    Temporary dir;
+    const CallContext caller{"package-owner", true, true, true};
+    Fd directory(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    check(directory.get() >= 0, "open isolated configuration directory");
+    vm::RuntimeContext runtime_context;
+    runtime_context.cache_dir = dir.path;
+    runtime_context.owner = getuid();
+    runtime_context.shutting_down = [] { return true; }; // Never admit a VMM.
+    VmService vms(runtime_context);
+    bool armed = false;
+    VmConfigService configs(directory.get(), getuid(), [&](const char* stage) {
+        if (armed && fault == stage) throw std::runtime_error("injected persistence failure");
+    }, [&](const Json::Value& document) {
+        if (armed && fault == "unknown") throw std::runtime_error("unknown registration failure");
+        return vms.prepare_config(document);
+    });
+    auto initial = configs.snapshot(caller);
+    auto document = initial->document;
+    document["extension"] = "preserve";
+    configs.replace(caller, initial->revision, document);
+    bool raced = false;
+    NetworkConfigService networks(directory.get(), getuid(), [&](const char* stage) {
+        if (fault == "conflict" && std::string_view(stage) == "installed") {
+            auto prior = configs.snapshot(caller);
+            auto changed = prior->document;
+            changed["concurrent_edit"] = true;
+            configs.replace(caller, prior->revision, std::move(changed));
+            raced = true;
+        }
+    });
+    auto manifest = fixture_manifest();
+    manifest.vm["name"] = "imported";
+    manifest.vm["networks"] = wire::parse(R"([{"pkg_network_ref":"net0","mac_address":"02:00:00:00:00:01","dhcp4_lease":{"enabled":true,"offset":70}}])");
+    manifest.disks.clear();
+    manifest.boots.clear();
+    manifest.compression = Compression::none;
+    DiskEntry disk;
+    disk.name = disk.archive_path = "disk.img";
+    disk.format = "RAW";
+    disk.size = 7;
+    disk.ref.index = 0;
+    manifest.disks.push_back(disk);
+    manifest.networks.push_back(wire::parse(R"({"schema":2,"id":"00000000-0000-4000-8000-000000000001","name":"import-net","bridge_name":"brimport","uplink_mode":"l3","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"10.0.0.1/24","dhcp":{"enabled":true}}}]},"pkg_network_ref":"net0"})"));
+    PackageSpec spec;
+    spec.dest = dir.at("source.vmpkg");
+    spec.compression = Compression::none;
+    spec.app_version_code = manifest.app_version_code;
+    write_package(spec, manifest_text(manifest), [](TarWriter& tar) { tar.entry("disk.img", "payload"); });
+    LegacyEvents events;
+    TaskLimits limits;
+    limits.background_workers = 1;
+    TaskService tasks(limits);
+    PkgContext context;
+    context.vms = &vms; context.vm_config = &configs; context.networks = &networks;
+    context.events = &events; context.tasks = &tasks; context.data_dir = dir.path;
+    PkgService packages(context);
+    Json::Value request;
+    request["src_path"] = spec.dest;
+    request["target_dir"] = dir.at("output");
+    armed = true;
+    auto run = [&] {
+        const auto response = packages.vm_import(caller, request);
+        const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+        const auto deadline = TaskService::Clock::now() + 5s;
+        auto task = tasks.get(caller, ref);
+        while (!task_terminal(task.state) && TaskService::Clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+            task = tasks.get(caller, ref);
+        }
+        check(task_terminal(task.state), "import finishes within bounded deadline");
+        return task;
+    };
+    auto task = run();
+    const bool installed = fault.empty() || fault == "installed";
+    const bool retained = installed || fault == "unknown";
+    auto view = configs.snapshot(caller);
+    check(view->document["vms"].size() == (installed ? 1u : 0u), "registration snapshot matches commit outcome");
+    check(vms.list(caller).size() == (installed ? 1u : 0u), "runtime inventory follows persistence");
+    check(view->document["extension"] == "preserve", "import preserves root extension");
+    check(exists(dir.at("output/imported/disk.img")) == retained, "only rejected registration cleans imported files");
+    if (retained) check(bytes_of(dir.at("output/imported/disk.img")) == "payload", "retained disk contents intact");
+    if (fault.empty()) {
+        check(task.state == TaskState::succeeded && vms.exists(caller, task.result["vm_id"].asString()), "success exposes persistent VM");
+        const auto first_nic = view->document["vms"][0]["networks"][0];
+        check(first_nic["dhcp4_lease"]["enabled"].asBool() && first_nic["dhcp4_lease"]["offset"] == 70, "initial import persists lease");
+        Json::Value join;
+        join["ref"] = "net0"; join["action"] = "join"; join["network_id"] = first_nic["network_id"];
+        request["network_plan"] = Json::Value(Json::arrayValue);
+        request["network_plan"].append(std::move(join));
+        task = run();
+        check(task.state == TaskState::succeeded, "second import succeeds without legacy create");
+        view = configs.snapshot(caller);
+        check(view->document["vms"].size() == 2 && view->document["vms"][1]["name"] == "imported (1)", "name planned from persistent snapshot");
+        check(view->document["vms"][1]["networks"][0]["dhcp4_lease"]["offset"] == 71, "lease planning respects persisted VM reservation");
+    } else {
+        const auto expected = fault == "installed" ? ErrorCode::commit_uncertain : fault == "conflict" ? ErrorCode::conflict :
+            fault == "unknown" ? ErrorCode::internal : ErrorCode::io_error;
+        check(task.state == TaskState::failed && task.error == expected, "task preserves registration failure code");
+        if (fault == "conflict") check(raced && view->document["concurrent_edit"].asBool(), "planning revision detects concurrent commit");
+        if (fault == "installed") check(view->durability_uncertain, "installed failure remains explicitly uncertain");
+        if (retained) {
+            bool reported = false;
+            for (const auto& frame : events.drain()) {
+                const auto data = wire::parse(std::string_view(frame).substr(4))["data"];
+                if (data["phase"] == "error" && data["retained_directory"] == dir.at("output/imported")) reported = true;
+            }
+            check(reported, "failure notification identifies retained import directory");
+        }
+    }
+    packages.shutdown();
+    tasks.shutdown();
+    // A new service reads the real persisted document, not an in-memory task result.
+    VmConfigService reopened(directory.get(), getuid());
+    check(reopened.snapshot(caller)->document == view->document, "reopen preserves imported configuration or concurrent edit");
+}
 void single_file_packages() {
     Temporary dir;
     const auto disk = sample(300000, 6, true), noise = sample(5000, 7, false);
@@ -566,6 +685,11 @@ int main() {
     const std::vector<Test> tests{
         {"service authorization", service_access},
         {"service queue capacity and cancellation", service_queue_capacity},
+        {"persistent import and repeated name", [] { persistent_import(""); }},
+        {"import rejects stale planning revision", [] { persistent_import("conflict"); }},
+        {"import cleans pre-install failure", [] { persistent_import("before_install"); }},
+        {"import retains uncertain commit files", [] { persistent_import("installed"); }},
+        {"import retains unknown failure files", [] { persistent_import("unknown"); }},
         {"tar round trip", tar_round_trip}, {"tar edges", tar_edges}, {"compression round trips", compression_round_trips},
         {"compression corruption", compression_corruption}, {"header", header_contract}, {"manifest", manifest_contract},
         {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},

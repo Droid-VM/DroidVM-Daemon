@@ -5,6 +5,7 @@
 #include "services/legacy_events.h"
 #include "services/network_config.h"
 #include "services/vm.h"
+#include "services/vm_config.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include "vm/boot_plan.h"
@@ -345,6 +346,7 @@ private:
     std::vector<NetworkPlanEntry> plan_;
     std::string vm_dir_, vm_name_;
     bool registered_ = false;
+    VmConfigService::Snapshot config_snapshot_;
     int total_ = 0, volume_total_ = 0;
     Manifest manifest_;
     Json::Value vm_;
@@ -384,8 +386,12 @@ TaskCompletion ImportTask::run(TaskControl& control) {
     control_ = &control;
     id_ = control.ref().id;
     Json::Value data;
+    auto failure_code = ErrorCode::io_error;
     try {
         check_cancel();
+        // Capture before name/lease planning. Concurrent configuration changes
+        // must reject this import rather than silently rebasing its decisions.
+        if (context_.vm_config) config_snapshot_ = context_.vm_config->snapshot(internal);
         unpack();
         // Network creation and VM registration are observable shared state.
         // Finish cancellable extraction/cleanup before entering this commit.
@@ -393,9 +399,36 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         auto networks = import_networks();
         resolve_leases();
         std::string id;
-        try { id = context_.vms->create(internal, vm_); }
+        try {
+            if (context_.vm_config) {
+                id = config::uuid(vm_);
+                Json::Value operations(Json::arrayValue), operation;
+                operation["op"] = "create";
+                operation["config"] = vm_;
+                operations.append(std::move(operation));
+                // Unknown failures may occur after installation. Keep files
+                // unless the service explicitly proves the commit was rejected.
+                registered_ = true;
+                failure_code = ErrorCode::internal;
+                context_.vm_config->apply(internal, config_snapshot_->revision, operations);
+            } else id = context_.vms->create(internal, vm_);
+        }
         catch (const ServiceError& error) {
-            if (error.code() == ErrorCode::conflict) throw Error("failed to register VM");
+            if (!context_.vm_config && error.code() == ErrorCode::conflict)
+                throw Error("failed to register VM");
+            failure_code = error.code();
+            switch (error.code()) {
+                case ErrorCode::conflict:
+                case ErrorCode::invalid_argument:
+                case ErrorCode::not_found:
+                case ErrorCode::resource_exhausted:
+                case ErrorCode::permission_denied:
+                case ErrorCode::unauthenticated:
+                case ErrorCode::io_error:
+                    registered_ = false;
+                    break;
+                default: break;
+            }
             throw Error(error.what());
         }
         registered_ = true;
@@ -420,10 +453,15 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         data["done"] = 0;
         data["total"] = total_;
         if (*error.what()) data["message"] = error.what();
+        data["error_code"] = error_code_name(failure_code);
+        if (registered_) {
+            data["vm_id"] = vm_["id"];
+            data["retained_directory"] = vm_dir_;
+        }
         emit(data, "error");
         if (!cleaned) return TaskCompletion::failure(ErrorCode::io_error, "Failed to clean up imported files");
         if (control.cancellation_requested()) return TaskCompletion::cancelled();
-        return TaskCompletion::failure(ErrorCode::io_error, error.what());
+        return TaskCompletion::failure(failure_code, error.what());
     }
 }
 void ImportTask::unpack() {
@@ -642,7 +680,8 @@ void ImportTask::resolve_lease(Json::Value& nic, Family family) {
     const auto* vlan = network ? vm::nic_dhcp_vlan(nic, *network) : nullptr;
     if (!vlan || !vlan_dhcp_enabled(*vlan, family)) { lease["enabled"] = false; return; }
     std::set<int64_t> used;
-    for (const auto& other : context_.vms->list(internal)) add_offsets(used, other, *network, *vlan, family);
+    const auto rows = config_snapshot_ ? config_snapshot_->document["vms"] : context_.vms->list(internal);
+    for (const auto& other : rows) add_offsets(used, other, *network, *vlan, family);
     // This VM is not registered yet; its other NICs are only in the config in hand.
     add_offsets(used, vm_, *network, *vlan, family, &nic);
     const auto& offset = config::member(lease, "offset");
@@ -660,7 +699,8 @@ void ImportTask::resolve_lease(Json::Value& nic, Family family) {
 }
 std::string ImportTask::unique_vm_name(const std::string& name) const {
     std::set<std::string> taken;
-    for (const auto& row : context_.vms->list(internal)) {
+    const auto rows = config_snapshot_ ? config_snapshot_->document["vms"] : context_.vms->list(internal);
+    for (const auto& row : rows) {
         const auto& value = config::member(row, "name");
         if (value.isString()) taken.insert(value.asString());
     }
