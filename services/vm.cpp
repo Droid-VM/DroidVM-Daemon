@@ -342,15 +342,28 @@ std::vector<std::string> VmService::busy_vms_using(const std::string& network) c
 void VmService::drop_network(const std::string& network) {
     std::lock_guard lock(mutex_);
     require_legacy_writer();
-    for (const auto& entry : entries_) {
-        const auto config = entry.vm->config();
+    if (shutting_down_->load()) throw ServiceError(ErrorCode::unavailable, "VM service is shutting down");
+    // Freeze every affected VM before publishing anything. A previous runtime
+    // lookup must not be able to start with a NIC removed by this operation.
+    auto next = entries_;
+    std::vector<vm::VmRuntime::StoppedLease> leases;
+    leases.reserve(entries_.size());
+    for (auto& entry : next) {
+        auto config = entry.definition;
         const auto& nics = config::member(config, "networks");
         if (!nics.isArray()) continue;
         Json::Value kept(Json::arrayValue);
         for (const auto& nic : nics) if (config::string(nic, "network_id") != network) kept.append(nic);
         if (kept.size() == nics.size()) continue;
-        entry.vm->set_networks(std::move(kept));
+        auto lease = entry.vm->try_edit();
+        if (!lease) throw ServiceError(ErrorCode::conflict, "VM " + entry.id + " is busy; cannot remove network");
+        leases.push_back(std::move(lease));
+        config["networks"] = std::move(kept);
+        entry.vm = std::make_shared<vm::VmRuntime>(entry.id, config, context_);
+        entry.definition = std::move(config);
     }
+    for (auto& lease : leases) lease.retire();
+    entries_.swap(next);
 }
 Json::Value VmService::vm_by_tap(const std::string& tap) const {
     std::lock_guard lock(mutex_);

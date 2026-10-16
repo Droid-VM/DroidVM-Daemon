@@ -64,6 +64,41 @@ void replacement_and_failure() {
     check(!service.exists(admin, id) && !replacement->start() && fixture.starts == 2, "removed reference cannot restart");
     check(!service.remove(admin, id), "unknown deletion retains legacy false result");
 }
+void network_removal_is_atomic() {
+    Fixture fixture;
+    VmService service(fixture.context);
+    auto first = config("first"), second = config("second"), untouched = config("untouched");
+    Json::Value nic; nic["network_id"] = "removed"; nic["extension"] = "keep";
+    first["networks"].append(nic); second["networks"].append(nic);
+    nic["network_id"] = "retained"; first["networks"].append(nic);
+    const auto a = service.create(admin, first), b = service.create(admin, second);
+    const auto c = service.create(admin, untouched);
+    auto before_a = service.runtime(admin, a), before_b = service.runtime(admin, b);
+    auto before_c = service.runtime(admin, c);
+    const auto config_a = before_a->config(), config_b = before_b->config();
+    {
+        auto busy = before_b->try_edit();
+        check(bool(busy), "hold second VM lifecycle lease");
+        error(ErrorCode::conflict, [&] { service.drop_network("removed"); });
+        check(service.runtime(admin, a) == before_a && service.runtime(admin, b) == before_b,
+            "later busy VM aborts all replacements");
+        check(before_a->config() == config_a && before_b->config() == config_b,
+            "failed network removal preserves every NIC");
+        check(!before_a->start() && fixture.starts == 1, "aborted removal releases earlier lease without retiring");
+    }
+    service.drop_network("removed");
+    check(service.runtime(admin, a) != before_a && service.runtime(admin, b) != before_b,
+        "successful removal replaces every affected runtime");
+    check(service.runtime(admin, c) == before_c, "unaffected runtime survives");
+    check(!before_a->start() && !before_b->start() && fixture.starts == 1,
+        "stale runtimes cannot start with removed network");
+    check(service.get(admin, a)["networks"].size() == 1
+        && service.get(admin, a)["networks"][0] == nic
+        && service.get(admin, b)["networks"].empty(), "only target NICs removed and opaque fields preserved");
+    const auto after = service.runtime(admin, a);
+    service.drop_network("removed");
+    check(service.runtime(admin, a) == after, "repeated removal preserves unchanged runtime");
+}
 void session_overrides_and_failed_admission() {
     Fixture fixture;
     auto value = config("session");
@@ -155,7 +190,7 @@ void lease_abort_and_lifetime() {
     }
     check(weak.expired(), "lease releases runtime after unlocking");
 }
-void lifecycle_races(bool removing) {
+void lifecycle_races(int operation) {
     for (int i = 0; i < 16; ++i) {
         Fixture fixture;
         Gate started, proceed;
@@ -169,13 +204,18 @@ void lifecycle_races(bool removing) {
         };
         VmService service(fixture.context); inventory = &service;
         auto value = config("before"), changed = value; changed["name"] = "after";
+        if (operation == 2) {
+            Json::Value nic; nic["network_id"] = "removed";
+            value["networks"].append(nic);
+        }
         const auto id = service.create(admin, value);
         auto original = service.runtime(admin, id);
         auto start = std::async(std::launch::async, [&] { return original->start(); });
         started.wait();
         auto mutation = std::async(std::launch::async, [&] {
             try {
-                if (removing) service.remove(admin, id);
+                if (operation == 2) service.drop_network("removed");
+                else if (operation == 1) service.remove(admin, id);
                 else service.modify(admin, changed);
                 return false;
             } catch (const ServiceError& error) { return error.code() == ErrorCode::conflict; }
@@ -185,13 +225,15 @@ void lifecycle_races(bool removing) {
         const bool admitted = start.get(), rejected = mutation.get();
         check(ready && rejected && !admitted, "lifecycle/edit race rejects promptly without lock inversion");
         check(service.runtime(admin, id) == original && service.get(admin, id)["name"] == "before", "racing edit leaves inventory unchanged");
-        if (removing) service.remove(admin, id);
+        if (operation == 2) service.drop_network("removed");
+        else if (operation == 1) service.remove(admin, id);
         else service.modify(admin, changed);
         check(!original->start() && fixture.starts == 1, "successful retry retires precisely the previous runtime");
     }
 }
-void modify_races() { lifecycle_races(false); }
-void remove_races() { lifecycle_races(true); }
+void modify_races() { lifecycle_races(0); }
+void remove_races() { lifecycle_races(1); }
+void network_removal_races() { lifecycle_races(2); }
 void configured_start_binding() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -454,6 +496,8 @@ void revisioned_batch_adapter() {
 }
 int main() {
     return run({{"replace_delete_stale_references", replacement_and_failure},
+        {"network_removal_atomic_inventory", network_removal_is_atomic},
+        {"sixteen_network_removal_start_races", network_removal_races},
         {"session_overrides_failed_admission", session_overrides_and_failed_admission},
         {"invalid_session_overrides", invalid_session_overrides},
         {"session_overrides_worker_abort", session_overrides_worker_abort},
