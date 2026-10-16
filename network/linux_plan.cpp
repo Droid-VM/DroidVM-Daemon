@@ -4,6 +4,7 @@
 #include "store/network_config.h"
 #include "services/context.h"
 #include <bit>
+#include <algorithm>
 #include <set>
 
 namespace droidvm::network {
@@ -23,6 +24,7 @@ LinuxPlan linux_plan(Json::Value network) {
         vlan.device = OwnedLinks::vlan_device(plan.bridge, vlan.id);
         if (vlan.id) vlan.leg = OwnedLinks::vlan_leg(plan.bridge, vlan.id);
         vlan.pd = config::string(config::member(row, "ipv6"), "source") == "dhcp_pd";
+        vlan.snat4 = config::boolean(config::member(row, "ipv4"), "snat");
         for (const bool ipv6 : {false, true}) {
             std::set<std::string> unique;
             auto add = [&](const std::string& cidr) {
@@ -38,5 +40,18 @@ LinuxPlan linux_plan(Json::Value network) {
         plan.vlans.push_back(std::move(vlan));
     }
     return plan;
+}
+LinuxPlan linux_live_plan(const LinuxPlan& plan, const PdAddresses& pd) {
+    auto result = plan;
+    for (const auto& [id, address] : pd) {
+        auto vlan = std::find_if(result.vlans.begin(), result.vlans.end(), [&](const auto& row) { return row.id == id && row.pd; });
+        if (vlan == result.vlans.end() || address.empty())
+            throw ServiceError(ErrorCode::invalid_argument, "live PD address is not for a configured PD VLAN");
+        const auto prefix = config::NetworkPrefix::parse(address, true);
+        const auto normalized = prefix.address() + "/" + std::to_string(prefix.prefix());
+        auto& addresses = vlan->addresses[1];
+        if (std::find(addresses.begin(), addresses.end(), normalized) == addresses.end()) addresses.push_back(normalized);
+    }
+    return result;
 }
 }

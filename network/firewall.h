@@ -9,6 +9,7 @@ namespace droidvm::network {
 // module name, shell expression or executable. Only built-in hooks are used.
 struct FirewallRule {
     bool ipv6 = false, negate_output = false, established = false;
+    bool input_prefix = false, output_prefix = false; // typed suffix '+'; names remain literal stems
     std::string table = "filter", chain = "FORWARD";
     std::string input, output, source, destination, protocol;
     uint16_t port_first = 0, port_last = 0;

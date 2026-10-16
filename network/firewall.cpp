@@ -72,7 +72,7 @@ std::string restore_line(const char* operation, const Iptables::TaggedRule& row)
     for (const auto& arg : args) {
         // The typed grammar currently emits only these unquoted tokens. Fail
         // closed if future fields need quoting; never splice arbitrary text.
-        if (arg.empty() || arg.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-:/,!=[]") != std::string::npos)
+        if (arg.empty() || arg.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-:/,!=[]+") != std::string::npos)
             invalid("firewall restore token requires unsupported quoting");
         if (!line.empty()) line += ' ';
         line += arg;
@@ -94,12 +94,17 @@ std::vector<std::string> FirewallRule::arguments() const {
     if ((target == "MASQUERADE" && (table != "nat" || chain != "POSTROUTING")) ||
         (target == "DNAT" && (table != "nat" || (chain != "PREROUTING" && chain != "OUTPUT")))) invalid("invalid NAT hook");
     if (negate_output && output.empty()) invalid("negated firewall output missing");
+    auto interface = [](const std::string& name, bool prefix) {
+        Netbox::interface_name(name);
+        if (prefix && name.size() >= 15) invalid("firewall interface prefix is too long");
+        return name + (prefix ? "+" : "");
+    };
+    if ((input_prefix && input.empty()) || (output_prefix && output.empty())) invalid("firewall interface prefix missing");
     std::vector<std::string> args;
-    if (!input.empty()) { Netbox::interface_name(input); args.insert(args.end(), {"-i", input}); }
+    if (!input.empty()) args.insert(args.end(), {"-i", interface(input, input_prefix)});
     if (!output.empty()) {
-        Netbox::interface_name(output);
         if (negate_output) args.push_back("!");
-        args.insert(args.end(), {"-o", output});
+        args.insert(args.end(), {"-o", interface(output, output_prefix)});
     }
     for (const auto& [flag, address] : {std::pair{"-s", source}, std::pair{"-d", destination}})
         if (!address.empty()) args.insert(args.end(), {flag, config::NetworkPrefix::parse(address, ipv6).network()});
@@ -129,6 +134,7 @@ Json::Value FirewallRule::json() const {
     arguments();
     Json::Value result;
     result["ipv6"] = ipv6; result["negate_output"] = negate_output; result["established"] = established;
+    result["input_prefix"] = input_prefix; result["output_prefix"] = output_prefix;
     result["table"] = table; result["chain"] = chain; result["input"] = input; result["output"] = output;
     result["source"] = source; result["destination"] = destination; result["protocol"] = protocol; result["target"] = target;
     result["port_first"] = port_first; result["port_last"] = port_last; result["translated_address"] = translated_address;
@@ -137,6 +143,11 @@ Json::Value FirewallRule::json() const {
 }
 FirewallRule FirewallRule::from(const Json::Value& value) {
     FirewallRule rule;
+    for (const auto& [key, field] : {std::pair{"input_prefix", &rule.input_prefix}, {"output_prefix", &rule.output_prefix}}) {
+        if (!value.isMember(key)) continue; // schema-1 exact-interface journals
+        if (!value[key].isBool()) invalid("invalid stored firewall prefix selector");
+        *field = value[key].asBool();
+    }
     for (const auto& [key, field] : {std::pair{"ipv6", &rule.ipv6}, {"negate_output", &rule.negate_output}, {"established", &rule.established}}) {
         if (!value[key].isBool()) invalid("invalid stored firewall boolean");
         *field = value[key].asBool();

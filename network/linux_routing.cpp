@@ -15,14 +15,8 @@ RoutingTables RoutingTables::from(const std::vector<PolicyRule>& ipv4, const std
     return result;
 }
 std::vector<VlanRoutes> linux_route_plan(const LinuxPlan& plan, const PdAddresses& pd) {
-    for (const auto& [id, address] : pd) {
-        bool found = false;
-        for (const auto& vlan : plan.vlans) if (vlan.id == id && vlan.pd) found = true;
-        if (!found || address.empty()) throw ServiceError(ErrorCode::invalid_argument, "live PD address is not for a configured PD VLAN");
-        config::NetworkPrefix::parse(address, true);
-    }
     std::vector<VlanRoutes> result;
-    for (const auto& vlan : plan.vlans) {
+    for (const auto& vlan : linux_live_plan(plan, pd).vlans) {
         VlanRoutes row; row.device = vlan.device;
         for (const bool ipv6 : {false, true}) {
             std::set<std::string> unique;
@@ -31,7 +25,6 @@ std::vector<VlanRoutes> linux_route_plan(const LinuxPlan& plan, const PdAddresse
                 if (unique.insert(prefix).second) row.prefixes[ipv6].push_back(prefix);
             };
             for (const auto& address : vlan.addresses[ipv6]) add(address);
-            if (ipv6 && vlan.pd) if (const auto at = pd.find(vlan.id); at != pd.end()) add(at->second);
         }
         result.push_back(std::move(row));
     }

@@ -5,7 +5,6 @@
 #include <map>
 
 namespace droidvm::network {
-using PdAddresses = std::map<int, std::string>; // only authoritative live host CIDRs
 struct RoutingTables {
     std::array<std::vector<uint32_t>, 2> upstream, returns;
     static RoutingTables from(const std::vector<PolicyRule>& ipv4, const std::vector<PolicyRule>& ipv6);

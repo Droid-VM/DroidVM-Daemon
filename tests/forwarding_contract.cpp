@@ -4,6 +4,7 @@
 #include "contracts.h"
 #include "network/forwarding.h"
 #include "network/firewall.h"
+#include "network/linux_firewall.h"
 #include "network/netbox.h"
 #include "network/netlink.h"
 #include "services/network.h"
@@ -92,25 +93,28 @@ uint16_t checksum(const uint8_t* data, size_t size, uint32_t sum = 0) {
 }
 struct Path {
     Netbox netbox{executable};
-    Fd input{open_transient_tap("fwin")}, output{open_transient_tap("fwout")};
+    std::string input_name, output_name;
+    Fd input, output;
     std::array<uint8_t, 6> router{};
-    Path() {
+    Path(std::string ingress = "fwin", std::string egress = "fwout")
+        : input_name(std::move(ingress)), output_name(std::move(egress)),
+          input(open_transient_tap(input_name)), output(open_transient_tap(output_name)) {
         check(fcntl(input.get(), F_SETFL, O_NONBLOCK) == 0 && fcntl(output.get(), F_SETFL, O_NONBLOCK) == 0, "nonblocking test TAPs");
         int header_size = 10;
         check(ioctl(input.get(), TUNSETVNETHDRSZ, &header_size) == 0 && ioctl(output.get(), TUNSETVNETHDRSZ, &header_size) == 0,
             "set existing TAP adapter's virtio header size");
-        for (const auto* name : {"fwin", "fwout"}) netbox.state(name, true);
-        netbox.address("fwin", "198.18.201.1/24", true); netbox.address("fwout", "198.18.202.1/24", true);
-        netbox.address("fwin", "fd91:fe21:201::1/64", true); netbox.address("fwout", "fd91:fe21:202::1/64", true);
+        for (const auto& name : {input_name, output_name}) netbox.state(name, true);
+        netbox.address(input_name, "198.18.201.1/24", true); netbox.address(output_name, "198.18.202.1/24", true);
+        netbox.address(input_name, "fd91:fe21:201::1/64", true); netbox.address(output_name, "fd91:fe21:202::1/64", true);
         Fd socket(::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
-        ifreq request{}; std::copy_n("fwin", 5, request.ifr_name);
+        ifreq request{}; std::copy(input_name.begin(), input_name.end(), request.ifr_name);
         check(socket.get() >= 0 && ioctl(socket.get(), SIOCGIFHWADDR, &request) == 0, "read ingress TAP MAC");
         std::copy_n(reinterpret_cast<uint8_t*>(request.ifr_hwaddr.sa_data), 6, router.begin());
         for (const bool ipv6 : {false, true}) {
             NetlinkMessage<ndmsg> message;
             message.header.nlmsg_type = RTM_NEWNEIGH; message.header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
             message.payload.ndm_family = ipv6 ? AF_INET6 : AF_INET;
-            message.payload.ndm_ifindex = if_nametoindex("fwout"); message.payload.ndm_state = NUD_PERMANENT;
+            message.payload.ndm_ifindex = if_nametoindex(output_name.c_str()); message.payload.ndm_state = NUD_PERMANENT;
             std::array<uint8_t, 16> address{};
             check(inet_pton(message.payload.ndm_family, ipv6 ? "fd91:fe21:202::2" : "198.18.202.2", address.data()) == 1, "parse peer IP");
             const uint8_t mac[]{2, 0, 0, 0, 0, 2};
@@ -118,7 +122,8 @@ struct Path {
             netlink_exchange(message.header);
         }
     }
-    bool packet(bool ipv6, uint8_t sequence, const std::string& expected_source = {}) {
+    bool packet(bool ipv6, uint8_t sequence, const std::string& expected_source = {}, const std::string& from = {}) {
+        const auto source_ip = from.empty() ? std::string(ipv6 ? "fd91:fe21:201::2" : "198.18.201.2") : from;
         const size_t ip_size = ipv6 ? 40 : 20, udp = 14 + ip_size;
         std::vector<uint8_t> packet(udp + 12, 0);
         auto word = [&](size_t at, uint16_t value) { packet[at] = value >> 8; packet[at + 1] = value & 255; };
@@ -126,11 +131,11 @@ struct Path {
         word(12, ipv6 ? 0x86dd : 0x0800);
         if (ipv6) {
             packet[14] = 0x60; word(18, 12); packet[20] = 17; packet[21] = 64;
-            check(inet_pton(AF_INET6, "fd91:fe21:201::2", packet.data() + 22) == 1 &&
+            check(inet_pton(AF_INET6, source_ip.c_str(), packet.data() + 22) == 1 &&
                 inet_pton(AF_INET6, "fd91:fe21:202::2", packet.data() + 38) == 1, "encode IPv6 packet");
         } else {
             packet[14] = 0x45; word(16, ip_size + 12); packet[22] = 64; packet[23] = 17;
-            check(inet_pton(AF_INET, "198.18.201.2", packet.data() + 26) == 1 &&
+            check(inet_pton(AF_INET, source_ip.c_str(), packet.data() + 26) == 1 &&
                 inet_pton(AF_INET, "198.18.202.2", packet.data() + 30) == 1, "encode IPv4 packet");
             word(24, checksum(packet.data() + 14, ip_size));
         }
@@ -156,7 +161,7 @@ struct Path {
                 !std::equal(packet.begin() + udp, packet.end(), bytes + udp)) continue;
             check(bytes[ipv6 ? 21 : 22] == 63, "kernel routed packet and decremented hop count");
             std::array<uint8_t, 16> source{};
-            const auto text = expected_source.empty() ? (ipv6 ? "fd91:fe21:201::2" : "198.18.201.2") : expected_source.c_str();
+            const auto text = expected_source.empty() ? source_ip.c_str() : expected_source.c_str();
             check(inet_pton(ipv6 ? AF_INET6 : AF_INET, text, source.data()) == 1 &&
                 std::equal(source.begin(), source.begin() + (ipv6 ? 16 : 4), bytes + (ipv6 ? 22 : 26)), "forwarded source address matches expected NAT behavior");
             return true;
@@ -268,6 +273,78 @@ void firewall_packet_contract(const std::string& netbox, const std::string& work
     }
     for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
     check(rmdir(place.c_str()) == 0, "packet firewall fixture empty");
+}
+void linux_firewall_packet_contract(const std::string& netbox, const std::string& work) {
+    executable = netbox; set_forwarding(0);
+    auto config = configuration("Linux policy packets"); config["bridge_name"] = "brfp";
+    config["l3"]["vlans"].append(wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":false},
+        "ipv6":{"source":"static","cidr":"fd91:fe21:201::1/64"}})"));
+    Forwarding forwarding; auto demand = forwarding.acquire(config);
+    const auto place = work + "/planned-packets";
+    check(mkdir(place.c_str(), 0700) == 0, "create planned packet inventory");
+    Fd fd(open(place.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)); Iptables iptables;
+    OwnedFirewall owner(fd.get(), getuid(), iptables);
+    auto filters = [&](const LinuxFirewallPlan& plan) {
+        for (const bool ipv6 : {false, true}) owner.replace_table(plan.owner, ipv6, "filter", plan.filter[ipv6]);
+    };
+    // This private fixture has one controlled flow. It verifies generated
+    // rules, not cross-table publication/readiness of a production backend.
+    const auto base = linux_firewall_plan(config);
+    uint8_t sequence = 80;
+    for (const std::string egress : {"eth0", "wlan0", "rmnet_data0", "tun0", "usb0", "veth0", "brfp.7"}) {
+        Path path("brfp", egress);
+        if (egress == "eth0") {
+            check(path.packet(false, sequence++, {}, "198.19.201.2") && path.packet(true, sequence++, {}, "fd91:fe21:901::2"),
+                "baseline routes unapproved source addresses before policy filtering");
+            filters(base); owner.replace_table(base.owner, false, "mangle", base.mangle4);
+        }
+        const bool inter = egress == "brfp.7", allowed = inter || (egress != "usb0" && egress != "veth0");
+        check(path.packet(false, sequence++) == allowed && path.packet(true, sequence++) == allowed,
+            "actual dual-stack forwarding follows external allowlist or inter-VLAN prefix");
+        check(path.packet(false, sequence++, {}, "198.19.201.2") == inter && path.packet(true, sequence++, {}, "fd91:fe21:901::2") == inter,
+            "external forwarding checks source subnet while legacy inter-VLAN acceptance remains scoped to bridge prefix");
+        if (egress == "eth0" || inter) {
+            auto nat = config; nat["l3"]["vlans"][0]["ipv4"]["snat"] = true;
+            owner.replace_table(base.owner, false, "nat", linux_firewall_plan(nat).nat4);
+            check(path.packet(false, sequence++, inter ? "198.18.201.2" : "198.18.202.1"), "planned SNAT rewrites only non-bridge egress");
+            owner.replace_table(base.owner, false, "nat", {});
+            check(path.packet(false, sequence++), "disabling planned SNAT preserves original source");
+        }
+        if (egress == "eth0") {
+            auto pd = config; auto& vlan = pd["l3"]["vlans"][0];
+            vlan["ipv6"]["source"] = "dhcp_pd"; vlan["ipv6"]["cidr"] = "fd91:fe21:999::1/64";
+            vlan["ipv6"]["pd"]["uplink"] = "eth0";
+            auto apply = [&](const PdAddresses& lease) { owner.replace_table(base.owner, true, "filter", linux_firewall_plan(pd, lease).filter[1]); };
+            apply({}); check(!path.packet(true, sequence++), "absent PD does not authorize configured placeholder or former static subnet");
+            apply({{0, "fd91:fe21:201::1/64"}}); check(path.packet(true, sequence++), "authoritative live PD enables actual guest forwarding");
+            apply({{0, "fd91:fe21:203::1/64"}}); check(!path.packet(true, sequence++), "changed delegation revokes former subnet for new flows");
+            apply({}); check(!path.packet(true, sequence++), "PD withdrawal keeps unknown subnet blocked");
+            vlan["ipv6_secondary"].append("fd91:fe21:201::1/64"); apply({});
+            check(path.packet(true, sequence++), "static IPv6 secondary remains available without a live delegation");
+            owner.replace_table(base.owner, true, "filter", base.filter[1]);
+        }
+    }
+    // Reverse topology: the packet enters via a host uplink and is routed to
+    // the guest-facing interface. Its destination, not source, is scoped.
+    config["l3"]["vlans"][0]["ipv4"]["cidr"] = "198.18.202.1/24";
+    config["l3"]["vlans"][0]["ipv6"]["cidr"] = "fd91:fe21:202::1/64";
+    filters(linux_firewall_plan(config));
+    for (const std::string ingress : {"eth0", "usb0"}) {
+        Path path(ingress, "brfp");
+        const bool allowed = ingress == "eth0";
+        check(path.packet(false, sequence++) == allowed && path.packet(true, sequence++) == allowed,
+            "inbound uplink traffic uses exact guest device and external interface allowlist");
+        if (allowed) {
+            auto other = config; other["l3"]["vlans"][0]["ipv4"]["cidr"] = "198.18.203.1/24";
+            other["l3"]["vlans"][0]["ipv6"]["cidr"] = "fd91:fe21:203::1/64";
+            filters(linux_firewall_plan(other));
+            check(!path.packet(false, sequence++) && !path.packet(true, sequence++), "inbound acceptance requires a configured destination subnet");
+            filters(linux_firewall_plan(config));
+        }
+    }
+    check(owner.cleanup(base.owner).empty(), "planned policy exact cleanup");
+    for (const char* name : {"network-firewall.json", "network-firewall.json.bak"}) unlinkat(fd.get(), name, 0);
+    check(rmdir(place.c_str()) == 0, "planned packet fixture empty");
 }
 void forwarding_namespace_contract(const std::string& netbox, const std::string& work) {
     const auto path = work + "/forwarding";

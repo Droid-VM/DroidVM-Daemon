@@ -2,6 +2,7 @@
 #include "firewall_contract.h"
 #include "contracts.h"
 #include "network/firewall.h"
+#include "network/linux_firewall.h"
 #include "network/links.h"
 #include "common/identity.h"
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/syscall.h>
+#include <set>
 
 namespace droidvm::test {
 namespace {
@@ -371,7 +373,7 @@ void batch_crash_boundaries() {
     }
 }
 void actual_daemon_recovery() {
-    Case test; const auto desired = rule();
+    Case test; auto desired = rule(); desired.input_prefix = true;
     OwnedFirewall owner(test.fd.get(), getuid(), test.iptables); owner.put("test", "test", desired);
     const auto identity = tag(owner);
     test.iptables.erase(desired, identity); auto changed = desired; changed.target = "DROP"; test.iptables.insert(changed, identity);
@@ -407,21 +409,88 @@ void actual_daemon_recovery() {
     test.finish();
 }
 void packets() { firewall_packet_contract(executable, directory); }
+void planned_packets() { linux_firewall_packet_contract(executable, directory); }
+void prefix_rules_and_old_journal() {
+    Case test; OwnedFirewall owned(test.fd.get(), getuid(), test.iptables);
+    for (const bool ipv6 : {false, true}) {
+        auto value = rule(ipv6); value.input = "brfp"; value.input_prefix = true; value.output = "eth"; value.output_prefix = true;
+        owned.put("prefix", "rule", value);
+        check(test.iptables.contains(value, tag(owned, "rule")), "typed prefixes accepted by actual iptables family");
+        OwnedFirewall restored(test.fd.get(), getuid(), test.iptables);
+        restored.put("prefix", "rule", value);
+        check(tag(restored, "rule") == tag(owned, "rule") && test.iptables.tagged(value, tag(restored, "rule")) == 1,
+            "prefix identity is stable across reload without duplicate kernel rules");
+        owned.remove("prefix", "rule");
+        auto old = rule(ipv6).json(); old.removeMember("input_prefix"); old.removeMember("output_prefix");
+        check(FirewallRule::from(old).arguments() == rule(ipv6).arguments(), "previous schema-1 records still mean exact interfaces");
+        auto bad = value; bad.input = "brfp+";
+        error(ErrorCode::invalid_argument, [&] { bad.arguments(); });
+        bad = value; bad.output.clear();
+        error(ErrorCode::invalid_argument, [&] { bad.arguments(); });
+        bad = value; bad.input = "abcdefghijklmno";
+        error(ErrorCode::invalid_argument, [&] { bad.arguments(); });
+    }
+    owned.put("old", "exact", rule());
+    auto old = owned.inventory(); old["rules"][0]["rule"].removeMember("input_prefix"); old["rules"][0]["rule"].removeMember("output_prefix");
+    config::JsonFile(test.fd.get(), "network-firewall.json", getuid()).save(old);
+    OwnedFirewall restored(test.fd.get(), getuid(), test.iptables);
+    check(restored.recover_all().empty() && !test.iptables.tagged(rule(), tag(owned, "exact")), "real old-format journal recovers exact interface rule");
+    test.finish();
 }
-void firewall_namespace_contract(const std::string& netbox, const std::string& work, const std::string& daemon) {
-    const auto path = work + "/firewall";
+void linux_policy_plan() {
+    auto config = wire::parse(R"({"schema":2,"name":"firewall","bridge_type":"linux","bridge_name":"brfp","uplink_mode":"l3",
+        "l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"198.18.201.1/24","snat":true},
+        "ipv4_secondary":["198.18.201.9/24","198.18.203.1/24"],"ipv6":{"source":"dhcp_pd","cidr":"fd91:fe21:999::1/64","pd":{"uplink":"eth0"}},
+        "ipv6_secondary":["fd91:fe21:203::1/64"]}]}})");
+    config["id"] = random_id(true);
+    const auto before = linux_firewall_plan(config);
+    check(before.nat4.size() == 2 && before.mangle4.size() == 1, "SNAT deduplicates subnet aliases and preserves secondary subnet");
+    std::set<std::string> external;
+    for (const auto& row : before.filter[0]) {
+        check(row.rule.chain != "INPUT", "empty legacy IPv4 INPUT chain remains fallthrough");
+        if (row.rule.output_prefix && row.rule.output != "brfp") external.insert(row.rule.output);
+    }
+    check(external == std::set<std::string>({"wlan", "eth", "rmnet", "tun"}), "external allowlist is independent of discovery prefixes");
+    bool secondary = false;
+    for (const auto& row : before.filter[1]) {
+        check(row.rule.source.find("999") == std::string::npos && row.rule.destination.find("999") == std::string::npos, "PD placeholder never authorizes traffic");
+        if (row.rule.chain == "INPUT" && row.rule.destination == "fd91:fe21:203::1/128") secondary = true;
+    }
+    check(secondary, "static IPv6 secondary router remains usable while PD is absent");
+    const auto leased = linux_firewall_plan(config, {{0, "fd91:fe21:201::1/64"}});
+    size_t delegated = leased.filter[1].size(), inter = delegated;
+    for (size_t i = 0; i < leased.filter[1].size(); ++i) {
+        const auto& rule = leased.filter[1][i].rule;
+        if (rule.source == "fd91:fe21:201::/64" && delegated == leased.filter[1].size()) delegated = i;
+        if (rule.input_prefix && rule.output_prefix && rule.input == "brfp" && rule.output == "brfp") inter = i;
+    }
+    check(delegated < inter, "live PD retains legacy insertion precedence over static inter-VLAN rules");
+    error(ErrorCode::invalid_argument, [&] { linux_firewall_plan(config, {{2, "fd91:fe21:201::1/64"}}); });
+    config["l3"]["vlans"][0]["ipv4"].removeMember("snat");
+    check(linux_firewall_plan(config).nat4.empty(), "missing SNAT field uses existing false default");
+    config["uplink_mode"] = "l2"; config["l2"]["uplink"] = "Ethernet";
+    const auto l2 = linux_firewall_plan(config);
+    check(l2.filter[0].size() == 1 && l2.filter[1].empty() && l2.nat4.empty() && l2.mangle4.empty() &&
+        l2.filter[0][0].rule.input == "brfp" && l2.filter[0][0].rule.output == "brfp" && !l2.filter[0][0].rule.input_prefix,
+        "L2 is exactly one IPv4 bridge pair without L3 or prefix rules");
+}
+}
+void firewall_namespace_contract(const std::string& netbox, const std::string& work, const std::string& daemon, bool planned) {
+    const auto path = work + (planned ? "/linux-firewall" : "/firewall");
     check(mkdir(path.c_str(), 0700) == 0, "create firewall namespace fixture");
-    ChildOptions options; options.argv = {"/proc/self/exe", "--firewall-namespace", netbox, path, daemon};
+    ChildOptions options; options.argv = {"/proc/self/exe", planned ? "--linux-firewall-namespace" : "--firewall-namespace", netbox, path, daemon};
     const auto result = Child(options).communicate({}, 60s);
     std::cerr << "isolated firewall contracts: " << result.output << result.error << std::endl;
     check(result.exit_code == 0 && !result.timed_out && wire::parse(result.output)["passed"] == true, "isolated firewall contracts pass");
     check(rmdir(path.c_str()) == 0, "firewall namespace fixture empty");
 }
-int firewall_namespace_child(const std::string& netbox, const std::string& work, const std::string& program, bool orphan_only) {
+int firewall_namespace_child(const std::string& netbox, const std::string& work, const std::string& program, bool orphan_only, bool planned) {
     const auto scope = network_scope();
     if (unshare(CLONE_NEWNET) != 0 || same_scope(scope, network_scope())) return 70;
     executable = netbox; directory = work; daemon = program;
     if (orphan_only) return run({{"orphan_mutator_inherited_barrier", orphan_mutator_barrier}});
+    if (planned) return run({{"typed_prefix_and_old_journal", prefix_rules_and_old_journal}, {"linux_configuration_policy_plan", linux_policy_plan},
+        {"linux_policy_real_dual_stack_packets", planned_packets}});
     return run({{"typed_rules_and_real_dual_stack_tables", typed_rules_and_real_tables}, {"foreign_rules_and_ambiguity", foreign_rules_and_ambiguity},
         {"creation_deletion_races_and_write_failure", races_and_write_failures}, {"scope_and_corrupt_primary", inventory_scope_and_corruption},
         {"twelve_firewall_sigkill_boundaries", crash_boundaries}, {"actual_daemon_firewall_recovery", actual_daemon_recovery},
