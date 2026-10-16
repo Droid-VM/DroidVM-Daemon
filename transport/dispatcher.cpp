@@ -10,6 +10,7 @@
 #include <cmath>
 #include <array>
 #include <limits>
+#include <unistd.h>
 
 namespace droidvm {
 namespace {
@@ -20,7 +21,7 @@ constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_
 constexpr std::array network_commands{"network_create", "network_modify", "network_list", "network_info", "network_exists"};
 constexpr std::array vm_upload_commands{"vm_config_upload_begin", "vm_config_upload_append", "vm_config_upload_commit", "vm_config_upload_abort"};
 bool vm_upload_command(const std::string& command) { return std::find(vm_upload_commands.begin(), vm_upload_commands.end(), command) != vm_upload_commands.end(); }
-bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || vm_upload_command(command); }
+bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || command == "vm_start_configured" || vm_upload_command(command); }
 constexpr std::array host_commands{"network_list_interfaces", "network_list_uplinks", "network_list_host_addresses"};
 bool host_command(const std::string& command) {
     return std::find(host_commands.begin(), host_commands.end(), command) != host_commands.end();
@@ -163,12 +164,43 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
-    return (vm_config_ && (command == "vm_config_apply" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
+    return (vm_config_ && (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
         (runtime_ && runtime_command(command)) ||
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    if (vm_config_ && command == "vm_start_configured") {
+        try {
+            auto snapshot = vm_config_->snapshot(caller);
+            if (!vms_) throw ServiceError(ErrorCode::unavailable, "VM runtime unavailable");
+            for (const auto& key : request.getMemberNames())
+                if (key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry")
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected configured start field");
+            const auto revision = string_field(request, "revision");
+            const auto id = string_field(request, "vm_id");
+            if (revision.empty() || id.empty()) throw ServiceError(ErrorCode::invalid_argument, "Missing revision or VM ID");
+            if (snapshot->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
+            if (snapshot->durability_uncertain) throw ServiceError(ErrorCode::commit_uncertain, "VM configuration durability is uncertain");
+            const auto boot = request.isMember("boot_entry") ? string_field(request, "boot_entry") : std::string();
+            for (const auto& row : snapshot->document["vms"]) if (row["id"] == id) {
+                if (request["overrides"].isObject() && request["overrides"].isMember("pseudo_unprotected")) {
+                    vm::HostFacts facts;
+                    facts.has_kvm = access("/dev/kvm", F_OK) == 0;
+                    facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
+                    if (config::java_enum(row, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "CROSVM" || !vm::resolves_to_gunyah(row, facts))
+                        throw ServiceError(ErrorCode::invalid_argument, "Protection override requires crosvm with Gunyah");
+                }
+                if (!vms_->start_configured(caller, id, row, request["overrides"], boot.empty() ? std::nullopt : std::optional(boot)))
+                    throw ServiceError(ErrorCode::conflict, "VM start was not admitted; reload state before retrying");
+                Json::Value result;
+                result["success"] = true; result["vm_id"] = id; result["revision"] = revision;
+                return result;
+            }
+            throw ServiceError(ErrorCode::not_found, "VM not found");
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "VM start outcome is unknown; reload state before retrying")); }
+    }
     if (vm_uploads_ && vm_upload_command(command)) {
         try {
             if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
@@ -602,6 +634,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : vm_upload_commands) result["commands"].append(name);
                 result["vm_config_upload"] = "revisioned-chunks-v1";
                 result["service_api_minor"] = 15;
+                if (vms_) {
+                    result["commands"].append("vm_start_configured");
+                    result["vm_config_start"] = "revisioned-session-v1";
+                    result["service_api_minor"] = 16;
+                }
             }
         }
         return result;
@@ -616,7 +653,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         } else if (command == "vm_config_snapshot") {
             if (!vm_config_->has_events()) throw ServiceError(ErrorCode::unavailable, "VM configuration view unavailable");
             return snapshot_json(tasks_.vm_config_snapshot(caller, size_field(request, "max_bytes", 256u << 10)));
-        } else if (command == "vm_config_apply" || vm_upload_command(command)) {
+        } else if (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command)) {
             // Server dispatches this to the bounded worker pool. Also support
             // direct adapter callers without a second implementation.
             return execute_background(caller, command, request);

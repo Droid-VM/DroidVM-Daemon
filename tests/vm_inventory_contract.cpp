@@ -223,6 +223,36 @@ void configured_start_binding() {
     store.replace(admin, view->revision, changed);
     error(ErrorCode::not_found, [&] { inventory.start_configured(admin, id, updated); });
 }
+void configured_start_adapter() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    TaskService tasks;
+    VmConfigService store(directory.get(), getuid(), {}, [&](const Json::Value& doc) { return inventory.prepare_config(doc); }, &tasks);
+    SystemService system([] { return true; }, [] { return "test"; }, "test", tasks.epoch());
+    RequestDispatcher dispatcher(system, tasks, nullptr, nullptr, nullptr, nullptr, &inventory);
+    ClientSession session; session.caller.authorized = true;
+    check(!dispatcher.execute(session, "capabilities", {}).isMember("vm_config_start"), "legacy runtime does not advertise configured start");
+    dispatcher.set_vm_config(&store);
+    check(dispatcher.execute(session, "capabilities", {})["vm_config_start"] == "revisioned-session-v1" && dispatcher.background("vm_start_configured"), "configured start is an advertised worker operation");
+    auto view = store.snapshot(admin);
+    auto doc = view->document; auto vm = config("adapter-start"); vm["backend"] = "qemu";
+    doc["vms"].append(vm); view = store.replace(admin, view->revision, doc);
+    Json::Value request; request["revision"] = view->revision; request["vm_id"] = vm["id"];
+    auto denied = [&](const CallContext& caller, const Json::Value& input, const char* code) {
+        const auto result = dispatcher.execute_background(caller, "vm_start_configured", input);
+        check(result["success"] == false && result["error"]["code"] == code, "configured start structured error");
+    };
+    denied({}, request, "UNAUTHENTICATED"); denied(owner, request, "PERMISSION_DENIED");
+    auto bad = request; bad["revision"] = "stale"; denied(admin, bad, "CONFLICT");
+    bad = request; bad["config"] = vm; denied(admin, bad, "INVALID_ARGUMENT");
+    bad = request; bad["overrides"]["pseudo_unprotected"] = true; denied(admin, bad, "INVALID_ARGUMENT");
+    bad = request; bad["vm_id"] = random_id(true); denied(admin, bad, "NOT_FOUND");
+    check(fixture.starts == 0, "invalid requests have no runtime side effects");
+    denied(admin, request, "CONFLICT");
+    check(fixture.starts == 1 && store.snapshot(admin) == view, "matching revision reaches admission without rewriting configuration");
+    check(dispatcher.execute(session, "vm_start_configured", request)["error"]["code"] == "CONFLICT", "direct dispatch shares configured start implementation");
+}
 void persistent_inventory_commit() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -421,6 +451,7 @@ int main() {
         {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
         {"persistent_inventory_commit", persistent_inventory_commit},
         {"configured_start_binding", configured_start_binding},
+        {"configured_start_adapter", configured_start_adapter},
         {"persistent_busy_and_unchanged", persistent_busy_and_unchanged},
         {"persistent_publication_and_writers", persistent_publication_and_writers},
         {"revisioned_batch_adapter", revisioned_batch_adapter}});
