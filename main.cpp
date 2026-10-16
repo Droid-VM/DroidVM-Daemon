@@ -12,6 +12,7 @@
 #include "network/linux_bridge.h"
 #include "network/pd_ownership.h"
 #include "network/ports.h"
+#include "network/pbridge.h"
 #include "store/network_config.h"
 #include "common/wire.h"
 #include "transport/server.h"
@@ -104,6 +105,7 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::network::OwnedRules> owned_rules;
             std::unique_ptr<droidvm::network::OwnedRoutes> owned_routes;
             std::unique_ptr<droidvm::network::OwnedPorts> owned_ports;
+            std::unique_ptr<droidvm::network::PbridgeOwnership> owned_pbridge;
             if (layout) {
                 netbox = std::make_unique<droidvm::network::Netbox>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
@@ -112,6 +114,10 @@ int main(int argc, char** argv) {
                 const auto rule_failures = owned_rules->recover_all();
                 if (!rule_failures.empty()) throw std::runtime_error("Network rule recovery incomplete: " + droidvm::wire::stringify(rule_failures));
                 owned_routes = std::make_unique<droidvm::network::OwnedRoutes>(instance->directory_fd(), layout->owner(), *owned_links);
+                // pbridge veth ends are foreign ports of owned bridges too.
+                owned_pbridge = std::make_unique<droidvm::network::PbridgeOwnership>(instance->directory_fd(), layout->owner(), *netbox);
+                const auto pbridge_failures = owned_pbridge->recover_all();
+                if (!pbridge_failures.empty()) throw std::runtime_error("Network pbridge recovery incomplete: " + droidvm::wire::stringify(pbridge_failures));
                 owned_ports = std::make_unique<droidvm::network::OwnedPorts>(instance->directory_fd(), layout->owner(), *netbox);
                 const auto port_failures = owned_ports->recover_all(); // foreign uplinks leave owned bridges first
                 if (!port_failures.empty()) throw std::runtime_error("Network port recovery incomplete: " + droidvm::wire::stringify(port_failures));
@@ -142,8 +148,8 @@ int main(int argc, char** argv) {
                         if (droidvm::config::string(config, "bridge_type") == "gvisor")
                             return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime);
                         return std::make_unique<droidvm::network::LinuxBridge>(droidvm::network::LinuxBridge::Resources{
-                            *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, pd_ownership, *owned_ports, switch_runtime,
-                            (binaries / "bridgedhcp").string(), files.get()});
+                            *netbox, *owned_links, *owned_rules, *owned_routes, linux_firewall, pd_ownership, *owned_ports, *owned_pbridge, switch_runtime,
+                            (binaries / "bridgedhcp").string(), (binaries / "pbridge").string(), files.get()});
                     });
                 network_runtime->request_autostart({"network-autostart", true, true, true});
                 if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");

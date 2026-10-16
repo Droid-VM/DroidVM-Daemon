@@ -15,7 +15,7 @@ void require(bool ok, const char* operation) {
 }
 std::string kind(const Json::Value& entry) { return entry.get("kind", "gvswitch").asString(); }
 bool valid_name(const std::string& name, const std::string& kind) {
-    return name.size() == 35 && name.starts_with(kind == "gvswitch" ? "gv-" : "dh-") &&
+    return name.size() == 35 && name.starts_with(kind == "gvswitch" ? "gv-" : kind == "pbridge" ? "pb-" : "dh-") &&
         name.substr(3).find_first_not_of("0123456789abcdef") == std::string::npos;
 }
 }
@@ -35,7 +35,7 @@ SwitchRuntime::SwitchRuntime(int directory, uid_t owner, Observer observer, conf
     std::set<std::pair<std::string, std::string>> owners;
     for (const auto& entry : document_["switches"]) {
         if (!entry.isObject() || (entry.isMember("kind") && !entry["kind"].isString()) ||
-            (kind(entry) != "gvswitch" && kind(entry) != "bridgedhcp") ||
+            (kind(entry) != "gvswitch" && kind(entry) != "bridgedhcp" && kind(entry) != "pbridge") ||
             !entry["name"].isString() || !valid_name(entry["name"].asString(), kind(entry)) ||
             !entry["owner"].isString() || entry["owner"].asString().empty() || entry["owner"].asString().size() > 128 ||
             !entry["device"].isUInt64() || !entry["inode"].isUInt64() ||
@@ -67,8 +67,8 @@ void SwitchRuntime::allocate(const std::string& owner, Allocation& allocation, K
     if (!allocation.name.empty() || allocation.directory.get() >= 0) throw std::logic_error("switch allocation is not empty");
     if (owner.empty() || owner.size() > 128 || owner.find('\0') != std::string::npos)
         throw std::invalid_argument("invalid switch runtime owner");
-    const std::string type = helper_kind == Kind::gvswitch ? "gvswitch" : "bridgedhcp";
-    const auto name = std::string(helper_kind == Kind::gvswitch ? "gv-" : "dh-") + random_id(false);
+    const std::string type = helper_kind == Kind::gvswitch ? "gvswitch" : helper_kind == Kind::pbridge ? "pbridge" : "bridgedhcp";
+    const auto name = std::string(helper_kind == Kind::gvswitch ? "gv-" : helper_kind == Kind::pbridge ? "pb-" : "dh-") + random_id(false);
     {
         std::lock_guard lock(mutex_);
         for (const auto& row : document_["switches"]) if (row["owner"] == owner && kind(row) == type)

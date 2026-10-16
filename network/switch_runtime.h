@@ -9,7 +9,7 @@ namespace droidvm::network {
 // Owners serialize operations on one entry and drain workers before recovery.
 class SwitchRuntime {
 public:
-    enum class Kind { gvswitch, bridgedhcp };
+    enum class Kind { gvswitch, bridgedhcp, pbridge };
     struct Allocation { std::string name; Fd directory; };
     using Observer = std::function<void(const char*)>;
     SwitchRuntime(int directory, uid_t owner, Observer observer = {}, config::JsonFile::Observer file_observer = {});

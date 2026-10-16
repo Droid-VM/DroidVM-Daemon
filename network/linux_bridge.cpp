@@ -13,7 +13,8 @@ std::string bridge_mac(const Json::Value& config) {
     const auto configured = config::string(config, "uplink_mode") == "l2" ? "" : config::string(config::member(config, "l3"), "mac_address");
     return configured.empty() ? config::string(config, "generated_mac") : configured;
 }
-std::string l2_uplink(const Json::Value& config) {
+struct L2Uplink { std::string name; bool pseudo; };
+L2Uplink l2_uplink(const Json::Value& config) {
     const auto& l2 = config::member(config, "l2");
     const auto configured = config::string(l2, "uplink");
     const auto snapshot = UplinkSnapshot::scan();
@@ -21,9 +22,11 @@ std::string l2_uplink(const Json::Value& config) {
     if (!uplink) throw ServiceError(ErrorCode::unavailable, "Uplink \"" + configured + "\" not found");
     // Legacy: honor the toggle, but force pseudo-bridging for a device that
     // cannot be enslaved (Wi-Fi STA / non-Ethernet).
-    if (config::boolean(l2, "pseudo_bridge", true) || snapshot.assume_dont_bridge(*uplink))
-        throw ServiceError(ErrorCode::unavailable, "Native pseudo-bridge (pbridge) uplinks are not implemented yet");
-    return *uplink;
+    return {*uplink, config::boolean(l2, "pseudo_bridge", true) || snapshot.assume_dont_bridge(*uplink)};
+}
+// Per-network veth names keep pbridge instances sharing an uplink apart.
+std::string pbridge_port(const Json::Value& config, const char* suffix) {
+    return config::string(config, "bridge_name").substr(0, 12) + suffix;
 }
 struct PdVlan { int vlan; uint32_t table; std::string uplink; };
 std::vector<PdVlan> pd_vlans(const Json::Value& config) {
@@ -52,7 +55,13 @@ std::map<int, std::string> resolve(const Json::Value& config) {
 }
 LinuxBridge::LinuxBridge(Resources resources)
     : resources_(std::move(resources)), topology_(resources_.netbox, resources_.links),
-      dhcp_(resources_.dhcp_executable, resources_.runtime, resources_.dhcp_state_directory) {}
+      dhcp_(resources_.dhcp_executable, resources_.runtime, resources_.dhcp_state_directory),
+      pbridge_(resources_.pbridge_executable, resources_.runtime) {}
+void LinuxBridge::start_pbridge() {
+    const auto fwd0 = pbridge_port(config_, "-pi"), fwd1 = pbridge_port(config_, "-pb");
+    pbridge_registered_ = true; resources_.pbridge.acquire(firewall_owner_, uplink_, fwd0, fwd1);
+    pbridge_.start(firewall_owner_, uplink_, config::string(config_, "bridge_name"), fwd0, fwd1);
+}
 void LinuxBridge::start_dhcp(std::map<int, std::string> uplinks) {
     // Register every delegation durably before the helper can touch the host.
     for (const auto& vlan : pd_vlans(config_)) if (const auto at = uplinks.find(vlan.vlan); at != uplinks.end()) {
@@ -62,20 +71,21 @@ void LinuxBridge::start_dhcp(std::map<int, std::string> uplinks) {
     dhcp_needed_ = dhcp_.start(config_, {}, std::move(uplinks));
 }
 void LinuxBridge::start(const Json::Value& config) {
-    if (running_ || routing_ || !firewall_owner_.empty() || pd_registered_)
+    if (running_ || routing_ || !firewall_owner_.empty() || pd_registered_ || pbridge_registered_)
         throw ServiceError(ErrorCode::conflict, "Linux network requires cleanup before start");
     const auto plan = linux_plan(config);
-    const auto uplink = plan.l3 ? std::string() : l2_uplink(config);
+    const auto uplink = plan.l3 ? L2Uplink{} : l2_uplink(config);
     try {
         // Guard bridge scopes before any guest-facing link comes up.
-        config_ = config; pd_.clear(); l3_ = plan.l3;
+        config_ = config; pd_.clear(); l3_ = plan.l3; pseudo_ = uplink.pseudo; uplink_ = uplink.name;
         firewall_owner_ = plan.owner; resources_.firewall.set(config);
         topology_.start(config, bridge_mac(config));
         if (l3_) {
             routing_ = std::make_unique<LinuxRouting>(config, resources_.rules, resources_.routes);
             routing_->refresh({}, resources_.pd.tables());
             start_dhcp(resolve(config));
-        } else resources_.ports.attach(plan.owner, uplink, plan.bridge);
+        } else if (pseudo_) start_pbridge();
+        else resources_.ports.attach(plan.owner, uplink_, plan.bridge);
         running_ = true; rebuild_ = false;
     } catch (const std::exception& error) {
         const std::string detail = error.what();
@@ -85,7 +95,7 @@ void LinuxBridge::start(const Json::Value& config) {
     }
 }
 bool LinuxBridge::healthy() const {
-    return running_ && !rebuild_ && (!dhcp_needed_ || dhcp_.healthy());
+    return running_ && !rebuild_ && (!dhcp_needed_ || dhcp_.healthy()) && (!pseudo_ || pbridge_.healthy());
 }
 void LinuxBridge::refresh() {
     if (!running_) throw ServiceError(ErrorCode::unavailable, "Linux network is stopped");
@@ -94,9 +104,9 @@ void LinuxBridge::refresh() {
     if (!l3_) {
         // A replugged uplink is a new device: retire the stale record, then
         // attach whatever the configured identifier resolves to now.
-        if (!resources_.ports.attached(firewall_owner_)) {
+        if (!pseudo_ && !resources_.ports.attached(firewall_owner_)) {
             resources_.ports.release(firewall_owner_);
-            resources_.ports.attach(firewall_owner_, l2_uplink(config_), config::string(config_, "bridge_name"));
+            resources_.ports.attach(firewall_owner_, l2_uplink(config_).name, config::string(config_, "bridge_name"));
         }
         resources_.firewall.refresh(); return;
     }
@@ -121,6 +131,13 @@ void LinuxBridge::refresh() {
     resources_.firewall.refresh();
 }
 void LinuxBridge::recover(const Json::Value& config) {
+    if (running_ && !rebuild_ && pseudo_ && !pbridge_.healthy()) {
+        // Stateless forwarder: a fresh process rebuilds the data path once
+        // the dead one's veth and proxies are retired.
+        topology_.verify(); pbridge_.stop();
+        resources_.pbridge.release(firewall_owner_); pbridge_registered_ = false;
+        start_pbridge(); return;
+    }
     if (running_ && !rebuild_ && dhcp_needed_ && !dhcp_.healthy()) {
         // The kernel bridge stays the data path; leases and the PD binding
         // survive in state, and the PD registration stays with the network.
@@ -137,6 +154,10 @@ void LinuxBridge::stop() {
     // Detach a foreign uplink first: it quiesces external traffic and must
     // leave before the bridge can be released.
     if (!l3_ && !firewall_owner_.empty()) attempt([&] { resources_.ports.release(firewall_owner_); });
+    bool pbridge_stopped = false;
+    attempt([&] { pbridge_.stop(); pbridge_stopped = true; });
+    if (pbridge_stopped && pbridge_registered_)
+        attempt([&] { resources_.pbridge.release(firewall_owner_); pbridge_registered_ = false; }); // after the process exited
     bool helper_stopped = false;
     attempt([&] { dhcp_.stop(); dhcp_needed_ = false; helper_stopped = true; });
     // A live helper could reinstall rules after a flush; retire PD state only
@@ -151,9 +172,11 @@ void LinuxBridge::stop() {
     else throw ServiceError(ErrorCode::io_error, "Linux network cleanup incomplete: " + wire::stringify(failures));
 }
 Json::Value LinuxBridge::tools() const {
+    if (pseudo_) return pbridge_.tools();
     return dhcp_needed_ ? dhcp_.tools() : Json::Value(Json::arrayValue);
 }
 Json::Value LinuxBridge::tool_log(const std::string& key) const {
+    if (pseudo_ && key == "pbridge") return pbridge_.tool_log();
     return dhcp_needed_ && key == "bridgedhcp" ? dhcp_.tool_log() : Json::Value();
 }
 }
