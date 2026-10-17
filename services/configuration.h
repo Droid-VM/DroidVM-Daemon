@@ -28,6 +28,11 @@ public:
     // One exact VM revision and exact network config protect the confirmation.
     VmConfigService::Snapshot remove_network(const CallContext& caller, const std::string& vm_revision,
         const Json::Value& expected_network, NetworkService* lifecycle = nullptr);
+    struct VmDiskResult { VmConfigService::Snapshot vms; DiskConfigService::Snapshot disks; };
+    // Internal registry transaction: no image create/rebase/unlink is authorized.
+    // File-operation callers must add header/file leases before exposing an API.
+    VmDiskResult replace_vm_disks(const CallContext& caller, const std::string& vm_revision,
+        const std::string& disk_revision, Json::Value vms, Json::Value disks);
     // Only an administrator may retry durable redo; this does not resubmit a
     // deletion against a newer baseline. Failure keeps the common gate closed.
     void recover(const CallContext& caller);
@@ -41,9 +46,14 @@ private:
     std::unique_ptr<DiskConfigService> disks_;
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
+    std::shared_ptr<DiskConfigSnapshot> pending_disk_;
     void publish_pending();
+    void commit_pending(const std::vector<config::ConfigTransaction::Update>& updates,
+        ConfigurationCommit& runtime, ConfigurationGate::Transaction& exclusive);
     void validate_vm_networks(const Json::Value& before, const Json::Value& after) const;
     void validate_vm_disks(const Json::Value& before, const Json::Value& after) const;
+    void validate_vm_disks(const Json::Value& before, const Json::Value& after,
+        const Json::Value& old_disks, const Json::Value& new_disks) const;
     void validate_disk_change(const Json::Value& before, const Json::Value& after) const;
 };
 }

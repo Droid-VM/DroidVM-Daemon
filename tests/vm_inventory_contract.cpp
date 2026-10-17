@@ -143,7 +143,7 @@ void coordinated_historical_disk_references() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     auto row = config("historical disk VM"); Json::Value slot; slot["path"] = "/unregistered"; slot["extension"] = 7;
-    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot);
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot); row["disks"].append(slot);
     Json::Value document; document["vms"] = Json::Value(Json::arrayValue); document["vms"].append(row);
     config::JsonFile(directory.get(), "vms.json", getuid()).save(document);
     Coordinated c(fixture, {}, true); auto base = c.service.vms().snapshot(admin);
@@ -159,6 +159,9 @@ void coordinated_historical_disk_references() {
         }
         error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, base->revision, edited); });
     }
+    edited = base->document; edited["vms"][0]["disks"].resize(1);
+    base = c.service.vms().replace(admin, base->revision, edited);
+    check(base->document["vms"][0]["disks"].size() == 1, "historical reference multiplicity may decrease");
     edited = base->document; edited["vms"][0]["disks"].clear();
     c.service.vms().replace(admin, base->revision, edited);
 }
@@ -181,6 +184,118 @@ void coordinated_disk_structure() {
     invalid["disks"].append(next);
     error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, invalid); });
     check(disks.snapshot(admin)->revision == saved->revision, "ancestor and descendant edits of referenced disk rejected before IO");
+}
+struct VmDiskInput {
+    ConfigurationService::VmDiskResult baseline;
+    std::string vm_id, unrelated_id;
+};
+VmDiskInput seed_vm_disk(Coordinated& c) {
+    auto vm = c.service.vms().snapshot(admin); auto disk = c.service.disks()->snapshot(admin);
+    auto vms = vm->document, disks = disk->document;
+    auto row = config("disk participant"), unrelated = config("unrelated participant");
+    Json::Value slot; slot["path"] = "/images/image.qcow2"; slot["extension"] = Json::Int64(9007199254740993LL);
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot);
+    vms["vms"].append(row); vms["vms"].append(unrelated); vms["root_extension"] = "keep";
+    disks["disks"].append(registered_disk()); disks["root_extension"] = Json::Int64(9007199254740993LL);
+    return {c.service.replace_vm_disks(admin, vm->revision, disk->revision, vms, disks),
+        row["id"].asString(), unrelated["id"].asString()};
+}
+void coordinated_vm_disk_commit() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
+    const auto old = c.inventory.runtime(admin, input.vm_id), unrelated = c.inventory.runtime(admin, input.unrelated_id);
+    auto vms = input.baseline.vms->document, disks = input.baseline.disks->document;
+    auto unchanged = c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks);
+    check(unchanged.vms->revision == input.baseline.vms->revision && unchanged.disks->revision == input.baseline.disks->revision,
+        "durable joint noop preserves revisions");
+    vms["vms"][0]["disks"].clear(); disks["disks"].clear();
+    auto saved = c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks);
+    check(saved.vms->document["vms"][0]["disks"].empty() && saved.disks->document["disks"].empty(), "joint detach and registry removal");
+    check(saved.vms->document["root_extension"] == "keep" && saved.disks->document["root_extension"].asInt64() == 9007199254740993LL,
+        "joint commit retains extensions and int64");
+    check(c.inventory.runtime(admin, input.unrelated_id) == unrelated && c.inventory.runtime(admin, input.vm_id) != old,
+        "joint commit replaces only affected runtime");
+    check(!old->start() && fixture.starts == 0, "old runtime retired after joint commit");
+    check(config::JsonFile(c.directory.get(), "vms.json", getuid(), {}, VmConfigService::max_bytes).load()->value == saved.vms->document
+        && config::JsonFile(c.directory.get(), "disks.json", getuid()).load()->value == saved.disks->document, "both committed files match views");
+}
+void coordinated_vm_disk_rejections() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
+    auto vms = input.baseline.vms->document, disks = input.baseline.disks->document;
+    auto empty = disks; empty["disks"].clear();
+    error(ErrorCode::conflict, [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, empty); });
+    for (bool stale_vm : {false, true})
+        error(ErrorCode::conflict, [&] { c.service.replace_vm_disks(admin, stale_vm ? "stale" : input.baseline.vms->revision,
+            stale_vm ? input.baseline.disks->revision : "stale", vms, disks); });
+    auto runtime = c.inventory.runtime(admin, input.vm_id);
+    auto edited = disks; edited["disks"][0]["extension"] = "metadata edit";
+    {
+        auto busy = runtime->try_edit(); check(bool(busy), "hold stopped runtime lease");
+        error(ErrorCode::conflict, [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, edited); });
+    }
+    check(c.service.vms().snapshot(admin)->revision == input.baseline.vms->revision
+        && c.service.disks()->snapshot(admin)->revision == input.baseline.disks->revision, "joint rejection occurs before persistence");
+    auto saved = c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, edited);
+    check(saved.vms->document == vms && c.inventory.runtime(admin, input.vm_id) != runtime,
+        "unchanged VM definition still receives fresh runtime when disk family changed");
+}
+void coordinated_vm_disk_failure_recovery() {
+    for (const auto* boundary : {"before_decision", "participant_synced", "decision_removed"}) {
+        Fixture fixture; bool fail = false;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail && std::string_view(stage) == boundary) throw std::runtime_error("joint disk failure");
+        }, true);
+        auto input = seed_vm_disk(c); fail = true;
+        auto vms = input.baseline.vms->document, disks = input.baseline.disks->document;
+        vms["vms"][0]["disks"].clear(); disks["disks"].clear();
+        const bool decided = std::string_view(boundary) != "before_decision";
+        error(decided ? ErrorCode::commit_uncertain : ErrorCode::io_error,
+            [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks); });
+        if (decided) {
+            error(ErrorCode::unavailable, [&] { c.service.vms().snapshot(admin); });
+            error(ErrorCode::unavailable, [&] { c.service.disks()->snapshot(admin); });
+            error(ErrorCode::unavailable, [&] { c.tasks.disk_config_snapshot(admin); });
+            error(ErrorCode::unavailable, [&] { c.inventory.list(admin); });
+        } else check(c.service.vms().snapshot(admin)->revision == input.baseline.vms->revision
+            && c.service.disks()->snapshot(admin)->revision == input.baseline.disks->revision, "undecided failure preserves old generation");
+        fail = false; c.service.recover(admin);
+        const auto vm_after = c.service.vms().snapshot(admin); const auto disk_after = c.service.disks()->snapshot(admin);
+        check(vm_after->document["vms"][0]["disks"].empty() == decided && disk_after->document["disks"].empty() == decided,
+            "redo restores coherent VM/disk generation");
+        check(!vm_after->durability_uncertain && !disk_after->durability_uncertain, "recovery clears both uncertainty flags");
+        check(c.service.networks().list(admin).empty(), "disk recovery does not invent pending network state");
+    }
+}
+void coordinated_vm_disk_restart() {
+    Fixture fixture;
+    {
+        bool fail = false;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail && std::string_view(stage) == "participant_synced") throw std::runtime_error("restart joint transaction");
+        }, true);
+        auto input = seed_vm_disk(c); auto vms = input.baseline.vms->document, disks = input.baseline.disks->document;
+        vms["vms"][0]["disks"].clear(); disks["disks"].clear(); fail = true;
+        error(ErrorCode::commit_uncertain, [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks); });
+    }
+    Coordinated reopened(fixture, {}, true);
+    check(reopened.service.vms().snapshot(admin)->document["vms"][0]["disks"].empty()
+        && reopened.service.disks()->snapshot(admin)->document["disks"].empty(), "restart replays actual joint API transaction");
+}
+void coordinated_vm_disk_readonly() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
+    auto vms = input.baseline.vms->document, disks = input.baseline.disks->document;
+    auto child = registered_disk(); child["name"] = "overlay.qcow2"; child["parent"] = disks["disks"][0]["id"];
+    disks["disks"].append(child);
+    error(ErrorCode::conflict, [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks); });
+    vms["vms"][0]["disks"][0]["readonly"] = true;
+    auto saved = c.service.replace_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, vms, disks);
+    auto writer = vms; writer["vms"][0]["disks"][0]["path"] = "/images/overlay.qcow2";
+    writer["vms"][0]["disks"][0]["readonly"] = false;
+    saved = c.service.replace_vm_disks(admin, saved.vms->revision, saved.disks->revision, writer, disks);
+    auto shared = saved.vms->document;
+    shared["vms"][1]["disks"] = shared["vms"][0]["disks"];
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, saved.vms->revision, shared); });
+    shared["vms"][0]["disks"][0]["readonly"] = true; shared["vms"][1]["disks"][0]["readonly"] = true;
+    c.service.vms().replace(admin, saved.vms->revision, shared);
 }
 void coordinated_disk_reference_races() {
     for (int attempt = 0; attempt < 16; ++attempt) {
@@ -1148,6 +1263,11 @@ int main() {
         {"coordinated_network_delete", coordinated_network_delete},
         {"coordinated_disk_references", coordinated_disk_references},
         {"coordinated_disk_structure", coordinated_disk_structure},
+        {"coordinated_vm_disk_commit", coordinated_vm_disk_commit},
+        {"coordinated_vm_disk_rejections", coordinated_vm_disk_rejections},
+        {"coordinated_vm_disk_failure_recovery", coordinated_vm_disk_failure_recovery},
+        {"coordinated_vm_disk_restart", coordinated_vm_disk_restart},
+        {"coordinated_vm_disk_readonly", coordinated_vm_disk_readonly},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},

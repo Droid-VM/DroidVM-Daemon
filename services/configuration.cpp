@@ -64,26 +64,61 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
 }
 void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after) const {
     const auto registry = disks_->state();
-    const auto paths = config::valid_disk_paths(registry->document);
-    auto unresolved = [&](const Json::Value& slot) {
+    validate_vm_disks(before, after, registry->document, registry->document);
+}
+void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after,
+        const Json::Value& old_disks, const Json::Value& new_disks) const {
+    const auto old_paths = config::valid_disk_paths(old_disks), new_paths = config::valid_disk_paths(new_disks);
+    struct Restrictions { std::set<std::string> bases; std::map<std::string, size_t> holders; };
+    auto readonly_paths = [](const Json::Value& vms, const Json::Value& registry) {
+        std::map<std::string, std::string> paths_by_id;
+        Restrictions restricted;
+        for (const auto& row : registry["disks"]) paths_by_id.emplace(config::uuid(row), config::disk_path(row));
+        for (const auto& row : registry["disks"]) {
+            Json::Value parent; parent["id"] = config::member(row, "parent");
+            try {
+                const auto found = paths_by_id.find(config::uuid(parent));
+                if (found != paths_by_id.end()) restricted.bases.insert(found->second);
+            } catch (const std::invalid_argument&) {}
+        }
+        for (const auto& vm : vms["vms"]) {
+            const auto& slots = config::member(vm, "disks");
+            if (slots.isArray()) for (const auto& slot : slots) {
+                const auto& path = config::member(slot, "path");
+                if (path.isString() && !path.asString().empty()) ++restricted.holders[path.asString()];
+            }
+        }
+        return restricted;
+    };
+    const auto old_readonly = readonly_paths(before, old_disks), new_readonly = readonly_paths(after, new_disks);
+    auto unresolved = [&](const Json::Value& slot, const auto& paths, const auto& readonly) {
         const auto& path = config::member(slot, "path");
         if (path.isNull() || (path.isString() && path.asString().empty())) return false;
-        return !path.isString() || !paths.contains(path.asString());
+        return !path.isString() || !paths.contains(path.asString())
+            || ((readonly.bases.contains(path.asString()) || readonly.holders.at(path.asString()) > 1)
+                && !config::boolean(slot, "readonly"));
+    };
+    auto not_worse = [&](const Json::Value& slot) {
+        const auto path = config::string(slot, "path");
+        const auto old_count = old_readonly.holders.find(path), new_count = new_readonly.holders.find(path);
+        return (!old_paths.contains(path) || new_paths.contains(path))
+            && (!new_readonly.bases.contains(path) || old_readonly.bases.contains(path))
+            && (new_count == new_readonly.holders.end() || (old_count != old_readonly.holders.end() && new_count->second <= old_count->second));
     };
     std::map<std::string, std::multiset<Json::Value>> historical;
     for (const auto& vm : before["vms"]) {
         const auto& slots = config::member(vm, "disks");
-        if (slots.isArray()) for (const auto& slot : slots) if (unresolved(slot))
+        if (slots.isArray()) for (const auto& slot : slots) if (unresolved(slot, old_paths, old_readonly))
             historical[config::uuid(vm)].insert(slot);
     }
     for (const auto& vm : after["vms"]) {
         const auto& slots = config::member(vm, "disks");
         if (!slots.isArray()) continue;
         auto& allowed = historical[config::uuid(vm)];
-        for (const auto& slot : slots) if (unresolved(slot)) {
+        for (const auto& slot : slots) if (unresolved(slot, new_paths, new_readonly)) {
             const auto found = allowed.find(slot);
-            if (found == allowed.end())
-                throw ServiceError(ErrorCode::conflict, "VM disk reference is not registered; reload disks before saving");
+            if (found == allowed.end() || !not_worse(slot))
+                throw ServiceError(ErrorCode::conflict, "VM disk reference is unresolved or requires read-only access; reload disks before saving");
             allowed.erase(found);
         }
     }
@@ -187,8 +222,9 @@ void ConfigurationService::validate_vm_networks(const Json::Value& before, const
     }
 }
 void ConfigurationService::publish_pending() {
-    vms_->publish(pending_vm_);
-    networks_->publish(pending_network_);
+    if (pending_vm_) vms_->publish(pending_vm_);
+    if (pending_network_) networks_->publish(pending_network_);
+    if (pending_disk_) disks_->publish(pending_disk_);
 }
 VmConfigService::Snapshot ConfigurationService::remove_network(const CallContext& caller, const std::string& vm_revision,
         const Json::Value& expected_network, NetworkService* lifecycle) {
@@ -239,28 +275,81 @@ VmConfigService::Snapshot ConfigurationService::remove_network(const CallContext
     // watchdog can run between cleanup and the durable decision.
     if (lifecycle) lifecycle->stop_for_delete(id);
     networks_->require_stopped(id);
+    pending_vm_ = vm_next; pending_network_ = network_next;
+    commit_pending(updates, *runtime, exclusive);
+    return vm_next;
+}
+void ConfigurationService::commit_pending(const std::vector<config::ConfigTransaction::Update>& updates,
+        ConfigurationCommit& runtime, ConfigurationGate::Transaction& exclusive) {
     exclusive.require_recovery();
     try { journal_->commit(updates); }
     catch (const config::TransactionError& error) {
         if (!error.decided) {
+            pending_vm_.reset(); pending_network_.reset(); pending_disk_.reset();
             // Staging cleanup can itself have failed. Only reopen the gate after
             // the journal confirms no unresolved intent or leftovers remain.
             try { journal_->recover(); exclusive.recovered(); } catch (...) {}
             throw ServiceError(ErrorCode::io_error, "Configuration transaction was not committed");
         }
-        vm_next->durability_uncertain = true;
-        network_next->durability_uncertain = true;
-        pending_vm_ = vm_next; pending_network_ = network_next;
-        runtime->commit(); // Retire old handles; gate forbids new starts until redo.
+        if (pending_vm_) pending_vm_->durability_uncertain = true;
+        if (pending_network_) pending_network_->durability_uncertain = true;
+        if (pending_disk_) pending_disk_->durability_uncertain = true;
+        runtime.commit(); // Retire old handles; gate forbids new starts until redo.
         publish_pending();
         throw ServiceError(ErrorCode::commit_uncertain, "Configuration transaction requires recovery before further access");
     }
-    pending_vm_ = vm_next; pending_network_ = network_next;
-    runtime->commit();
+    runtime.commit();
     publish_pending();
-    pending_vm_.reset(); pending_network_.reset();
+    pending_vm_.reset(); pending_network_.reset(); pending_disk_.reset();
     exclusive.recovered();
-    return vm_next;
+}
+ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const CallContext& caller,
+        const std::string& vm_revision, const std::string& disk_revision, Json::Value vms, Json::Value disks) {
+    access(caller);
+    if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
+    if (vm_revision.empty() || vm_revision.size() > 128 || disk_revision.empty() || disk_revision.size() > 128)
+        throw ServiceError(ErrorCode::invalid_argument, "VM and disk revisions are required");
+    auto exclusive = gate_->transaction(); exclusive.require_available();
+    std::lock_guard vm_writer(vms_->writer_mutex_);
+    std::lock_guard disk_writer(disks_->writer_mutex_);
+    const auto vm_before = vms_->state(); const auto disk_before = disks_->state();
+    if (vm_before->revision != vm_revision || disk_before->revision != disk_revision)
+        throw ServiceError(ErrorCode::conflict, "VM or disk configuration changed; reload before applying the operation");
+    auto vm_next = std::make_shared<VmConfigSnapshot>();
+    auto disk_next = std::make_shared<DiskConfigSnapshot>();
+    vm_next->document = VmConfigService::normalize(std::move(vms));
+    disk_next->document = DiskConfigService::normalize(std::move(disks));
+    try { config::validate_disk_transition(disk_before->document, disk_next->document); }
+    catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+    validate_vm_networks(vm_before->document, vm_next->document);
+    validate_vm_disks(vm_before->document, vm_next->document, disk_before->document, disk_next->document);
+    if (vm_next->document == vm_before->document && disk_next->document == disk_before->document
+            && vm_before->persisted && disk_before->persisted && !vm_before->recovered && !disk_before->recovered
+            && !vm_before->durability_uncertain && !disk_before->durability_uncertain)
+        return {vm_before, disk_before};
+    const auto affected = config::affected_disk_paths(disk_before->document, disk_next->document);
+    std::set<std::string> freeze;
+    for (const auto& vm : vm_before->document["vms"]) {
+        const auto& slots = config::member(vm, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) {
+            const auto& path = config::member(slot, "path");
+            if (path.isString() && affected.contains(path.asString())) freeze.insert(config::uuid(vm));
+        }
+    }
+    auto vm_bytes = config::encode_json(vm_next->document, VmConfigService::max_bytes);
+    auto disk_bytes = config::encode_json(disk_next->document, DiskConfigService::max_bytes);
+    vm_next->encoded = std::make_shared<const std::string>(vm_bytes.data(), vm_bytes.size());
+    disk_next->encoded = std::make_shared<const std::string>(disk_bytes.data(), disk_bytes.size());
+    vm_next->revision = random_id(true); disk_next->revision = random_id(true);
+    vm_next->persisted = true; disk_next->persisted = true;
+    // Even unchanged VM definitions must admit stopped replacement when their
+    // disk family changes. Unrelated runtime handles remain untouched.
+    auto runtime = inventory_.prepare_config(vm_next->document, freeze);
+    const std::vector<config::ConfigTransaction::Update> updates{
+        {"vms.json", vm_next->document}, {"disks.json", disk_next->document}};
+    pending_vm_ = vm_next; pending_disk_ = disk_next;
+    commit_pending(updates, *runtime, exclusive);
+    return {vm_next, disk_next};
 }
 void ConfigurationService::recover(const CallContext& caller) {
     access(caller);
@@ -268,16 +357,24 @@ void ConfigurationService::recover(const CallContext& caller) {
     exclusive.require_recovery();
     std::lock_guard vm_writer(vms_->writer_mutex_);
     std::lock_guard network_writer(networks_->writer_mutex_);
+    std::unique_lock<std::mutex> disk_writer;
+    if (disks_) disk_writer = std::unique_lock(disks_->writer_mutex_);
     try {
         journal_->recover();
         if (pending_vm_) {
             auto vm = std::make_shared<VmConfigSnapshot>(*pending_vm_);
-            auto network = std::make_shared<NetworkConfigService::State>(*pending_network_);
-            vm->durability_uncertain = false; network->durability_uncertain = false;
-            pending_vm_ = std::move(vm); pending_network_ = std::move(network);
-            publish_pending();
-            pending_vm_.reset(); pending_network_.reset();
+            vm->durability_uncertain = false; pending_vm_ = std::move(vm);
         }
+        if (pending_network_) {
+            auto network = std::make_shared<NetworkConfigService::State>(*pending_network_);
+            network->durability_uncertain = false; pending_network_ = std::move(network);
+        }
+        if (pending_disk_) {
+            auto disk = std::make_shared<DiskConfigSnapshot>(*pending_disk_);
+            disk->durability_uncertain = false; pending_disk_ = std::move(disk);
+        }
+        publish_pending();
+        pending_vm_.reset(); pending_network_.reset(); pending_disk_.reset();
         exclusive.recovered();
     } catch (const std::exception&) { throw ServiceError(ErrorCode::unavailable, "Configuration recovery failed; further access remains disabled"); }
 }

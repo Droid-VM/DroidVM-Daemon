@@ -108,4 +108,28 @@ void validate_disk_transition(const Json::Value& before, const Json::Value& afte
             throw std::invalid_argument("Disk update introduces a broken or ambiguous parent chain");
     }
 }
+std::set<std::string> affected_disk_paths(const Json::Value& before, const Json::Value& after) {
+    const auto old = inspect(before), next = inspect(after);
+    std::map<std::string, std::set<std::string>> adjacent;
+    for (const auto* registry : {&old, &next}) for (const auto& [id, parent] : registry->parents) {
+        adjacent[id].insert(parent); adjacent[parent].insert(id);
+    }
+    std::set<std::string> changed;
+    for (const auto& [id, row] : old.rows) {
+        const auto found = next.rows.find(id);
+        if (found == next.rows.end() || found->second != row) changed.insert(id);
+    }
+    for (const auto& [id, row] : next.rows) if (!old.rows.contains(id)) changed.insert(id);
+    std::vector<std::string> queue(changed.begin(), changed.end());
+    std::set<std::string> paths;
+    for (size_t i = 0; i < queue.size(); ++i) {
+        const auto id = queue[i];
+        for (const auto* registry : {&old, &next}) {
+            const auto row = registry->rows.find(id);
+            if (row != registry->rows.end()) paths.insert(disk_path(row->second));
+        }
+        for (const auto& related : adjacent[id]) if (changed.insert(related).second) queue.push_back(related);
+    }
+    return paths;
+}
 }

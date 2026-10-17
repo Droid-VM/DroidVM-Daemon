@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -38,7 +39,8 @@ public:
     // Internal single-writer participant, called with normalized complete document.
     // Attach before loading/serving legacy inventory. Commit disables legacy writes.
     // Owner must outlive the returned transaction and its VmConfigService.
-    std::unique_ptr<VmConfigService::Commit> prepare_config(const Json::Value& document);
+    std::unique_ptr<VmConfigService::Commit> prepare_config(const Json::Value& document,
+        const std::set<std::string>& disk_affected = {});
     // The VM's runtime; not_found carries the legacy "VM not found: <id>".
     std::shared_ptr<vm::VmRuntime> runtime(const CallContext& caller, const std::string& id) const;
     // Internal managed start. expected is a definition from a fixed persistent

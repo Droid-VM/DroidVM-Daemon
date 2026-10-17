@@ -107,7 +107,8 @@ void VmService::add(const std::string& id, Json::Value config) {
 }
 class VmService::ConfigUpdate final : public VmConfigService::Commit {
 public:
-    ConfigUpdate(VmService& owner, const Json::Value& document) : owner_(owner), lock_(owner.mutex_) {
+    ConfigUpdate(VmService& owner, const Json::Value& document, const std::set<std::string>& disk_affected)
+        : owner_(owner), lock_(owner.mutex_) {
         if (owner.shutting_down_->load()) throw ServiceError(ErrorCode::unavailable, "VM service is shutting down");
         if (!owner.config_managed_ && !owner.entries_.empty())
             throw ServiceError(ErrorCode::conflict, "Persistent VM configuration must attach before loading legacy inventory");
@@ -122,11 +123,11 @@ public:
                 throw ServiceError(ErrorCode::invalid_argument, "Duplicate or invalid VM definition");
         }
         // Freeze every changed/deleted instance before preparing replacements.
-        // Unchanged VMs keep their runtime, console and live configuration.
+        // Unchanged VMs keep their runtime unless their disk family changed.
         leases_.reserve(owner.entries_.size());
         for (const auto& entry : owner.entries_) {
             const auto found = definitions.find(entry.id);
-            if (found != definitions.end() && *found->second == entry.definition) continue;
+            if (found != definitions.end() && *found->second == entry.definition && !disk_affected.contains(entry.id)) continue;
             auto lease = entry.vm->try_edit();
             if (!lease) throw ServiceError(ErrorCode::conflict, "VM " + entry.id + " is busy; cannot save configuration");
             leases_.push_back(std::move(lease));
@@ -135,7 +136,7 @@ public:
         for (const auto& row : rows) {
             const auto id = config::uuid(row);
             const auto* previous = owner.find(id);
-            if (previous && previous->definition == row) entries_.push_back(*previous);
+            if (previous && previous->definition == row && !disk_affected.contains(id)) entries_.push_back(*previous);
             else entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, row, owner.context_), row});
         }
     }
@@ -153,8 +154,9 @@ private:
     std::vector<vm::VmRuntime::StoppedLease> leases_;
     bool committed_ = false;
 };
-std::unique_ptr<VmConfigService::Commit> VmService::prepare_config(const Json::Value& document) {
-    return std::make_unique<ConfigUpdate>(*this, document);
+std::unique_ptr<VmConfigService::Commit> VmService::prepare_config(const Json::Value& document,
+        const std::set<std::string>& disk_affected) {
+    return std::make_unique<ConfigUpdate>(*this, document, disk_affected);
 }
 void VmService::require_legacy_writer() const {
     if (config_managed_) throw ServiceError(ErrorCode::conflict, "VM configuration requires a revisioned persistent update");
