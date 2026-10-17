@@ -62,6 +62,9 @@ struct VncRun {
 struct CrosvmRun {
     // Managed disks must use the same paths admitted by the file lease.
     bool preserve_disk_paths = false;
+    // Present only after inspecting self-contained images; backing chains need
+    // a backend extension before they can be admitted through this interface.
+    std::optional<std::map<std::string, int>> disk_fds;
     std::optional<std::string> control_socket_path; // CrosvmBackendInstance.controlSocketPath
     std::optional<std::string> gpu_cgroup_path; // gpuCgroupPath after prepareGpuCgroup()
     std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved
@@ -71,6 +74,7 @@ struct CrosvmRun {
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
     std::vector<std::string> argv;
+    std::vector<int> preserve_fds;
     // NativeProcess.Builder.environment calls in order; later keys win when merged.
     std::vector<std::pair<std::string, std::string>> env;
     std::optional<std::string> strace_dir; // getStraceFolder(): caller recreates the directory

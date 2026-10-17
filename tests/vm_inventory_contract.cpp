@@ -19,6 +19,34 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void crosvm_retained_disk_attachment() {
+    Json::Value config;
+    config["id"] = random_id(true); config["name"] = "retained-crosvm";
+    config["screens"]["gpu-0"]["enabled"] = false; config["screens"]["simplefb"]["enabled"] = false;
+    config["disks"] = Json::Value(Json::arrayValue);
+    vm::CrosvmRun run; run.disk_fds.emplace();
+    int fd = 3;
+    for (const auto* bus : {"virtio", "scsi", "cdrom", "pmem"}) {
+        Json::Value slot; slot["bus"] = bus; slot["path"] = std::string("/storage/emulated/0/") + bus;
+        slot["readonly"] = true; config["disks"].append(slot);
+        run.disk_fds->emplace(slot["path"].asString(), fd++);
+    }
+    const auto launch = vm::crosvm_command(config, run, {}, {});
+    size_t attached = 0;
+    for (const auto& arg : launch.argv) {
+        check(arg.find("/storage/emulated/0/") == std::string::npos && arg.find("/data/media/0/") == std::string::npos,
+            "managed crosvm disks never reopen original or optimized paths");
+        if (arg.starts_with("/proc/self/fd/")) {
+            ++attached;
+            check(arg.find(",ro=true") != std::string::npos, "retained crosvm disks keep read-only flags");
+        }
+    }
+    check(attached == 4 && launch.preserve_fds.size() == 4, "four supported buses inherit all retained descriptors");
+    run.disk_fds->erase("/storage/emulated/0/virtio");
+    bool refused = false;
+    try { vm::crosvm_command(config, run, {}, {}); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "missing crosvm descriptor cannot fall back to a pathname");
+}
 void qemu_retained_disk_attachment() {
     Json::Value config;
     config["id"] = random_id(true); config["name"] = "retained-slots";
@@ -1599,7 +1627,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
+    return run({{"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
+        {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
         {"qemu_retained_disk_graph", qemu_retained_disk_graph},
         {"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},
         {"disk_option_path_encoding", disk_option_path_encoding},

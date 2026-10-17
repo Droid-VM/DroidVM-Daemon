@@ -304,9 +304,16 @@ struct Builder {
         for (const auto* disk : items(item["disks"])) {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
-            if (!run.preserve_disk_paths) path = optimized_path(std::move(path), host);
+            if (!run.preserve_disk_paths && !run.disk_fds) path = optimized_path(std::move(path), host);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
+            if (bus == "PFLASH") continue; // Not implemented by the legacy crosvm backend either.
+            if (run.disk_fds) {
+                const auto found = run.disk_fds->find(path);
+                if (found == run.disk_fds->end() || found->second < 3)
+                    throw std::invalid_argument("Missing retained crosvm disk descriptor");
+                path = "/proc/self/fd/" + std::to_string(found->second);
+            }
             auto arg = crosvm_option_value(path);
             if (bus == "SCSI") {
                 arg += ",lock=false";
@@ -680,6 +687,7 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
     CrosvmLaunch launch;
     builder.command(launch);
     launch.argv = std::move(builder.args);
+    if (run.disk_fds) for (const auto& [path, fd] : *run.disk_fds) launch.preserve_fds.push_back(fd);
     builder.environment(launch);
     return launch;
 }
