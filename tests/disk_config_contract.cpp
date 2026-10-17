@@ -6,6 +6,7 @@
 #include "store/vm_ownership.h"
 #include "store/disk_config.h"
 #include "transport/dispatcher.h"
+#include "runtime/child.h"
 #include <atomic>
 #include <dirent.h>
 #include <fcntl.h>
@@ -164,6 +165,43 @@ void leased_read_descriptor() {
     check(pread(fd, bytes, sizeof(bytes), 0) == 8 && std::string(bytes, sizeof(bytes)) == "original",
         "borrowed descriptor continues to identify the admitted inode");
     error(ErrorCode::conflict, [&] { lease->read_fd(path); });
+}
+void leased_file_io() {
+    Temporary temp;
+    temp.raw("image", "original");
+    const auto path = temp.path + "/image";
+    config::DiskFileLeases pool;
+    {
+        auto lease = pool.acquire({{path, false}});
+        error(ErrorCode::permission_denied, [&] { lease->open_file(path, true); });
+        error(ErrorCode::invalid_argument, [&] { lease->open_file(temp.path + "/missing"); });
+        auto first = lease->open_file(path), second = lease->open_file(path);
+        char a = 0, b = 0;
+        check(read(first.get(), &a, 1) == 1 && read(second.get(), &b, 1) == 1 && a == 'o' && b == 'o',
+            "separate leased readers have independent offsets");
+        check((fcntl(first.get(), F_GETFL) & O_ACCMODE) == O_RDONLY &&
+            pwrite(first.get(), "X", 1, 0) == -1, "read access cannot write the inode");
+    }
+    auto writer = pool.acquire({{path, true}});
+    auto output = writer->open_file(path, true);
+    check(output.get() >= 3 && (fcntl(output.get(), F_GETFD) & FD_CLOEXEC) != 0 &&
+        (fcntl(output.get(), F_GETFL) & O_ACCMODE) == O_RDWR, "write IO descriptor remains close-on-exec in the parent");
+    check(rename(path.c_str(), (temp.path + "/moved").c_str()) == 0, "replace pathname after IO descriptor is acquired");
+    temp.raw("image", "replacement");
+    ChildOptions child;
+    child.argv = {"/system/bin/sh", "-c", "printf UPDATED! > /proc/self/fd/" + std::to_string(output.get())};
+    child.preserve_fds = {output.get()};
+    const auto result = Child(child).communicate({}, std::chrono::seconds(2), 4096);
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "child writes the retained IO descriptor");
+    check((fcntl(output.get(), F_GETFD) & FD_CLOEXEC) != 0, "child inheritance preserves parent descriptor flags");
+    char bytes[11];
+    Fd current(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    check(pread(current.get(), bytes, sizeof(bytes), 0) == 11 && std::string(bytes, sizeof(bytes)) == "replacement",
+        "write does not touch replacement pathname");
+    Fd original(open((temp.path + "/moved").c_str(), O_RDONLY | O_CLOEXEC));
+    check(pread(original.get(), bytes, 8, 0) == 8 && std::string(bytes, 8) == "UPDATED!", "write reaches the leased original inode");
+    error(ErrorCode::conflict, [&] { writer->open_file(path, true); });
+    error(ErrorCode::conflict, [&] { pool.acquire({{path, true}}); });
 }
 void historical_structure_repair() {
     auto historical = document(); historical["disks"][0]["parent"] = "broken";
@@ -500,6 +538,7 @@ int main() {
         {"disk_start_reference_readonly_validation", disk_start_validation},
         {"disk_file_leases_alias_batch_release", disk_file_leases},
         {"disk_lease_read_descriptor", leased_read_descriptor},
+        {"disk_lease_file_io_permissions_identity", leased_file_io},
         {"disk_start_chain_leases", disk_start_chain_leases},
         {"disk_historical_structure_repair", historical_structure_repair},
         {"disk_structure_long_chain_cycle", long_structure_chain},

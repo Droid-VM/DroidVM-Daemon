@@ -24,9 +24,13 @@ public:
         // and explicitly preserve the descriptor when passing it to a child.
         // Use pread or reopen /proc/self/fd/N for an independent file offset.
         int read_fd(const std::string& path) const;
+        // Owns an independent file offset on the admitted inode. Write access
+        // requires a write lease; no create/truncate. Keep this Lease alive for
+        // the entire IO lifetime, including children inheriting the returned FD.
+        Fd open_file(const std::string& path, bool write = false) const;
     private:
         friend class DiskFileLeases;
-        struct File { std::string path; Fd fd; };
+        struct File { std::string path; Fd fd; bool write = false; };
         Lease(std::shared_ptr<State> state, std::map<std::string, bool> keys, std::vector<File> files);
         std::shared_ptr<State> state_;
         std::map<std::string, bool> keys_;

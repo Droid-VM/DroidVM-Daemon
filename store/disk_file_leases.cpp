@@ -39,6 +39,27 @@ int DiskFileLeases::Lease::read_fd(const std::string& path) const {
     }
     throw ServiceError(ErrorCode::invalid_argument, "Disk path is not held by this lease");
 }
+Fd DiskFileLeases::Lease::open_file(const std::string& path, bool write) const {
+    for (const auto& file : files_) if (file.path == path) {
+        if (write && !file.write) throw ServiceError(ErrorCode::permission_denied, "Disk lease does not authorize writes");
+        verify();
+        const auto held_path = "/proc/self/fd/" + std::to_string(file.fd.get());
+        Fd result(open(held_path.c_str(), (write ? O_RDWR : O_RDONLY) | O_CLOEXEC));
+        if (result.get() < 0) throw ServiceError(ErrorCode::io_error, "Cannot open leased disk inode for IO");
+        if (result.get() < 3) {
+            Fd raised(fcntl(result.get(), F_DUPFD_CLOEXEC, 3));
+            if (raised.get() < 0) throw ServiceError(ErrorCode::io_error, "Cannot retain disk IO descriptor above stdio");
+            result = std::move(raised);
+        }
+        struct stat held{}, opened{};
+        if (fstat(file.fd.get(), &held) != 0 || fstat(result.get(), &opened) != 0
+                || !S_ISREG(opened.st_mode) || held.st_dev != opened.st_dev || held.st_ino != opened.st_ino)
+            throw ServiceError(ErrorCode::conflict, "Disk IO descriptor does not match leased inode");
+        verify();
+        return result;
+    }
+    throw ServiceError(ErrorCode::invalid_argument, "Disk path is not held by this lease");
+}
 std::shared_ptr<DiskFileLeases::Lease> DiskFileLeases::acquire(const std::vector<Request>& requests) {
     std::map<std::string, bool> paths, keys, inodes;
     for (const auto& request : requests) {
@@ -68,7 +89,7 @@ std::shared_ptr<DiskFileLeases::Lease> DiskFileLeases::acquire(const std::vector
         if (!resolved) throw ServiceError(ErrorCode::io_error, "Cannot resolve disk file path");
         const std::string canonical_key = "path:" + std::string(resolved.get());
         keys[canonical_key] = keys[canonical_key] || write;
-        files.push_back({path, std::move(file)});
+        files.push_back({path, std::move(file), write});
     }
     // Allocate before publishing any use so allocation failure cannot leak reservations.
     auto lease = std::shared_ptr<Lease>(new Lease({}, std::move(keys), std::move(files)));
