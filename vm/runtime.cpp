@@ -267,6 +267,16 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         idle_.wait_for(state, 1s, [&] { return !worker_; });
         if (worker_) return false;
     }
+    try {
+        if (context_.validate_start) {
+            if (!*context_.validate_start) throw std::runtime_error("VM start validation is not available");
+            (*context_.validate_start)(config());
+        }
+    } catch (const std::exception& error) {
+        context_.warn("Cannot start VM: " + std::string(error.what()));
+        if (auto* output = log("stdio")) output->append(std::string("start validation failed: ") + error.what() + "\n");
+        return false;
+    }
     // Clear only after validation and stopped admission, before new startup diagnostics.
     if (clear_logs) this->clear_logs();
     if (!setup_taps()) return false;

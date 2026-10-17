@@ -69,6 +69,33 @@ void structure_transition_validation() {
     next = valid; next["disks"][0]["folder"] = std::string("/a\0b", 4); reject(next);
     next = valid; next["disks"].removeIndex(0, nullptr); reject(next);
 }
+void disk_start_validation() {
+    auto registry = document();
+    Json::Value vm, slot, vms;
+    vm["id"] = random_id(true); vm["name"] = "start";
+    slot["path"] = "/first/disk.qcow2";
+    vm["disks"] = Json::Value(Json::arrayValue); vm["disks"].append(slot);
+    vms["vms"] = Json::Value(Json::arrayValue); vms["vms"].append(vm);
+    auto refused = [&](const Json::Value& candidate) {
+        bool rejected = false;
+        try { config::validate_disk_start(candidate, vms, registry); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "unsafe disk session rejected before start");
+    };
+    refused(vm); // Registered base still has an overlay.
+    vm["disks"][0]["readonly"] = true;
+    config::validate_disk_start(vm, vms, registry);
+    vm["disks"][0]["path"] = "/second/disk.qcow2"; vm["disks"][0]["readonly"] = false;
+    vms["vms"][0] = vm;
+    config::validate_disk_start(vm, vms, registry);
+    auto other = vm; other["id"] = random_id(true); vms["vms"].append(other);
+    refused(vm);
+    vm["disks"][0]["readonly"] = true;
+    config::validate_disk_start(vm, vms, registry);
+    vm["disks"][0]["path"] = "/unregistered"; refused(vm);
+    vm["disks"][0]["path"] = "/second/disk.qcow2";
+    registry["disks"][1]["parent"] = random_id(true); refused(vm);
+}
 void historical_structure_repair() {
     auto historical = document(); historical["disks"][0]["parent"] = "broken";
     auto next = historical; next["root_extension"] = "unrelated";
@@ -401,6 +428,7 @@ void disk_upload_conflicts_and_failures() {
 int main() {
     return run({{"disk_registry_roundtrip_restart_ownership", roundtrip_restart_and_ownership},
         {"disk_structure_transition_validation", structure_transition_validation},
+        {"disk_start_reference_readonly_validation", disk_start_validation},
         {"disk_historical_structure_repair", historical_structure_repair},
         {"disk_structure_long_chain_cycle", long_structure_chain},
         {"disk_registry_validation_participants_gate", validation_and_admission},

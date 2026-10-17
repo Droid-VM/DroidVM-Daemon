@@ -165,6 +165,38 @@ void coordinated_historical_disk_references() {
     edited = base->document; edited["vms"][0]["disks"].clear();
     c.service.vms().replace(admin, base->revision, edited);
 }
+void coordinated_disk_start_guard() {
+    Fixture fixture;
+    fixture.context.shutting_down = [] { return false; };
+    int attaches = 0;
+    fixture.context.attach_nic = [&](const std::string&, const Json::Value&, const std::string&) {
+        ++attaches; throw std::runtime_error("test stops before any network or VMM creation");
+    };
+    auto gate = std::make_shared<ConfigurationGate>(); fixture.context.configuration_gate = gate;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto row = config("historical invalid disk start");
+    Json::Value slot; slot["path"] = "/not-registered";
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot);
+    Json::Value nic; nic["network_id"] = random_id(true);
+    row["networks"] = Json::Value(Json::arrayValue); row["networks"].append(nic);
+    Json::Value document; document["vms"] = Json::Value(Json::arrayValue); document["vms"].append(row);
+    config::JsonFile(directory.get(), "vms.json", getuid()).save(document);
+    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    VmService inventory(fixture.context);
+    auto coordinator = std::make_unique<ConfigurationService>(directory.get(), getuid(), gate, inventory, tasks,
+        config::ConfigTransaction::Observer{}, true);
+    auto runtime = inventory.runtime(admin, row["id"].asString());
+    check(!runtime->start() && attaches == 0 && runtime->state() == vm::State::stopped,
+          "historical disk reference cannot reach TAP setup");
+    auto snapshot = coordinator->vms().snapshot(admin);
+    document = snapshot->document; document["vms"][0]["disks"].clear();
+    coordinator->vms().replace(admin, snapshot->revision, document);
+    check(!runtime->start() && attaches == 0, "old runtime remains retired after repair");
+    runtime = inventory.runtime(admin, row["id"].asString());
+    check(!runtime->start() && attaches == 1, "repaired diskless VM passes guard and reaches bounded test rejection");
+    coordinator.reset();
+    check(!runtime->start() && attaches == 1, "expired configuration owner rejects startup without dangling callback");
+}
 void coordinated_disk_structure() {
     Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
     auto base = disks.snapshot(admin); auto document = base->document;
@@ -1365,6 +1397,7 @@ int main() {
         {"coordinated_vm_disk_uploads", coordinated_vm_disk_uploads},
         {"coordinated_vm_disk_adapter", coordinated_vm_disk_adapter},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
+        {"coordinated_disk_start_guard", coordinated_disk_start_guard},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},
         {"coordinated_vm_network_references", coordinated_vm_network_references},

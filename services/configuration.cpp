@@ -45,15 +45,22 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     journal_ = std::make_unique<config::ConfigTransaction>(directory, owner, std::move(observer),
         std::move(targets));
     networks_ = std::make_unique<NetworkConfigService>(directory, owner, config::JsonFile::Observer{}, &events, true, gate_);
-    vms_ = std::make_unique<VmConfigService>(directory, owner, config::JsonFile::Observer{},
+    if (manage_disks) inventory.context_.validate_start = std::make_shared<std::function<void(const Json::Value&)>>();
+    vms_ = std::make_shared<VmConfigService>(directory, owner, config::JsonFile::Observer{},
         [&inventory](const Json::Value& document) { return inventory.prepare_config(document); }, &events, gate_);
     if (manage_disks) {
-        disks_ = std::make_unique<DiskConfigService>(directory, owner, config::JsonFile::Observer{}, gate_,
+        disks_ = std::make_shared<DiskConfigService>(directory, owner, config::JsonFile::Observer{}, gate_,
             [this](const Json::Value& before, const Json::Value& after) -> std::unique_ptr<ConfigurationCommit> {
                 validate_disk_change(before, after);
                 return {};
             }, &events);
         disks_->coordinated_ = true;
+        *inventory.context_.validate_start = [vms = std::weak_ptr<VmConfigService>(vms_), disks = std::weak_ptr<DiskConfigService>(disks_)](const Json::Value& vm) {
+            const auto vm_service = vms.lock(); const auto disk_service = disks.lock();
+            if (!vm_service || !disk_service) throw std::runtime_error("Configuration owner is unavailable");
+            const CallContext internal{"vm-start-validation", true, true, true};
+            config::validate_disk_start(vm, vm_service->snapshot(internal)->document, disk_service->snapshot(internal)->document);
+        };
     }
     networks_->coordinated_removal_ = true;
     vms_->validate_change_ = [this](const Json::Value& before, const Json::Value& after) {
@@ -69,28 +76,7 @@ void ConfigurationService::validate_vm_disks(const Json::Value& before, const Js
 void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after,
         const Json::Value& old_disks, const Json::Value& new_disks) const {
     const auto old_paths = config::valid_disk_paths(old_disks), new_paths = config::valid_disk_paths(new_disks);
-    struct Restrictions { std::set<std::string> bases; std::map<std::string, size_t> holders; };
-    auto readonly_paths = [](const Json::Value& vms, const Json::Value& registry) {
-        std::map<std::string, std::string> paths_by_id;
-        Restrictions restricted;
-        for (const auto& row : registry["disks"]) paths_by_id.emplace(config::uuid(row), config::disk_path(row));
-        for (const auto& row : registry["disks"]) {
-            Json::Value parent; parent["id"] = config::member(row, "parent");
-            try {
-                const auto found = paths_by_id.find(config::uuid(parent));
-                if (found != paths_by_id.end()) restricted.bases.insert(found->second);
-            } catch (const std::invalid_argument&) {}
-        }
-        for (const auto& vm : vms["vms"]) {
-            const auto& slots = config::member(vm, "disks");
-            if (slots.isArray()) for (const auto& slot : slots) {
-                const auto& path = config::member(slot, "path");
-                if (path.isString() && !path.asString().empty()) ++restricted.holders[path.asString()];
-            }
-        }
-        return restricted;
-    };
-    const auto old_readonly = readonly_paths(before, old_disks), new_readonly = readonly_paths(after, new_disks);
+    const auto old_readonly = config::disk_references(before, old_disks), new_readonly = config::disk_references(after, new_disks);
     auto unresolved = [&](const Json::Value& slot, const auto& paths, const auto& readonly) {
         const auto& path = config::member(slot, "path");
         if (path.isNull() || (path.isString() && path.asString().empty())) return false;

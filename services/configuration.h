@@ -42,8 +42,8 @@ private:
     TaskService& events_;
     std::unique_ptr<config::ConfigTransaction> journal_;
     std::unique_ptr<NetworkConfigService> networks_;
-    std::unique_ptr<VmConfigService> vms_;
-    std::unique_ptr<DiskConfigService> disks_;
+    std::shared_ptr<VmConfigService> vms_;
+    std::shared_ptr<DiskConfigService> disks_;
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     std::shared_ptr<DiskConfigSnapshot> pending_disk_;

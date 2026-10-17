@@ -6,6 +6,44 @@
 #include <vector>
 
 namespace droidvm::config {
+DiskReferences disk_references(const Json::Value& vms, const Json::Value& registry) {
+    std::map<std::string, std::string> paths_by_id;
+    DiskReferences result;
+    for (const auto& row : registry["disks"]) paths_by_id.emplace(uuid(row), disk_path(row));
+    for (const auto& row : registry["disks"]) {
+        Json::Value parent; parent["id"] = member(row, "parent");
+        try {
+            const auto found = paths_by_id.find(uuid(parent));
+            if (found != paths_by_id.end()) result.bases.insert(found->second);
+        } catch (const std::invalid_argument&) {}
+    }
+    for (const auto& vm : vms["vms"]) {
+        const auto& slots = member(vm, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) {
+            const auto& path = member(slot, "path");
+            if (path.isString() && !path.asString().empty()) ++result.holders[path.asString()];
+        }
+    }
+    return result;
+}
+void validate_disk_start(const Json::Value& vm, const Json::Value& vms, const Json::Value& registry) {
+    const auto paths = valid_disk_paths(registry);
+    const auto references = disk_references(vms, registry);
+    const auto& slots = member(vm, "disks");
+    if (slots.isNull()) return;
+    if (!slots.isArray()) throw std::invalid_argument("VM disk slots must be an array");
+    for (const auto& slot : slots) {
+        const auto& value = member(slot, "path");
+        if (value.isNull() || (value.isString() && value.asString().empty())) continue;
+        if (!value.isString() || !paths.contains(value.asString()))
+            throw std::invalid_argument("VM disk path is not registered with a valid backing chain");
+        const auto& path = value.asString();
+        const auto holders = references.holders.find(path);
+        if ((references.bases.contains(path) || (holders != references.holders.end() && holders->second > 1))
+                && !boolean(slot, "readonly"))
+            throw std::invalid_argument("Shared and backing disks must be read-only before starting");
+    }
+}
 std::string disk_path(const Json::Value& row) {
     auto base = string(row, "folder");
     auto child = string(row, "name");

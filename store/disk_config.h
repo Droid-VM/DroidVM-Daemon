@@ -3,6 +3,7 @@
 #include <json/json.h>
 #include <set>
 #include <string>
+#include <map>
 
 namespace droidvm::config {
 // Java DiskConfig.getFullPath lexical semantics; not canonical/inode identity.
@@ -15,4 +16,9 @@ std::set<std::string> valid_disk_paths(const Json::Value& document);
 void validate_disk_transition(const Json::Value& before, const Json::Value& after);
 // Paths in the old/new connected families of changed rows, for runtime leases.
 std::set<std::string> affected_disk_paths(const Json::Value& before, const Json::Value& after);
+struct DiskReferences { std::set<std::string> bases; std::map<std::string, size_t> holders; };
+DiskReferences disk_references(const Json::Value& vms, const Json::Value& registry);
+// Startup is stricter than historical-document preservation: every used path
+// must resolve, and base/shared slots must be read-only in the effective session.
+void validate_disk_start(const Json::Value& vm, const Json::Value& vms, const Json::Value& registry);
 }

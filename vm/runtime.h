@@ -25,6 +25,8 @@ enum class State { stopped, starting, running, suspended, stopping, rebooting };
 const char* state_name(State state); // VMState.name()
 struct RuntimeContext {
     std::shared_ptr<ConfigurationGate> configuration_gate;
+    // Shared holder bound once during coordinator startup, before gate recovery.
+    std::shared_ptr<std::function<void(const Json::Value&)>> validate_start;
     network::SwitchRuntime* identities = nullptr; // recoverable VM process identities
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;
