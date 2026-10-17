@@ -52,6 +52,7 @@ struct RuntimeContext {
     std::string lbx;
     std::function<bool()> shutting_down = [] { return false; };
     std::function<bool()> optimize_sdcard = [] { return true; };
+    std::function<bool()> hugepage_auto_reserve = [] { return true; }; // app setting; off leaves the reserve alone
     std::function<Json::Value()> app_config = [] { return Json::Value(Json::objectValue); }; // ServerContext.appConfig
     // NetworkInstance.attachNic/detachNic; attach throws with the legacy text.
     std::function<void(const std::string& network, const Json::Value& nic, const std::string& tap)> attach_nic, detach_nic;

@@ -322,7 +322,8 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         HostFacts facts;
         facts.has_kvm = access("/dev/kvm", F_OK) == 0;
         facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
-        if (!relaunch && context_.pool && resolves_to_gunyah(config, facts) && context_.hugepages.resizable()) {
+        if (!relaunch && context_.pool && resolves_to_gunyah(config, facts) && context_.hugepages.resizable()
+                && context_.hugepage_auto_reserve()) {
             const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
             if (!context_.pool->reserve(id_, (mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb))
                 throw std::runtime_error("Could not set huge-page reserve target");
@@ -420,7 +421,8 @@ void VmRuntime::run() {
     bool ready = true;
     if (resolves_to_gunyah(config, facts)) {
         const bool required = context_.pool && context_.pool->contains(id_);
-        if (required || context_.hugepages.present()) {
+        // Automatic sizing off: start on the reserve as the user left it, without waiting.
+        if (required || (context_.hugepages.present() && context_.hugepage_auto_reserve())) {
             const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
             ready = context_.hugepages.wait((mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, aborted);
         }

@@ -57,6 +57,11 @@ VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) 
         const auto& value = config::member(app_config_, "optimize_sdcard");
         return value.isBool() ? value.asBool() : true;
     };
+    context_.hugepage_auto_reserve = [this] {
+        std::lock_guard lock(app_mutex_);
+        const auto& value = config::member(app_config_, "vm_hugepage_auto_reserve");
+        return value.isBool() ? value.asBool() : true;
+    };
     context_.app_config = [this] { return app_config(); };
 }
 VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
