@@ -26,7 +26,9 @@ bool disk_upload_command(const std::string& command) { return std::find(disk_upl
 constexpr std::array network_upload_commands{"network_config_import_begin", "network_config_import_append", "network_config_import_commit", "network_config_import_abort"};
 constexpr std::array delete_upload_commands{"network_config_delete_begin", "network_config_delete_append", "network_config_delete_commit", "network_config_delete_abort"};
 bool delete_upload_command(const std::string& command) { return std::find(delete_upload_commands.begin(), delete_upload_commands.end(), command) != delete_upload_commands.end(); }
-bool configuration_command(const std::string& command) { return command == "configuration_recover" || delete_upload_command(command); }
+constexpr std::array vm_disk_upload_commands{"configuration_vm_disks_begin", "configuration_vm_disks_append", "configuration_vm_disks_commit", "configuration_vm_disks_abort"};
+bool vm_disk_upload_command(const std::string& command) { return std::find(vm_disk_upload_commands.begin(), vm_disk_upload_commands.end(), command) != vm_disk_upload_commands.end(); }
+bool configuration_command(const std::string& command) { return command == "configuration_recover" || delete_upload_command(command) || vm_disk_upload_command(command); }
 bool network_upload_command(const std::string& command) { return std::find(network_upload_commands.begin(), network_upload_commands.end(), command) != network_upload_commands.end(); }
 bool vm_upload_command(const std::string& command) { return std::find(vm_upload_commands.begin(), vm_upload_commands.end(), command) != vm_upload_commands.end(); }
 bool vm_config_command(const std::string& command) { return command == "vm_config_status" || command == "vm_config_apply" || command == "vm_config_snapshot" || command == "vm_start_configured" || vm_upload_command(command); }
@@ -187,32 +189,45 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
             if (!caller.administrator || caller.principal.empty()) throw ServiceError(ErrorCode::permission_denied, "Administrator permission required");
             if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Configuration request must be an object");
-            const bool begin = command == "network_config_delete_begin", append = command == "network_config_delete_append";
+            const bool joint = vm_disk_upload_command(command);
+            if (joint && !configuration_->disks()) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
+            const bool begin = command == "network_config_delete_begin" || command == "configuration_vm_disks_begin";
+            const bool append = command == "network_config_delete_append" || command == "configuration_vm_disks_append";
             for (const auto& key : request.getMemberNames()) {
                 if (key == "type" || key == "command" || key == "request_id") continue;
-                if (command != "configuration_recover" && ((begin && (key == "revision" || key == "bytes"))
+                if (command != "configuration_recover" && ((begin && (key == "bytes" || (joint
+                    ? key == "vm_revision" || key == "disk_revision" : key == "revision")))
                     || (!begin && key == "upload_id") || (append && (key == "offset" || key == "data")))) continue;
                 throw ServiceError(ErrorCode::invalid_argument, "Unexpected configuration transaction field");
             }
             Json::Value result; result["success"] = true;
             if (command == "configuration_recover") { configuration_->recover(caller); return result; }
             if (begin) {
-                result["upload_id"] = vm_uploads_->begin_delete(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
+                result["upload_id"] = joint ? vm_uploads_->begin_vm_disks(caller, string_field(request, "vm_revision"),
+                    string_field(request, "disk_revision"), size_field(request, "bytes", 0))
+                    : vm_uploads_->begin_delete(caller, string_field(request, "revision"), size_field(request, "bytes", 0));
                 result["chunk_bytes"] = Json::UInt64(ConfigUploads::chunk_bytes);
                 result["expires_in_seconds"] = 120;
             } else {
                 const auto id = string_field(request, "upload_id");
-                if (command == "network_config_delete_commit") {
+                if (command == "configuration_vm_disks_commit") {
+                    const auto saved = vm_uploads_->commit_vm_disks(caller, id);
+                    result["vms"] = config_status(saved.vms);
+                    result["disks"] = config_status(saved.disks, "disks");
+                } else if (command == "configuration_vm_disks_abort") vm_uploads_->abort_vm_disks(caller, id);
+                else if (command == "network_config_delete_commit") {
                     const auto deleted = vm_uploads_->commit_delete(caller, id);
                     result = config_status(deleted.vms); result["network_id"] = deleted.id;
                 } else if (command == "network_config_delete_abort") vm_uploads_->abort_delete(caller, id);
                 else {
                     if (!request["data"].isString() || !request.isMember("offset"))
-                        throw ServiceError(ErrorCode::invalid_argument, "Missing deletion chunk data or offset");
+                        throw ServiceError(ErrorCode::invalid_argument, "Missing configuration chunk data or offset");
                     std::string bytes;
                     try { bytes = wire::decode_base64(request["data"].asString(), ConfigUploads::chunk_bytes); }
-                    catch (const std::exception&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid deletion chunk encoding"); }
-                    result["received"] = Json::UInt64(vm_uploads_->append_delete(caller, id, size_field(request, "offset", 0), bytes));
+                    catch (const std::exception&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid configuration chunk encoding"); }
+                    result["received"] = Json::UInt64(joint
+                        ? vm_uploads_->append_vm_disks(caller, id, size_field(request, "offset", 0), bytes)
+                        : vm_uploads_->append_delete(caller, id, size_field(request, "offset", 0), bytes));
                 }
             }
             return result;
@@ -767,6 +782,11 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : disk_upload_commands) result["commands"].append(name);
                 result["disk_config_upload"] = "revisioned-chunks-v1";
                 result["service_api_minor"] = 23;
+            }
+            if (configuration_ && configuration_->disks()) {
+                result["configuration_vm_disks"] = "revisioned-chunks-v1";
+                for (const auto* name : vm_disk_upload_commands) result["commands"].append(name);
+                result["service_api_minor"] = 24;
             }
         }
         return result;

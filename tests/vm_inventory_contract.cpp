@@ -297,6 +297,49 @@ void coordinated_vm_disk_readonly() {
     shared["vms"][0]["disks"][0]["readonly"] = true; shared["vms"][1]["disks"][0]["readonly"] = true;
     c.service.vms().replace(admin, saved.vms->revision, shared);
 }
+void coordinated_vm_disk_uploads() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
+    auto now = ConfigUploads::Clock::now();
+    ConfigUploads uploads(&c.service.vms(), &c.service.networks(), [&] { return now; }, {}, c.service.disks());
+    uploads.bind_vm_disks([&](const CallContext& caller, const std::string& vm, const std::string& disk, Json::Value vms, Json::Value disks) {
+        const auto saved = c.service.replace_vm_disks(caller, vm, disk, std::move(vms), std::move(disks));
+        return ConfigUploads::VmDisks{saved.vms, saved.disks};
+    });
+    Json::Value payload; payload["vms"] = input.baseline.vms->document; payload["disks"] = input.baseline.disks->document;
+    payload["vms"]["vms"][0]["disks"].clear(); payload["disks"]["disks"].clear();
+    auto bytes = config::encode_json(payload, ConfigUploads::max_vm_disk_bytes);
+    auto id = uploads.begin_vm_disks(admin, input.baseline.vms->revision, input.baseline.disks->revision, bytes.size());
+    check(uploads.append_vm_disks(admin, id, 0, bytes) == bytes.size() && uploads.append_vm_disks(admin, id, 0, bytes) == bytes.size(),
+        "joint upload duplicate chunk is idempotent");
+    auto stranger = admin; stranger.principal = "another administrator";
+    error(ErrorCode::permission_denied, [&] { uploads.commit_vm_disks(stranger, id); });
+    error(ErrorCode::not_found, [&] { uploads.append_disk(admin, id, 0, bytes); });
+    const auto saved = uploads.commit_vm_disks(admin, id);
+    check(saved.vms->document["vms"][0]["disks"].empty() && saved.disks->document["disks"].empty(), "joint staging invokes coordinator");
+    error(ErrorCode::not_found, [&] { uploads.commit_vm_disks(admin, id); });
+    error(ErrorCode::conflict, [&] { uploads.begin_vm_disks(admin, input.baseline.vms->revision, saved.disks->revision, 1); });
+    const std::string invalid = "{\"vms\":{},\"disks\":{},\"extra\":true}";
+    id = uploads.begin_vm_disks(admin, saved.vms->revision, saved.disks->revision, invalid.size());
+    uploads.append_vm_disks(admin, id, 0, invalid);
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_vm_disks(admin, id); });
+    error(ErrorCode::not_found, [&] { uploads.commit_vm_disks(admin, id); });
+    id = uploads.begin_vm_disks(admin, saved.vms->revision, saved.disks->revision, bytes.size());
+    uploads.append_vm_disks(admin, id, 0, bytes);
+    auto changed = saved.vms->document; changed["extension"] = "another writer";
+    const auto current = c.service.vms().replace(admin, saved.vms->revision, changed);
+    error(ErrorCode::conflict, [&] { uploads.commit_vm_disks(admin, id); });
+    error(ErrorCode::not_found, [&] { uploads.commit_vm_disks(admin, id); });
+    std::vector<std::string> held{
+        uploads.begin(admin, current->revision, 1), uploads.begin_network(admin, 1),
+        uploads.begin_disk(admin, saved.disks->revision, 1), uploads.begin_vm_disks(admin, current->revision, saved.disks->revision, 1)};
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_vm_disks(admin, current->revision, saved.disks->revision, 1); });
+    now += ConfigUploads::lifetime;
+    error(ErrorCode::not_found, [&] { uploads.abort_vm_disks(admin, held.back()); });
+    id = uploads.begin_vm_disks(admin, current->revision, saved.disks->revision, ConfigUploads::max_vm_disk_bytes);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_disk(admin, saved.disks->revision, DiskConfigService::max_bytes); });
+    uploads.abort_vm_disks(admin, id);
+    error(ErrorCode::invalid_argument, [&] { uploads.begin_vm_disks(admin, current->revision, saved.disks->revision, ConfigUploads::max_vm_disk_bytes + 1); });
+}
 void coordinated_disk_reference_races() {
     for (int attempt = 0; attempt < 16; ++attempt) {
         Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
@@ -715,6 +758,66 @@ void network_cleanup_during_recovery() {
     c.service.recover(admin);
     check(c.service.networks().exists(admin, id), "cleanup never removes persistent configuration");
 }
+std::string encode_chunk(const std::string& bytes) {
+    const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        const auto a = static_cast<unsigned char>(bytes[i]);
+        const auto b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
+        const auto d = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
+        encoded += alphabet[a >> 2]; encoded += alphabet[((a & 3) << 4) | (b >> 4)];
+        encoded += i + 1 < bytes.size() ? alphabet[((b & 15) << 2) | (d >> 6)] : '=';
+        encoded += i + 2 < bytes.size() ? alphabet[d & 63] : '=';
+    }
+    return encoded;
+}
+void coordinated_vm_disk_adapter() {
+    for (bool inject : {false, true}) {
+        Fixture fixture; bool fail = false;
+        Coordinated c(fixture, [&](const char* stage, size_t) {
+            if (fail && std::string_view(stage) == "participant_synced") throw std::runtime_error("joint adapter uncertainty");
+        }, true);
+        auto input = seed_vm_disk(c);
+        SystemService system([] { return true; }, [] { return "test"; }, "test", c.tasks.epoch());
+        RequestDispatcher dispatcher(system, c.tasks, &c.service.networks(), nullptr, nullptr, nullptr, &c.inventory);
+        dispatcher.set_configuration(&c.service);
+        ClientSession session; session.caller.authorized = true;
+        const auto caps = dispatcher.execute(session, "capabilities", {});
+        check(caps["configuration_vm_disks"] == "revisioned-chunks-v1" && caps["service_api_minor"] == 24
+            && dispatcher.background("configuration_vm_disks_commit"), "joint capability and worker dispatch");
+        auto rejected = [](const Json::Value& response, const char* code) {
+            check(response["success"] == false && response["error"]["code"] == code, "joint adapter structured rejection");
+        };
+        Json::Value payload; payload["vms"] = input.baseline.vms->document; payload["disks"] = input.baseline.disks->document;
+        payload["vms"]["vms"][0]["disks"].clear(); payload["disks"]["disks"].clear();
+        const auto bytes = config::encode_json(payload, ConfigUploads::max_vm_disk_bytes);
+        Json::Value begin; begin["vm_revision"] = input.baseline.vms->revision; begin["disk_revision"] = input.baseline.disks->revision;
+        begin["bytes"] = Json::UInt64(bytes.size());
+        rejected(dispatcher.execute_background({}, "configuration_vm_disks_begin", begin), "UNAUTHENTICATED");
+        auto bad = begin; bad["revision"] = "unexpected";
+        rejected(dispatcher.execute_background(admin, "configuration_vm_disks_begin", bad), "INVALID_ARGUMENT");
+        const auto started = dispatcher.execute_background(admin, "configuration_vm_disks_begin", begin);
+        check(started["success"] == true, "joint adapter begin");
+        // Idempotent participant binding must not discard the active joint upload.
+        dispatcher.set_vm_config(&c.service.vms()); dispatcher.set_disk_config(c.service.disks());
+        Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0; chunk["data"] = "bad!";
+        rejected(dispatcher.execute_background(admin, "configuration_vm_disks_append", chunk), "INVALID_ARGUMENT");
+        chunk["data"] = encode_chunk(std::string(bytes.data(), bytes.size()));
+        check(dispatcher.execute_background(admin, "configuration_vm_disks_append", chunk)["received"] == bytes.size(), "joint adapter chunk");
+        Json::Value commit; commit["upload_id"] = started["upload_id"]; fail = inject;
+        const auto result = dispatcher.execute_background(admin, "configuration_vm_disks_commit", commit);
+        if (inject) {
+            rejected(result, "COMMIT_UNCERTAIN"); fail = false;
+            check(dispatcher.execute_background(admin, "configuration_recover", Json::Value(Json::objectValue))["success"] == true,
+                "joint adapter explicit recovery");
+        } else check(result["success"] == true && result["vms"]["persisted"] == true && result["disks"]["persisted"] == true
+            && result["vms"]["revision"] != input.baseline.vms->revision && result["disks"]["revision"] != input.baseline.disks->revision,
+            "joint acknowledgement includes both versions");
+        rejected(dispatcher.execute_background(admin, "configuration_vm_disks_commit", commit), "NOT_FOUND");
+        check(c.service.vms().snapshot(admin)->document["vms"][0]["disks"].empty()
+            && c.service.disks()->snapshot(admin)->document["disks"].empty(), "joint adapter reaches coherent end state");
+    }
+}
 void coordinated_delete_adapter() {
     for (bool inject : {false, true}) {
         Fixture fixture;
@@ -751,16 +854,7 @@ void coordinated_delete_adapter() {
         check(started["success"] == true && started["chunk_bytes"] == 49152, "delete upload begun");
         // Encode a real request payload, keeping this fixture independent of the
         // production decoder. Full-size chunk handling is covered by upload tests.
-        const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        std::string encoded;
-        for (size_t i = 0; i < bytes.size(); i += 3) {
-            const auto a = static_cast<unsigned char>(bytes[i]);
-            const auto b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
-            const auto d = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
-            encoded += alphabet[a >> 2]; encoded += alphabet[((a & 3) << 4) | (b >> 4)];
-            encoded += i + 1 < bytes.size() ? alphabet[((b & 15) << 2) | (d >> 6)] : '=';
-            encoded += i + 2 < bytes.size() ? alphabet[d & 63] : '=';
-        }
+        const auto encoded = encode_chunk(std::string(bytes.data(), bytes.size()));
         Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0; chunk["data"] = encoded;
         check(dispatcher.execute_background(admin, "network_config_delete_append", chunk)["received"] == bytes.size(), "encoded delete confirmation accepted");
         Json::Value commit; commit["upload_id"] = started["upload_id"];
@@ -1268,6 +1362,8 @@ int main() {
         {"coordinated_vm_disk_failure_recovery", coordinated_vm_disk_failure_recovery},
         {"coordinated_vm_disk_restart", coordinated_vm_disk_restart},
         {"coordinated_vm_disk_readonly", coordinated_vm_disk_readonly},
+        {"coordinated_vm_disk_uploads", coordinated_vm_disk_uploads},
+        {"coordinated_vm_disk_adapter", coordinated_vm_disk_adapter},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},

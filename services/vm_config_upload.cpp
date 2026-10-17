@@ -103,13 +103,46 @@ ConfigUploads::DeletedNetwork ConfigUploads::commit_delete(const CallContext& ca
 void ConfigUploads::abort_delete(const CallContext& caller, const std::string& id) {
     abort_impl(caller, id, Kind::network_delete);
 }
-std::string ConfigUploads::begin_impl(const CallContext& caller, const std::string& revision, size_t bytes, Kind kind) {
+std::string ConfigUploads::begin_vm_disks(const CallContext& caller, const std::string& vm_revision,
+        const std::string& disk_revision, size_t bytes) {
+    access(caller);
+    if (!replacement_) throw ServiceError(ErrorCode::unavailable, "Joint VM/disk configuration is unavailable");
+    if (vm_revision.empty() || vm_revision.size() > 128 || disk_revision.empty() || disk_revision.size() > 128
+            || !bytes || bytes > max_vm_disk_bytes)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid joint configuration revisions or size");
+    if (store_->snapshot(caller)->revision != vm_revision || disks_->snapshot(caller)->revision != disk_revision)
+        throw ServiceError(ErrorCode::conflict, "VM or disk configuration changed; reload before saving");
+    return begin_impl(caller, vm_revision, bytes, Kind::vm_disks, disk_revision);
+}
+size_t ConfigUploads::append_vm_disks(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+    return append_impl(caller, id, offset, bytes, Kind::vm_disks);
+}
+ConfigUploads::VmDisks ConfigUploads::commit_vm_disks(const CallContext& caller, const std::string& id) {
+    VmDisks result;
+    consume_impl(caller, id, Kind::vm_disks, [&](const Upload& upload) {
+        if (store_->snapshot(caller)->revision != upload.revision || disks_->snapshot(caller)->revision != upload.disk_revision)
+            throw ServiceError(ErrorCode::conflict, "VM or disk configuration changed; reload before saving");
+        Json::Value document;
+        try { document = config::parse_json({upload.data.data(), upload.data.size()}); }
+        catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid joint configuration JSON"); }
+        if (!document.isObject() || document.size() != 2 || !document["vms"].isObject() || !document["disks"].isObject())
+            throw ServiceError(ErrorCode::invalid_argument, "Complete VM and disk documents are required");
+        result = replacement_(caller, upload.revision, upload.disk_revision, std::move(document["vms"]), std::move(document["disks"]));
+    });
+    return result;
+}
+void ConfigUploads::abort_vm_disks(const CallContext& caller, const std::string& id) {
+    abort_impl(caller, id, Kind::vm_disks);
+}
+std::string ConfigUploads::begin_impl(const CallContext& caller, const std::string& revision, size_t bytes, Kind kind,
+        const std::string& disk_revision) {
     std::lock_guard lock(mutex_);
     reap();
     if (uploads_.size() >= max_uploads || bytes + upload_overhead > max_reserved - reserved_)
         throw ServiceError(ErrorCode::resource_exhausted, "Upload capacity exhausted");
     auto upload = std::make_shared<Upload>();
     upload->principal = caller.principal; upload->revision = revision; upload->total = bytes;
+    upload->disk_revision = disk_revision;
     upload->kind = kind;
     upload->data.reserve(bytes);
     upload->reservation = upload->data.capacity() + upload_overhead;
@@ -173,6 +206,12 @@ Json::Value ConfigUploads::commit_network(const CallContext& caller, const std::
 }
 void ConfigUploads::consume(const CallContext& caller, const std::string& id, Kind kind,
         const std::function<void(const std::string&, std::string_view)>& apply) {
+    consume_impl(caller, id, kind, [&](const Upload& upload) {
+        apply(upload.revision, {upload.data.data(), upload.data.size()});
+    });
+}
+void ConfigUploads::consume_impl(const CallContext& caller, const std::string& id, Kind kind,
+        const std::function<void(const Upload&)>& apply) {
     access(caller);
     std::shared_ptr<Upload> upload;
     {
@@ -184,7 +223,7 @@ void ConfigUploads::consume(const CallContext& caller, const std::string& id, Ki
     // Keep both reservation and immutable bytes until parsing/persistence finish.
     // Neither expiry nor abort can release a commit's budget or mutate its bytes.
     try {
-        apply(upload->revision, {upload->data.data(), upload->data.size()});
+        apply(*upload);
         upload.reset(); finish(id);
     } catch (...) { upload.reset(); finish(id); throw; }
 }

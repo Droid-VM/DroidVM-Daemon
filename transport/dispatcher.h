@@ -66,11 +66,20 @@ public:
     void set_configuration(ConfigurationService* service) {
         if (!service || configuration_ || networks_ != &service->networks() || vms_ != &service->inventory() || &tasks_ != &service->events())
             throw std::invalid_argument("Configuration adapter participants do not match");
+        if (service->disks() && disk_config_ && service->disks() != disk_config_)
+            throw std::invalid_argument("Coordinated disk participant does not match");
         set_vm_config(&service->vms());
+        if (service->disks()) set_disk_config(service->disks());
         vm_uploads_ = std::make_unique<ConfigUploads>(vm_config_, networks_, [] { return ConfigUploads::Clock::now(); },
             [service, lifecycle = runtime_](const CallContext& caller, const std::string& revision, const Json::Value& expected) {
                 return service->remove_network(caller, revision, expected, lifecycle);
             }, disk_config_);
+        if (service->disks()) vm_uploads_->bind_vm_disks(
+            [service](const CallContext& caller, const std::string& vm_revision, const std::string& disk_revision,
+                    Json::Value vms, Json::Value disks) {
+                const auto result = service->replace_vm_disks(caller, vm_revision, disk_revision, std::move(vms), std::move(disks));
+                return ConfigUploads::VmDisks{result.vms, result.disks};
+            });
         configuration_ = service;
     }
     bool background(const std::string& command) const;
