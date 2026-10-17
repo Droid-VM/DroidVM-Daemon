@@ -7,19 +7,32 @@
 #include <dlfcn.h>
 #include <json/json.h>
 #include <fstream>
+#include <memory>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include "audio_profile.h"
 #include "audio_policy.h"
 
 namespace {
-// Private C++ ABI, scoped to the inspected firmware. This version returns a
-// libc++ vector; older Android versions use a count and caller-provided array.
-// The NDK and platform libc++ vector representations and allocation ABI must
-// agree. This probe does not claim that this is a stable Android interface.
-using ListPorts = int (*)(audio_port_role_t, audio_port_type_t,
-                         std::vector<audio_port_v7>&, unsigned int*);
+// Private C++ ABI. Android 17 (libaudiobase) returns a libc++ vector; earlier
+// releases (libaudioclient) fill a caller-provided array. The mangled names pin
+// the signature; the audio_port_v7 layout is checked per port below, since only
+// the profiled firmware has it verified. The NDK and platform libc++ vector
+// representations and allocation ABI must agree.
+using ListPortsVector = int (*)(audio_port_role_t, audio_port_type_t,
+                                std::vector<audio_port_v7>&, unsigned int*);
+using ListPortsArray = int (*)(audio_port_role_t, audio_port_type_t,
+                               unsigned int*, audio_port_v7*, unsigned int*);
+constexpr const char* kArraySymbol =
+    "_ZN7android11AudioSystem14listAudioPortsE17audio_port_role_t17audio_port_type_tPjP13audio_port_v7S3_";
+
+void* symbol_in(const char* library_name, const char* symbol) {
+    // Kept loaded for process lifetime: AudioSystem may retain Binder callbacks.
+    void* library = dlopen(library_name, RTLD_NOW | RTLD_LOCAL);
+    return library ? dlsym(library, symbol) : nullptr;
+}
 
 template<size_t N> std::string bounded_string(const char (&value)[N]) {
     const auto size = strnlen(value, N);
@@ -68,9 +81,9 @@ void run_audio_probe(Json::Value& report) {
     policy_input >> policy;
     char fingerprint[PROP_VALUE_MAX]{};
     __system_property_get("ro.build.fingerprint", fingerprint);
-    if (android_get_device_api_level() != profile["sdk"].asInt() ||
-        fingerprint != profile["fingerprint"].asString())
-        throw std::runtime_error("no verified audio ABI profile for this firmware");
+    const bool verified = android_get_device_api_level() == profile["sdk"].asInt() &&
+        fingerprint == profile["fingerprint"].asString();
+    report["verified_firmware"] = verified;
     if (sizeof(audio_port_v7) != profile["audio_port_v7_size"].asUInt() ||
         sizeof(std::vector<audio_port_v7>) != profile["vector_size"].asUInt())
         throw std::runtime_error("compiled audio ABI differs from firmware profile");
@@ -78,24 +91,55 @@ void run_audio_probe(Json::Value& report) {
     throw std::runtime_error("audio C++ ABI has only been verified on arm64-v8a");
 #endif
     report["fingerprint"] = fingerprint;
-    const auto symbol = profile["list_audio_ports_symbol"].asString();
-    report["private_abi"] = symbol;
+    const auto vector_symbol = profile["list_audio_ports_symbol"].asString();
     report["audio_port_v7_size"] = static_cast<Json::UInt64>(sizeof(audio_port_v7));
-    // Keep this library loaded for process lifetime: AudioSystem may retain
-    // Binder callbacks even after a query returns.
-    static void* library = dlopen(profile["library"].asCString(), RTLD_NOW | RTLD_LOCAL);
-    if (!library) throw std::runtime_error(dlerror());
-    auto list = reinterpret_cast<ListPorts>(dlsym(library, symbol.c_str()));
-    if (!list) throw std::runtime_error("profiled listAudioPorts symbol unavailable");
-    std::vector<audio_port_v7> ports;
+    static auto* list_vector = reinterpret_cast<ListPortsVector>(
+        symbol_in(profile["library"].asCString(), vector_symbol.c_str()));
+    static auto* list_array = reinterpret_cast<ListPortsArray>(symbol_in("libaudioclient.so", kArraySymbol));
+    std::vector<audio_port_v7> vector_ports;
+    // The array call may write a larger firmware struct: twice our size per port.
+    std::unique_ptr<audio_port_v7[]> array_ports;
+    const audio_port_v7* ports = nullptr;
+    size_t count = 0;
     unsigned generation = 0;
-    const auto status = list(AUDIO_PORT_ROLE_NONE, AUDIO_PORT_TYPE_DEVICE, ports, &generation);
+    int status = 0;
+    if (list_vector) {
+        report["private_abi"] = vector_symbol;
+        status = list_vector(AUDIO_PORT_ROLE_NONE, AUDIO_PORT_TYPE_DEVICE, vector_ports, &generation);
+        // size() and capacity() divide the firmware's byte spans by our element size.
+        const auto* begin = reinterpret_cast<const char*>(vector_ports.data());
+        const auto* end = reinterpret_cast<const char* const*>(&vector_ports)[1];
+        const auto* cap = reinterpret_cast<const char* const*>(&vector_ports)[2];
+        if (!verified && ((end - begin) % sizeof(audio_port_v7) || (cap - begin) % sizeof(audio_port_v7))) {
+            // A different element size: freeing with our size would trip sized delete.
+            new std::vector<audio_port_v7>(std::move(vector_ports));
+            throw std::runtime_error("audio port layout or bounds mismatch");
+        }
+        ports = vector_ports.data();
+        count = vector_ports.size();
+    } else if (list_array) {
+        report["private_abi"] = kArraySymbol;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            unsigned total = 0;
+            status = list_array(AUDIO_PORT_ROLE_NONE, AUDIO_PORT_TYPE_DEVICE, &total, nullptr, &generation);
+            if (status != 0 || total > 1024) break;
+            array_ports = std::make_unique<audio_port_v7[]>(2 * static_cast<size_t>(total) + 1);
+            unsigned filled = total;
+            const auto before = generation;
+            status = list_array(AUDIO_PORT_ROLE_NONE, AUDIO_PORT_TYPE_DEVICE, &filled, array_ports.get(), &generation);
+            count = std::min(filled, total);
+            if (status != 0 || (filled <= total && generation == before)) break;
+        }
+        ports = array_ports.get();
+    } else {
+        throw std::runtime_error("listAudioPorts unavailable on this firmware");
+    }
     report["audio_status"] = status;
     if (status != 0) throw std::runtime_error("listAudioPorts failed: " + std::to_string(status));
-    if (ports.size() > 1024) throw std::runtime_error("unreasonable audio port count");
+    if (count > 1024) throw std::runtime_error("unreasonable audio port count");
     report["generation"] = generation;
     auto& devices = report["devices"] = Json::Value(Json::arrayValue);
-    for (const auto& port : ports) {
+    for (const auto& port : std::span(ports, count)) {
         if (port.id <= 0 || port.type != AUDIO_PORT_TYPE_DEVICE ||
             (port.role != AUDIO_PORT_ROLE_SOURCE && port.role != AUDIO_PORT_ROLE_SINK) ||
             port.num_audio_profiles > AUDIO_PORT_MAX_AUDIO_PROFILES ||
