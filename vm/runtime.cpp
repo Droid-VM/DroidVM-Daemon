@@ -201,6 +201,9 @@ void VmRuntime::set_state(State next) {
         }
         state_ = next;
     }
+    if (context_.info && (next == State::running || next == State::rebooting || next == State::stopping))
+        context_.info("VM " + id_ + " (" + config::string(config(), "name") + "): " + lower(state_name(next)) +
+                      (next == State::running ? " pid=" + std::to_string(pid()) : std::string()));
     fire("state");
     if (context_.state_changed) {
         // Guarded: a state change never fails because of the keyboard.
@@ -221,6 +224,7 @@ void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
     data["event"] = event;
     if (event == "exited") {
         data["exit_code"] = exit_code_;
+        if (context_.info) context_.info("VM " + id_ + " (" + data["vm_name"].asString() + "): exited code=" + std::to_string(exit_code_));
         if (auto* stdio = log("stdio")) data["stdio"] = utf8_lossy(stdio->contents());
     }
     if (extra.isObject()) for (const auto& key : extra.getMemberNames()) data[key] = extra[key];
@@ -403,6 +407,7 @@ void VmRuntime::run() {
         config_["boot"] = config["boot"]; // BootConfig's accessors create what they read
     } catch (const std::exception& error) {
         stdio(std::string("boot resolution failed: ") + error.what() + "\n");
+        context_.warn("VM " + id_ + ": boot resolution failed: " + error.what());
         finish_stopped(-1);
         return;
     }
@@ -428,6 +433,7 @@ void VmRuntime::run() {
     try { launched = launch(config, plan, failure); } catch (const std::exception& error) { failure = error.what(); }
     if (!launched) {
         if (!failure.empty()) stdio(failure + "\n");
+        context_.warn("VM " + id_ + " (" + config::string(config, "name") + "): launch failed: " + failure);
         finish_stopped(-1);
         return;
     }

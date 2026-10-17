@@ -307,6 +307,7 @@ int main(int argc, char** argv) {
                     else owned_links->cleanup(network + "/" + tap); // network gone: remove the TAP directly
                 };
                 context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
+                context.info = [&](const std::string& text) { if (log) log->write("INFO", text); };
                 context.state_changed = [&](const std::string& id, const std::string& name, droidvm::VmState state) {
                     // VMInstance.setState: USB first, then the keyboard; each guarded.
                     if (usb) try { usb->on_vm_state(id, static_cast<droidvm::usb::VmState>(state)); }
