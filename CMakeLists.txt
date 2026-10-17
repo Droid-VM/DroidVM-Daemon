@@ -119,7 +119,7 @@ add_library(droidvm_pkg_core STATIC pkg/io.cpp pkg/compression.cpp pkg/tar.cpp p
 target_link_libraries(droidvm_pkg_core PUBLIC droidvm_vm droidvm_child droidvm_identity PRIVATE droidvm_zstd droidvm_lzma z)
 target_link_libraries(droidvm_network_backend PUBLIC droidvm_pkg_core)
 target_compile_options(droidvm_pkg_core PRIVATE -Wall -Wextra -Werror)
-add_library(droidvm_pkg STATIC pkg/service.cpp)
+add_library(droidvm_pkg STATIC pkg/service.cpp pkg/disk_operation.cpp)
 target_include_directories(droidvm_pkg PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(droidvm_pkg PUBLIC droidvm_pkg_core droidvm_network_backend)
 target_compile_options(droidvm_pkg PRIVATE -Wall -Wextra -Werror)

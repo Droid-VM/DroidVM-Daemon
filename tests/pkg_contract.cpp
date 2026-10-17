@@ -4,6 +4,7 @@
 #include "pkg/plan.h"
 #include "pkg/writer.h"
 #include "pkg/service.h"
+#include "pkg/disk_operation.h"
 #include "services/legacy_events.h"
 #include "services/vm.h"
 #include "services/network_config.h"
@@ -14,6 +15,8 @@
 #include "common/identity.h"
 #include "common/wire.h"
 #include <cstring>
+#include <dirent.h>
+#include <optional>
 #include <fcntl.h>
 #include <functional>
 #include <iostream>
@@ -1117,6 +1120,280 @@ void real_retained_rebase(const std::string& tool) {
         "real qemu inspection resolves relative backing from leased original path");
     Images(tool).validate_backing(*lease, files[2]->path(), files[1]->path());
 }
+
+// Coordinated in-place disk operations. data_dir empty = fake tool in the fixture.
+struct DiskOps {
+    Temporary dir;
+    const CallContext caller{"disk-owner", true, true, true};
+    std::string data_dir;
+    Fd directory;
+    std::shared_ptr<ConfigurationGate> gate;
+    vm::RuntimeContext runtime;
+    std::unique_ptr<VmService> vms;
+    std::unique_ptr<TaskService> tasks;
+    std::unique_ptr<ConfigurationService> configuration;
+    std::unique_ptr<DiskOperationService> operations;
+    std::function<void(const char*)> fault;
+    explicit DiskOps(const std::string& tool = {}) {
+        directory = Fd(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (tool.empty()) {
+            data_dir = dir.path;
+            check(make_dirs(dir.at("usr/bin")), "create fake tool directory");
+            // info: plain raw. convert: write a marker into the descriptor target.
+            put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
+                "echo \"$@\" >> " + dir.at("tool.log") + "\n"
+                "case \"$1\" in\n"
+                "info) printf '%s' '{\"format\":\"raw\"}' ;;\n"
+                "convert) [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
+                "  eval \"out=\\${$#}\"; printf converted > \"$out\" ;;\n"
+                "resize) ;;\n"
+                "*) exit 9 ;;\nesac\n");
+            check(chmod(dir.at("usr/bin/qemu-img").c_str(), 0700) == 0, "enable fake image tool");
+        } else data_dir = dirname(dirname(dirname(tool))); // <data>/usr/bin/qemu-img
+        open_services();
+    }
+    ~DiskOps() { close_services(); }
+    void open_services() {
+        gate = std::make_shared<ConfigurationGate>();
+        runtime.cache_dir = dir.path; runtime.data_dir = dir.path; runtime.owner = getuid(); runtime.configuration_gate = gate;
+        runtime.shutting_down = [] { return false; };
+        vms = std::make_unique<VmService>(runtime);
+        TaskLimits limits;
+        limits.background_workers = 2;
+        tasks = std::make_unique<TaskService>(limits, [] { return TaskService::Clock::now(); }, EventLimits{}, gate);
+        configuration = std::make_unique<ConfigurationService>(directory.get(), getuid(), gate, *vms, *tasks,
+            config::ConfigTransaction::Observer{}, true);
+        DiskOperationContext context;
+        context.configuration = configuration.get(); context.directory = directory.get(); context.owner = getuid();
+        context.data_dir = data_dir;
+        context.fault = [this](const char* stage) { if (fault) fault(stage); };
+        operations = std::make_unique<DiskOperationService>(context);
+    }
+    void close_services() {
+        if (tasks) tasks->shutdown();
+        operations.reset(); configuration.reset(); tasks.reset(); vms.reset();
+    }
+    // Simulated daemon death: no cleanup beyond what a crash would leave.
+    void restart() { close_services(); open_services(); }
+    std::string revision() { return configuration->disks()->snapshot(caller)->revision; }
+    std::string add(const std::string& name, const std::optional<std::string>& parent = {}) {
+        const auto before = configuration->disks()->snapshot(caller);
+        auto document = before->document;
+        Json::Value row;
+        row["id"] = random_id(true); row["name"] = name; row["folder"] = dir.path;
+        if (parent) row["parent"] = *parent;
+        document["disks"].append(row);
+        configuration->disks()->replace(caller, before->revision, document);
+        return row["id"].asString();
+    }
+    Json::Value row(const std::string& id) {
+        for (const auto& row : configuration->disks()->snapshot(caller)->document["disks"]) if (row["id"] == id) return row;
+        return Json::Value();
+    }
+    Json::Value request(const std::string& id, const std::string& action) {
+        Json::Value value;
+        value["disk_revision"] = revision(); value["disk_id"] = id; value["action"] = action;
+        return value;
+    }
+    TaskView run(const Json::Value& request) {
+        using namespace std::chrono_literals;
+        const auto response = operations->start(caller, request);
+        const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+        const auto deadline = TaskService::Clock::now() + 60s;
+        auto task = tasks->get(caller, ref);
+        while (!task_terminal(task.state) && TaskService::Clock::now() < deadline) {
+            std::this_thread::sleep_for(2ms); task = tasks->get(caller, ref);
+        }
+        check(task_terminal(task.state), "disk operation bounded completion");
+        return task;
+    }
+};
+ErrorCode start_error(DiskOps& ops, const Json::Value& request, const CallContext* caller = nullptr) {
+    try { ops.operations->start(caller ? *caller : ops.caller, request); }
+    catch (const ServiceError& error) { return error.code(); }
+    throw std::runtime_error("disk operation admission unexpectedly succeeded");
+}
+size_t temporaries(const std::string& path) {
+    size_t count = 0;
+    std::unique_ptr<DIR, decltype(&closedir)> listing(opendir(path.c_str()), &closedir);
+    while (const auto* entry = listing ? readdir(listing.get()) : nullptr)
+        if (std::string_view(entry->d_name).starts_with(".dvm-")) ++count;
+    return count;
+}
+ino_t inode_of(const std::string& path) {
+    struct stat info{};
+    check(stat(path.c_str(), &info) == 0, "stat disk image");
+    return info.st_ino;
+}
+void disk_operation_admission() {
+    DiskOps ops;
+    put(ops.dir.at("a.img"), "original"); put(ops.dir.at("b.img"), "base");
+    const auto a = ops.add("a.img"), b = ops.add("b.img");
+    const CallContext anonymous{};
+    check(start_error(ops, ops.request(a, "convert"), &anonymous) == ErrorCode::unauthenticated,
+        "disk operations require authentication");
+    auto stale = ops.request(a, "convert"); stale["disk_revision"] = "stale";
+    check(start_error(ops, stale) == ErrorCode::conflict, "stale disk revision rejected");
+    check(start_error(ops, ops.request(random_id(true), "convert")) == ErrorCode::not_found, "unknown disk rejected");
+    auto bad = ops.request(a, "resize");
+    check(start_error(ops, bad) == ErrorCode::invalid_argument, "resize needs size");
+    bad = ops.request(a, "convert"); bad["format"] = "vmdk";
+    check(start_error(ops, bad) == ErrorCode::invalid_argument, "unsupported target format rejected");
+    check(start_error(ops, ops.request(a, "flatten")) == ErrorCode::conflict, "standalone disk cannot flatten");
+    {
+        auto writer = ops.configuration->disk_files()->acquire({{ops.dir.at("a.img"), false}});
+        check(start_error(ops, ops.request(a, "convert")) == ErrorCode::conflict, "running VM read lease blocks rewrite");
+    }
+    put(ops.dir.at("c.img"), "child");
+    ops.add("c.img", b);
+    check(start_error(ops, ops.request(b, "convert")) == ErrorCode::conflict, "disk with overlays cannot be rewritten");
+    check(bytes_of(ops.dir.at("a.img")) == "original" && temporaries(ops.dir.path) == 0, "rejected admission changes nothing");
+}
+void disk_operation_journal() {
+    DiskOps ops;
+    put(ops.dir.at("a.img"), "original"); put(ops.dir.at("b.img"), "other");
+    check(chmod(ops.dir.at("a.img").c_str(), 0640) == 0, "set source mode");
+    const auto a = ops.add("a.img"), b = ops.add("b.img");
+    // Registry edits racing the image rewrite: held row and new children fail, others pass.
+    bool held_rejected = false, child_rejected = false, unrelated_saved = false;
+    ops.fault = [&](const char* stage) {
+        if (std::string_view(stage) != "converted") return;
+        const auto before = ops.configuration->disks()->snapshot(ops.caller);
+        auto renamed = before->document;
+        for (auto& row : renamed["disks"]) if (row["id"] == a) row["name"] = "moved.img";
+        try { ops.configuration->disks()->replace(ops.caller, before->revision, renamed); }
+        catch (const ServiceError& error) { held_rejected = error.code() == ErrorCode::conflict; }
+        auto child = before->document;
+        Json::Value row; row["id"] = random_id(true); row["name"] = "x.img"; row["folder"] = ops.dir.path; row["parent"] = a;
+        child["disks"].append(row);
+        try { ops.configuration->disks()->replace(ops.caller, before->revision, child); }
+        catch (const ServiceError& error) { child_rejected = error.code() == ErrorCode::conflict; }
+        auto unrelated = before->document;
+        for (auto& row : unrelated["disks"]) if (row["id"] == b) row["note"] = "edited";
+        ops.configuration->disks()->replace(ops.caller, before->revision, unrelated);
+        unrelated_saved = true;
+    };
+    const auto old_inode = inode_of(ops.dir.at("a.img"));
+    auto task = ops.run(ops.request(a, "convert"));
+    check(task.state == TaskState::succeeded && task.result["format"] == "raw", "convert succeeds");
+    check(held_rejected && child_rejected && unrelated_saved, "reservation blocks only held rows and new children");
+    struct stat info{};
+    check(stat(ops.dir.at("a.img").c_str(), &info) == 0 && (info.st_mode & 07777) == 0640 && info.st_ino != old_inode,
+        "replacement keeps mode under a new inode");
+    check(bytes_of(ops.dir.at("a.img")) == "converted" && temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0,
+        "convert replaces image and clears journal");
+    check(ops.row(a)["name"] == "a.img", "convert keeps the registry row");
+    ops.fault = {};
+    put(ops.dir.at("fail"), "");
+    task = ops.run(ops.request(a, "convert"));
+    check(task.state == TaskState::failed && task.error == ErrorCode::io_error, "tool failure reported");
+    check(bytes_of(ops.dir.at("a.img")) == "converted" && temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0,
+        "tool failure removes the partial copy");
+    check(unlink(ops.dir.at("fail").c_str()) == 0, "clear failure marker");
+    put(ops.dir.at("slow"), "");
+    {
+        using namespace std::chrono_literals;
+        const auto response = ops.operations->start(ops.caller, ops.request(a, "convert"));
+        const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+        const auto deadline = TaskService::Clock::now() + 10s;
+        while (temporaries(ops.dir.path) == 0 && TaskService::Clock::now() < deadline) std::this_thread::sleep_for(2ms);
+        std::this_thread::sleep_for(100ms);
+        ops.tasks->cancel(ops.caller, ref);
+        auto view = ops.tasks->get(ops.caller, ref);
+        while (!task_terminal(view.state) && TaskService::Clock::now() < deadline) { std::this_thread::sleep_for(2ms); view = ops.tasks->get(ops.caller, ref); }
+        check(view.state == TaskState::cancelled, "convert cancellation stops the tool");
+    }
+    check(bytes_of(ops.dir.at("a.img")) == "converted" && temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0,
+        "cancellation removes the partial copy");
+    check(unlink(ops.dir.at("slow").c_str()) == 0, "clear slow marker");
+    // Crash with a journaled partial copy: no new operation until replay removes it.
+    put(ops.dir.at("a.img"), "original");
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "prepared") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(a, "convert"));
+    check(task.state == TaskState::failed && temporaries(ops.dir.path) == 1 && ops.operations->pending() == 1, "crash leaves journaled copy");
+    ops.fault = {};
+    check(start_error(ops, ops.request(a, "convert")) == ErrorCode::unavailable, "unrecovered disk refuses new operation");
+    ops.restart();
+    check(temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0 && bytes_of(ops.dir.at("a.img")) == "original",
+        "restart removes only the partial copy");
+    // Crash after replacement: the new image stays and replay only clears the record.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(a, "convert"));
+    check(task.state == TaskState::failed && ops.operations->pending() == 1, "post-rename crash keeps record");
+    ops.fault = {};
+    ops.restart();
+    check(bytes_of(ops.dir.at("a.img")) == "converted" && temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0,
+        "replay keeps completed replacement");
+    // A replaced temporary name is never deleted by replay.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "prepared") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(a, "convert"));
+    ops.fault = {};
+    std::string temporary;
+    {
+        std::unique_ptr<DIR, decltype(&closedir)> listing(opendir(ops.dir.path.c_str()), &closedir);
+        while (const auto* entry = readdir(listing.get())) if (std::string_view(entry->d_name).starts_with(".dvm-")) temporary = entry->d_name;
+    }
+    // Allocate the foreign inode before the journaled one is freed.
+    put(ops.dir.at("foreign.tmp"), "foreign");
+    check(!temporary.empty() && rename(ops.dir.at("foreign.tmp").c_str(), ops.dir.at(temporary).c_str()) == 0, "replace journaled copy");
+    ops.restart();
+    check(ops.operations->pending() == 1 && bytes_of(ops.dir.at(temporary)) == "foreign", "foreign file at temporary name is kept");
+    check(unlink(ops.dir.at(temporary).c_str()) == 0, "remove foreign file");
+    check(ops.operations->recover(ops.caller)["pending"].asUInt64() == 0, "administrator recovery clears resolved record");
+    // Resize keeps the inode, passes an explicit no-backing node and the size.
+    const auto kept = inode_of(ops.dir.at("a.img"));
+    auto resize = ops.request(a, "resize"); resize["size"] = Json::Int64(1048576); resize["shrink"] = true;
+    task = ops.run(resize);
+    const auto log = bytes_of(ops.dir.at("tool.log"));
+    check(task.state == TaskState::succeeded && inode_of(ops.dir.at("a.img")) == kept, "resize edits the leased inode in place");
+    check(log.find("resize --shrink json:{\"driver\":\"raw\",\"file\":{\"driver\":\"file\",\"filename\":\"/proc/self/fd/") != std::string::npos
+        && log.find("1048576") != std::string::npos, "resize uses retained descriptor and exact size");
+}
+Json::Value real_info(const std::string& tool, const std::string& path) {
+    ChildOptions options;
+    options.argv = {tool, "info", "--output=json", path};
+    const auto result = Child(options).communicate({}, std::chrono::seconds(10));
+    check(result.exit_code == 0 && !result.timed_out, "real qemu-img info");
+    return parse_object(result.output);
+}
+std::string real_head(const std::string& tool, const std::string& path, const std::string& out) {
+    ChildOptions options;
+    options.argv = {tool, "convert", "-O", "raw", path, out};
+    const auto result = Child(options).communicate({}, std::chrono::seconds(30));
+    check(result.exit_code == 0 && !result.timed_out, "real qemu-img reads image view");
+    return bytes_of(out).substr(0, 8);
+}
+void real_disk_operations(const std::string& tool) {
+    DiskOps ops(tool);
+    std::string base(1u << 20, '\0');
+    base.replace(0, 8, "BASEDATA");
+    put(ops.dir.at("base.raw"), base);
+    ChildOptions create;
+    create.argv = {tool, "create", "-f", "qcow2", "-F", "raw", "-b", ops.dir.at("base.raw"), ops.dir.at("ov.qcow2")};
+    check(Child(create).communicate({}, std::chrono::seconds(10)).exit_code == 0, "create real overlay");
+    const auto base_id = ops.add("base.raw"), overlay = ops.add("ov.qcow2", base_id);
+    auto resize = ops.request(overlay, "resize"); resize["size"] = Json::Int64(2u << 20);
+    auto task = ops.run(resize);
+    auto info = real_info(tool, ops.dir.at("ov.qcow2"));
+    check(task.state == TaskState::succeeded && info["virtual-size"].asInt64() == (2 << 20)
+        && info["backing-filename"] == ops.dir.at("base.raw"), "real resize keeps overlay backing");
+    auto convert = ops.request(overlay, "convert"); convert["compress"] = "zstd";
+    task = ops.run(convert);
+    info = real_info(tool, ops.dir.at("ov.qcow2"));
+    check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw")
+        && info["format-specific"]["data"]["compression-type"] == "zstd", "real convert keeps durable backing");
+    check(real_head(tool, ops.dir.at("ov.qcow2"), ops.dir.at("view1.raw")) == "BASEDATA", "converted overlay reads base");
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(overlay, "flatten"));
+    check(task.state == TaskState::failed && ops.row(overlay).isMember("parent"), "flatten crash leaves registry link");
+    ops.fault = {};
+    ops.restart();
+    info = real_info(tool, ops.dir.at("ov.qcow2"));
+    check(ops.operations->pending() == 0 && !ops.row(overlay).isMember("parent") && !info.isMember("backing-filename"),
+        "replay completes flatten registry update");
+    check(rename(ops.dir.at("base.raw").c_str(), ops.dir.at("base.moved").c_str()) == 0, "move former base");
+    check(real_head(tool, ops.dir.at("ov.qcow2"), ops.dir.at("view2.raw")) == "BASEDATA", "flattened image is standalone");
+}
 }
 
 int main(int argc, char** argv) {
@@ -1147,15 +1424,19 @@ int main(int argc, char** argv) {
         {"leased image inspection failure", [] { leased_image_inspection("failure"); }},
         {"leased image malformed metadata", [] { leased_image_inspection("malformed"); }},
         {"leased image external data rejected", [] { leased_image_inspection("external-data"); }},
-        {"leased image replacement", [] { leased_image_inspection("replacement"); }}};
+        {"leased image replacement", [] { leased_image_inspection("replacement"); }},
+        {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};
     } else if (argc == 4 && std::string_view(argv[1]) == "--qemu-tools") {
         const std::string image_tool = argv[2], system_tool = argv[3];
         tests = {{"real QEMU retained block graph", [=] { real_qemu_disk_graph(image_tool, system_tool); }}};
+    } else if (argc == 3 && std::string_view(argv[1]) == "--disk-ops") {
+        const std::string tool = argv[2];
+        tests = {{"real coordinated disk operations", [tool] { real_disk_operations(tool); }}};
     } else if (argc != 1) {
-        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img | --qemu-tools /path/to/qemu-img /path/to/qemu-system]\n";
+        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img | --qemu-tools /path/to/qemu-img /path/to/qemu-system | --disk-ops /path/to/qemu-img]\n";
         return 2;
     }
     Json::Value report;

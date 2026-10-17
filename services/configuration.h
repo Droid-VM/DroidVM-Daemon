@@ -5,6 +5,9 @@
 #include "vm_config.h"
 #include "store/config_transaction.h"
 #include "store/disk_file_leases.h"
+#include <map>
+#include <mutex>
+#include <set>
 
 namespace droidvm {
 class VmService;
@@ -35,6 +38,15 @@ public:
     // File-operation callers must add header/file leases before exposing an API.
     VmDiskResult replace_vm_disks(const CallContext& caller, const std::string& vm_revision,
         const std::string& disk_revision, Json::Value vms, Json::Value disks);
+    // Disk file operations hold registry rows while their images change. Edits
+    // must not change/remove a held row or add children to an exclusively held
+    // one, except the owner's own commit. Admission is serialized with registry
+    // writers and requires the exact observed disk revision.
+    using DiskReservation = std::shared_ptr<const void>;
+    DiskReservation reserve_disks(const std::string& disk_revision,
+        const std::set<std::string>& exclusive, const std::set<std::string>& shared);
+    VmDiskResult replace_vm_disks(const CallContext& caller, const std::string& vm_revision,
+        const std::string& disk_revision, Json::Value vms, Json::Value disks, const DiskReservation& owner);
     // Only an administrator may retry durable redo; this does not resubmit a
     // deletion against a newer baseline. Failure keeps the common gate closed.
     void recover(const CallContext& caller);
@@ -50,6 +62,10 @@ private:
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     std::shared_ptr<DiskConfigSnapshot> pending_disk_;
+    struct Reserved { const void* writer = nullptr; std::map<const void*, size_t> readers; };
+    mutable std::mutex reservations_mutex_;
+    std::map<std::string, Reserved> reservations_;
+    void check_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const;
     void publish_pending();
     void commit_pending(const std::vector<config::ConfigTransaction::Update>& updates,
         ConfigurationCommit& runtime, ConfigurationGate::Transaction& exclusive);

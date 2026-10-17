@@ -143,6 +143,7 @@ void ConfigurationService::validate_vm_disks(const Json::Value& before, const Js
 void ConfigurationService::validate_disk_change(const Json::Value& before, const Json::Value& after) const {
     try { config::validate_disk_transition(before, after); }
     catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+    check_reservations(before, after, nullptr);
     // Disk writes hold the exclusive gate, so no VM writer/start can pass this
     // check concurrently. Registry-only uploads cannot detach referenced images
     // or alter a referenced row's metadata; those require a coordinated operation.
@@ -320,8 +321,95 @@ void ConfigurationService::commit_pending(const std::vector<config::ConfigTransa
     pending_vm_.reset(); pending_network_.reset(); pending_disk_.reset();
     exclusive.recovered();
 }
+namespace {
+std::map<std::string, Json::Value> disk_rows(const Json::Value& document) {
+    std::map<std::string, Json::Value> rows;
+    for (const auto& row : document["disks"]) {
+        try { rows.emplace(config::uuid(row), row); } catch (const std::invalid_argument&) {}
+    }
+    return rows;
+}
+}
+void ConfigurationService::check_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const {
+    std::lock_guard lock(reservations_mutex_);
+    if (reservations_.empty()) return;
+    const auto old_rows = disk_rows(before), new_rows = disk_rows(after);
+    for (const auto& [id, held] : reservations_) {
+        const bool foreign = (held.writer && held.writer != owner)
+            || std::any_of(held.readers.begin(), held.readers.end(), [&](const auto& reader) { return reader.first != owner; });
+        if (!foreign) continue;
+        const auto old_row = old_rows.find(id), new_row = new_rows.find(id);
+        if (old_row != old_rows.end() && (new_row == new_rows.end() || new_row->second != old_row->second))
+            throw ServiceError(ErrorCode::conflict, "A disk operation is using this disk; wait for it to finish");
+    }
+    for (const auto& [id, row] : new_rows) {
+        const auto old_row = old_rows.find(id);
+        if (old_row != old_rows.end() && old_row->second == row) continue;
+        const auto& parent = config::member(row, "parent");
+        if (!parent.isString()) continue;
+        const auto held = reservations_.find(parent.asString());
+        if (held != reservations_.end() && held->second.writer && held->second.writer != owner)
+            throw ServiceError(ErrorCode::conflict, "A disk operation is rewriting the parent disk; wait for it to finish");
+    }
+}
+ConfigurationService::DiskReservation ConfigurationService::reserve_disks(const std::string& disk_revision,
+        const std::set<std::string>& exclusive, const std::set<std::string>& shared) {
+    if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
+    // Exclusive admission orders this against registry commits: a reservation
+    // either sees the committed revision or blocks the later edit.
+    auto transaction = gate_->transaction(); transaction.require_available();
+    std::lock_guard disk_writer(disks_->writer_mutex_);
+    if (disks_->state()->revision != disk_revision)
+        throw ServiceError(ErrorCode::conflict, "Disk configuration changed; reload before starting the operation");
+    struct Holder {
+        ConfigurationService* service;
+        std::set<std::string> exclusive, shared;
+        ~Holder() {
+            std::lock_guard lock(service->reservations_mutex_);
+            for (const auto& id : exclusive) {
+                auto found = service->reservations_.find(id);
+                if (found == service->reservations_.end()) continue;
+                found->second.writer = nullptr;
+                if (found->second.readers.empty()) service->reservations_.erase(found);
+            }
+            for (const auto& id : shared) {
+                auto found = service->reservations_.find(id);
+                if (found == service->reservations_.end()) continue;
+                auto reader = found->second.readers.find(this);
+                if (reader != found->second.readers.end() && !--reader->second) found->second.readers.erase(reader);
+                if (!found->second.writer && found->second.readers.empty()) service->reservations_.erase(found);
+            }
+        }
+    };
+    auto holder = std::make_shared<Holder>();
+    holder->service = this;
+    std::lock_guard lock(reservations_mutex_);
+    for (const auto& id : exclusive) {
+        const auto found = reservations_.find(id);
+        if (shared.contains(id) || (found != reservations_.end() && (found->second.writer || !found->second.readers.empty())))
+            throw ServiceError(ErrorCode::conflict, "Another disk operation is using this disk");
+    }
+    for (const auto& id : shared) {
+        const auto found = reservations_.find(id);
+        if (found != reservations_.end() && found->second.writer)
+            throw ServiceError(ErrorCode::conflict, "Another disk operation is rewriting this disk");
+    }
+    // No allocation failure may leave a partial reservation behind. The holder
+    // is released after this lock if publication fails.
+    holder->exclusive = exclusive; holder->shared = shared;
+    auto next = reservations_;
+    for (const auto& id : exclusive) next[id].writer = holder.get();
+    for (const auto& id : shared) ++next[id].readers[holder.get()];
+    reservations_.swap(next);
+    return holder;
+}
 ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const CallContext& caller,
         const std::string& vm_revision, const std::string& disk_revision, Json::Value vms, Json::Value disks) {
+    return replace_vm_disks(caller, vm_revision, disk_revision, std::move(vms), std::move(disks), nullptr);
+}
+ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const CallContext& caller,
+        const std::string& vm_revision, const std::string& disk_revision, Json::Value vms, Json::Value disks,
+        const DiskReservation& owner) {
     access(caller);
     if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
     if (vm_revision.empty() || vm_revision.size() > 128 || disk_revision.empty() || disk_revision.size() > 128)
@@ -338,6 +426,7 @@ ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const 
     disk_next->document = DiskConfigService::normalize(std::move(disks));
     try { config::validate_disk_transition(disk_before->document, disk_next->document); }
     catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+    check_reservations(disk_before->document, disk_next->document, owner.get());
     validate_vm_networks(vm_before->document, vm_next->document);
     validate_vm_disks(vm_before->document, vm_next->document, disk_before->document, disk_next->document);
     if (vm_next->document == vm_before->document && disk_next->document == disk_before->document
