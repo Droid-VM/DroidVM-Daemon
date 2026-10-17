@@ -22,6 +22,8 @@
 #include "usb/service.h"
 #include "usb/watch.h"
 #include "pkg/service.h"
+#include "pkg/disk_operation.h"
+#include "services/configuration.h"
 #include "vm/host_facts.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
@@ -93,6 +95,7 @@ int main(int argc, char** argv) {
     try {
         std::string directory, data_directory, apk;
         bool force = false;
+        bool configuration_owner = false;
         droidvm::config::JsonFile::Observer observer;
 #ifdef DROIDVM_NETWORK_DELAY_FIXTURE
         int write_delay_ms = 0;
@@ -106,11 +109,13 @@ int main(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--help") {
                 std::cout << "Usage: droidvmd (--data-dir <app-data-directory> | --run-dir <existing-directory>)\n"
-                             "                --apk <installed-apk> [--force]\n"
+                             "                --apk <installed-apk> [--force] [--configuration-owner]\n"
+                             "--configuration-owner permanently takes VM/network/disk configuration ownership.\n"
                              "--data-dir creates run/ and cache/daemon.log owned by the data directory UID.\n"
                              "Development native daemon; system, tasks and network configuration APIs.\n";
                 return 0;
             } else if (arg == "--force") force = true;
+            else if (arg == "--configuration-owner") configuration_owner = true;
             else if (arg == "--run-dir" && i + 1 < argc) directory = argv[++i];
             else if (arg == "--data-dir" && i + 1 < argc) data_directory = argv[++i];
             else if (arg == "--apk" && i + 1 < argc) apk = argv[++i];
@@ -129,6 +134,8 @@ int main(int argc, char** argv) {
         }
         if ((directory.empty() == data_directory.empty()) || apk.empty())
             throw std::runtime_error("exactly one of --run-dir/--data-dir and --apk are required");
+        if (configuration_owner && data_directory.empty())
+            throw std::runtime_error("--configuration-owner requires --data-dir");
 #ifdef DROIDVM_KEYBOARD_FIXTURE
         if (keyboard_name.empty()) throw std::runtime_error("--test-keyboard-name is required");
 #endif
@@ -153,10 +160,10 @@ int main(int argc, char** argv) {
         std::unique_ptr<droidvm::Instance> instance;
         if (!data_directory.empty()) {
             layout = std::make_unique<droidvm::RuntimeLayout>(data_directory);
-            // This entry point still uses the legacy VM inventory. Refuse before
-            // --force can terminate a daemon that owns persistent configuration.
+            // Without --configuration-owner this entry point uses the legacy VM inventory.
+            // Refuse before --force can terminate a daemon that owns persistent configuration.
             auto files = layout->open_files();
-            droidvm::config::require_legacy_vm_config(files.get(), layout->owner());
+            if (!configuration_owner) droidvm::config::require_legacy_vm_config(files.get(), layout->owner());
             instance = std::make_unique<droidvm::Instance>(layout->take_run_directory(), force, layout->owner());
         } else instance = std::make_unique<droidvm::Instance>(directory, force);
         std::unique_ptr<droidvm::RuntimeLog> log;
@@ -225,8 +232,15 @@ int main(int argc, char** argv) {
             droidvm::LegacyEvents legacy_events;
             droidvm::TaskLimits task_limits;
             task_limits.background_workers = 2;
-            droidvm::TaskService tasks(task_limits); // joins before legacy events and domain services disappear
+            // One gate admits configuration readers/writers and VM starts in coordinated mode.
+            const auto configuration_gate = configuration_owner ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
+            droidvm::TaskService tasks(task_limits, [] { return droidvm::TaskService::Clock::now(); }, {}, configuration_gate); // joins before legacy events and domain services disappear
             std::unique_ptr<droidvm::pkg::PkgService> packages; // reaches vms, networks and the events
+            // Declared after vms/tasks: destroyed first, while both still exist.
+            std::unique_ptr<droidvm::ConfigurationService> configuration;
+            std::unique_ptr<droidvm::pkg::DiskOperationService> disk_operations;
+            droidvm::NetworkConfigService* network_config = nullptr; // owned by networks or configuration
+            std::string tool_data_dir;
 #ifdef DROIDVM_PLATFORM_SERVICES
             droidvm::platform::AudioTable audio_table;
 #endif
@@ -263,6 +277,8 @@ int main(int argc, char** argv) {
                 context.cache_dir = (data / "cache").string();
                 context.run_dir = (data / "run").string();
                 context.lbx = (data / "bin/lbx").string();
+                context.configuration_gate = configuration_gate;
+                tool_data_dir = context.data_dir;
                 // The USB gadget is global host state: only the app's own data directory owns the pool.
                 if (same) {
                     droidvm::vm::AcmOptions options;
@@ -273,7 +289,7 @@ int main(int argc, char** argv) {
                 const droidvm::CallContext internal{"vm-runtime", true, true, true};
                 context.attach_nic = [&, internal](const std::string& network, const Json::Value& nic, const std::string& tap) {
                     Json::Value config;
-                    try { config = networks->get(internal, network); }
+                    try { config = network_config->get(internal, network); }
                     catch (const droidvm::ServiceError& error) {
                         if (error.code() == droidvm::ErrorCode::not_found) throw std::runtime_error("Network " + network + " not found");
                         throw;
@@ -287,7 +303,7 @@ int main(int argc, char** argv) {
                     network_runtime->attach_nic(internal, network, sane, tap);
                 };
                 context.detach_nic = [&, internal](const std::string& network, const Json::Value& nic, const std::string& tap) {
-                    if (networks->exists(internal, network)) network_runtime->detach_nic(internal, network, nic, tap);
+                    if (network_config->exists(internal, network)) network_runtime->detach_nic(internal, network, nic, tap);
                     else owned_links->cleanup(network + "/" + tap); // network gone: remove the TAP directly
                 };
                 context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
@@ -301,7 +317,8 @@ int main(int argc, char** argv) {
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);
                 };
-                vms = std::make_unique<droidvm::VmService>(files.get(), context);
+                // The coordinator loads the inventory itself; it must attach to an empty service.
+                vms = configuration_owner ? std::make_unique<droidvm::VmService>(context) : std::make_unique<droidvm::VmService>(files.get(), context);
                 droidvm::input::KeyboardGrab::Hooks keys;
                 keys.find = [&, internal](const std::string& id) -> std::optional<std::string> {
                     try { return vms->runtime(internal, id)->id(); }
@@ -344,11 +361,19 @@ int main(int argc, char** argv) {
                 }
                 if (log && !vms->load_error().empty() && vms->load_error() != "absent")
                     log->write("WARN", "VM inventory not loaded: " + vms->load_error());
-                networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer, &tasks);
+                if (configuration_owner) {
+                    // Claims VM/network/disk ownership and replays its journal before loading.
+                    configuration = std::make_unique<droidvm::ConfigurationService>(files.get(), layout->owner(), configuration_gate, *vms, tasks,
+                        droidvm::config::ConfigTransaction::Observer{}, true);
+                    network_config = &configuration->networks();
+                } else {
+                    networks = std::make_unique<droidvm::NetworkConfigService>(files.get(), layout->owner(), observer, &tasks);
+                    network_config = networks.get();
+                }
                 host_network = std::make_unique<droidvm::NetworkHostService>(
                     (std::filesystem::absolute(data_directory) / "bin/netbox").string());
                 const auto binaries = std::filesystem::absolute(data_directory) / "bin";
-                network_runtime = std::make_unique<droidvm::NetworkService>(*networks,
+                network_runtime = std::make_unique<droidvm::NetworkService>(*network_config,
                     [&, binaries](const Json::Value& config) -> std::unique_ptr<droidvm::network::Backend> {
                         if (droidvm::config::string(config, "bridge_type") == "gvisor")
                             return std::make_unique<droidvm::network::Gvswitch>((binaries / "gvswitch").string(), switch_runtime, netbox.get(), owned_links.get());
@@ -375,19 +400,31 @@ int main(int argc, char** argv) {
 #endif
                 droidvm::pkg::PkgContext package_context;
                 package_context.vms = vms.get();
-                package_context.networks = networks.get();
+                package_context.networks = network_config;
+                package_context.configuration = configuration.get();
                 package_context.events = &legacy_events;
                 package_context.tasks = &tasks;
                 package_context.data_dir = context.data_dir;
                 package_context.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
                 packages = std::make_unique<droidvm::pkg::PkgService>(std::move(package_context));
-                if (log && networks->recovered()) log->write("WARN", "network configuration recovered from backup");
-                if (log && networks->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(networks->inactive()));
+                if (log && network_config->recovered()) log->write("WARN", "network configuration recovered from backup");
+                if (log && network_config->inactive()) log->write("WARN", "inactive network configurations retained: " + std::to_string(network_config->inactive()));
             }
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
-            droidvm::RequestDispatcher dispatcher(system, tasks, networks.get(), host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
+            droidvm::RequestDispatcher dispatcher(system, tasks, network_config, host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
             if (packages) dispatcher.set_packages(packages.get());
+            if (configuration) {
+                dispatcher.set_configuration(configuration.get());
+                droidvm::pkg::DiskOperationContext operation_context;
+                operation_context.configuration = configuration.get();
+                operation_context.directory = files.get(); operation_context.owner = layout->owner();
+                operation_context.data_dir = tool_data_dir;
+                operation_context.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+                // Replays interrupted disk operations before the socket serves anyone.
+                disk_operations = std::make_unique<droidvm::pkg::DiskOperationService>(std::move(operation_context));
+                dispatcher.set_disk_operations(disk_operations.get());
+            }
             if (usb) {
                 dispatcher.set_usb(usb.get());
                 // Daemon.main starts the USB manager after the VM sweep is queued; its pass recovers leftovers.
@@ -424,6 +461,7 @@ int main(int argc, char** argv) {
             }, report_failure);
             // Task teardown completes while both the instance lock and log are held.
             cleanup.attempt("packages", [&] { if (packages) packages->shutdown(); }, report_failure);
+            cleanup.attempt("disk operations", [&] { if (disk_operations) disk_operations->shutdown(); }, report_failure);
             cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure);
             // VMs leave before USB/networks: their taps and devices go with them.
             cleanup.attempt("VMs", [&] { if (vms) vms->stop_all(); }, report_failure);
