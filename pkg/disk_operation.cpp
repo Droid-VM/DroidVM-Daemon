@@ -164,6 +164,8 @@ private:
     // commit: overlays of the merged image. delete: the removed subtree, leaves last.
     std::vector<Member> related_;
     bool delete_files_ = false;
+    std::string reset_options_;
+    bool follow_ = true; // create: writable slots on a childless backing follow the overlay.
     std::string target() const { return fresh_ ? path_join(folder_, name_) : chain_.front().path; }
     TaskCompletion merge(TaskControl& control);
     TaskCompletion remove(TaskControl& control);
@@ -191,7 +193,7 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         throw ServiceError(ErrorCode::invalid_argument, "Disk revision is required");
     action_ = request["action"].isString() ? request["action"].asString() : "";
     if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone"
-            && action_ != "commit" && action_ != "delete")
+            && action_ != "commit" && action_ != "delete" && action_ != "reset")
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
     if (action_ == "commit" || action_ == "delete") {
         admit_tree(request, revision.asString());
@@ -222,12 +224,20 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         target_format_ = request["format"].asString();
         if (target_format_ != "qcow2" && target_format_ != "raw" && target_format_ != "vhdx" && target_format_ != "vdi" && target_format_ != "vmdk")
             throw ServiceError(ErrorCode::invalid_argument, "Unsupported image format");
-        if (!request["size"].isInt64() || request["size"].asInt64() <= 0)
-            throw ServiceError(ErrorCode::invalid_argument, "Create requires a positive byte size");
-        size_ = request["size"].asInt64();
+        // An overlay without a size inherits its backing's virtual size.
+        if (request.isMember("size") || !request.isMember("backing_id")) {
+            if (!request["size"].isInt64() || request["size"].asInt64() <= 0)
+                throw ServiceError(ErrorCode::invalid_argument, "Create requires a positive byte size");
+            size_ = request["size"].asInt64();
+        }
         if (request.isMember("backing_id")) {
             if (target_format_ != "qcow2") throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 images can have a backing disk");
             disk_id_ = row_id(request["backing_id"]);
+        }
+        if (request.isMember("attach")) {
+            if (!request["attach"].isString() || (request["attach"].asString() != "follow" && request["attach"].asString() != "readonly"))
+                throw ServiceError(ErrorCode::invalid_argument, "Attach must be follow or readonly");
+            follow_ = request["attach"].asString() == "follow";
         }
     } else disk_id_ = row_id(request["disk_id"]);
     if (action_ == "resize") {
@@ -277,7 +287,7 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         }
         if (action_ != "flatten" && children)
             throw ServiceError(ErrorCode::conflict, "Other disks are overlays of this disk; their content would change");
-        if (action_ == "flatten" && chain_.size() < 2)
+        if ((action_ == "flatten" || action_ == "reset") && chain_.size() < 2)
             throw ServiceError(ErrorCode::conflict, "Disk is not an overlay");
     }
     {
@@ -302,6 +312,25 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         catch (const std::exception& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
         if (member.format != "qcow2" && member.format != "raw")
             throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 and raw images are supported");
+    }
+    if (action_ == "reset") {
+        // Recreate empty with the overlay's own layout choices, like DiskActionDialog.resetOverlay.
+        if (chain_.front().format != "qcow2") throw ServiceError(ErrorCode::conflict, "Registered overlay is not a qcow2 image");
+        Json::Value details;
+        try { details = images.leased_info(*lease_, chain_.front().path); }
+        catch (const ServiceError&) { throw; }
+        catch (const std::exception& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+        if (details["encrypted"].isBool() && details["encrypted"].asBool())
+            throw ServiceError(ErrorCode::conflict, "Encrypted overlays cannot be reset");
+        if (!details["virtual-size"].isInt64() || details["virtual-size"].asInt64() <= 0)
+            throw ServiceError(ErrorCode::conflict, "Cannot determine overlay size");
+        size_ = details["virtual-size"].asInt64();
+        if (details["cluster-size"].isInt64() && details["cluster-size"].asInt64() > 0)
+            reset_options_ = "cluster_size=" + std::to_string(details["cluster-size"].asInt64());
+        const auto& compression = details["format-specific"]["data"]["compression-type"];
+        if (compression.isString() && (compression.asString() == "zlib" || compression.asString() == "zstd"))
+            reset_options_ += (reset_options_.empty() ? "" : ",") + std::string("compression_type=") + compression.asString();
+        target_format_ = "qcow2";
     }
     if (target_format_.empty()) target_format_ = chain_.front().format;
     if (action_ == "clone" && chain_.size() > 1 && target_format_ != "qcow2")
@@ -424,13 +453,20 @@ std::vector<std::string> DiskOperationService::Operation::command(int output) co
     if (preallocate_) settings = "preallocation=falloc";
     if (compress_ != "none") settings += std::string(settings.empty() ? "" : ",") + "compression_type=" + (compress_ == "zstd" ? "zstd" : "zlib");
     std::vector<std::string> argv{tool()};
+    if (action_ == "reset") {
+        argv.insert(argv.end(), {"create", "-f", "qcow2", "-b", chain_[1].path, "-F", chain_[1].format});
+        if (!reset_options_.empty()) argv.insert(argv.end(), {"-o", reset_options_});
+        argv.insert(argv.end(), {descriptor(output), std::to_string(size_)});
+        return argv;
+    }
     if (action_ == "create") {
         // The header stores the durable backing path; qemu-img checks it by
         // that path while the read lease pins the admitted inode.
         argv.insert(argv.end(), {"create", "-f", target_format_});
         if (!chain_.empty()) argv.insert(argv.end(), {"-b", chain_.front().path, "-F", chain_.front().format});
         if (!settings.empty()) argv.insert(argv.end(), {"-o", settings});
-        argv.insert(argv.end(), {descriptor(output), std::to_string(size_)});
+        argv.push_back(descriptor(output));
+        if (size_ > 0) argv.push_back(std::to_string(size_));
         return argv;
     }
     argv.insert(argv.end(), {"convert", "-O", target_format_});
@@ -722,7 +758,9 @@ void DiskOperationService::Operation::register_new() {
     row["id"] = disk_id_; row["name"] = name_; row["folder"] = folder_;
     if (!new_parent_.empty()) row["parent"] = new_parent_;
     document["disks"].append(std::move(row));
-    configuration.replace_vm_disks(internal, vms->revision, disks->revision, vms->document, std::move(document), reservation_);
+    // A new overlay turns its backing into a base: its slots follow or turn read-only.
+    configuration.replace_vm_disks(internal, vms->revision, disks->revision,
+        config::reattach_disk_slots(vms->document, disks->document, document, follow_), std::move(document), reservation_);
 }
 void DiskOperationService::Operation::finish_flatten() {
     auto& configuration = *owner_.context_.configuration;

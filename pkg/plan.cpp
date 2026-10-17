@@ -67,6 +67,12 @@ config::DiskImageInfo Images::inspect_leased(const config::DiskFileLeases::Lease
     result.parent = backing;
     return result;
 }
+Json::Value Images::leased_info(const config::DiskFileLeases::Lease& lease, const std::string& path) const {
+    const int fd = lease.read_fd(path);
+    auto details = info("/proc/self/fd/" + std::to_string(fd), {fd});
+    lease.verify();
+    return details;
+}
 config::DiskImageInfo Images::validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
         const std::optional<std::string>& expected) const {
     auto inspected = inspect_leased(lease, path);

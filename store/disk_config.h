@@ -22,11 +22,12 @@ std::set<std::string> valid_disk_paths(const Json::Value& document);
 void validate_disk_transition(const Json::Value& before, const Json::Value& after);
 // Paths in the old/new connected families of changed rows, for runtime leases.
 std::set<std::string> affected_disk_paths(const Json::Value& before, const Json::Value& after);
-// CursorPlan.reconcile for persisted slots after registry rows disappear (merge
-// or subtree delete): slots in the changed families stay, climb the old parent
-// chain to the nearest surviving row, or are removed when none is left; a slot
-// on a base or on a row held by two slots becomes read-only.
-Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& before, const Json::Value& after);
+// CursorPlan.reconcile for persisted slots in changed families: a writable slot
+// on a childless row that gains an overlay follows it when follow_new; slots on
+// removed rows climb the old parent chain to the nearest surviving row or are
+// removed; a slot on a base or on a row held by two slots becomes read-only.
+Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& before, const Json::Value& after,
+    bool follow_new = false);
 struct DiskReferences { std::set<std::string> bases; std::map<std::string, size_t> holders; };
 DiskReferences disk_references(const Json::Value& vms, const Json::Value& registry);
 // Startup is stricter than historical-document preservation: every used path

@@ -217,8 +217,15 @@ std::set<std::string> affected_disk_paths(const Json::Value& before, const Json:
     }
     return paths;
 }
-Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& before, const Json::Value& after) {
+Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& before, const Json::Value& after, bool follow_new) {
     const auto old = inspect(before), next = inspect(after);
+    // A row created under a surviving childless one is where that row's writable
+    // slots go ("take a snapshot, keep going"), when the caller asks for it.
+    std::set<std::string> old_bases;
+    for (const auto& [id, parent] : old.parents) old_bases.insert(parent);
+    std::map<std::string, std::string> created_under;
+    for (const auto& [id, parent] : next.parents)
+        if (!old.rows.contains(id) && old.rows.contains(parent)) created_under.emplace(parent, id);
     std::map<std::string, std::string> old_ids, new_ids, new_paths;
     for (const auto& [id, row] : old.rows) old_ids.emplace(disk_path(row), id);
     for (const auto& [id, row] : next.rows) { new_paths.emplace(id, disk_path(row)); new_ids.emplace(disk_path(row), id); }
@@ -246,7 +253,11 @@ Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& befor
             // base; subtree delete: the parent) or lose the slot.
             std::optional<std::string> target;
             std::set<std::string> seen;
-            for (auto id = std::optional<std::string>(node->second); id && seen.insert(*id).second;) {
+            const auto created = created_under.find(node->second);
+            if (follow_new && next.rows.contains(node->second) && created != created_under.end()
+                    && !old_bases.contains(node->second) && !boolean(slots[s], "readonly"))
+                target = created->second;
+            for (auto id = std::optional<std::string>(node->second); !target && id && seen.insert(*id).second;) {
                 if (next.rows.contains(*id)) { target = *id; break; }
                 const auto parent = old.parents.find(*id);
                 id = parent == old.parents.end() ? std::nullopt : std::optional<std::string>(parent->second);

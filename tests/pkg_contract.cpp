@@ -1143,7 +1143,7 @@ struct DiskOps {
             put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
                 "echo \"$@\" >> " + dir.at("tool.log") + "\n"
                 "case \"$1\" in\n"
-                "info) real=$(readlink \"$3\"); if [ -e \"$real.backing\" ]; then printf '{\"format\":\"qcow2\",\"backing-filename\":\"%s\"}' \"$(cat \"$real.backing\")\"; else printf '%s' '{\"format\":\"raw\"}'; fi ;;\n"
+                "info) real=$(readlink \"$3\"); if [ -e \"$real.backing\" ]; then printf '{\"format\":\"qcow2\",\"virtual-size\":4096,\"backing-filename\":\"%s\"}' \"$(cat \"$real.backing\")\"; else printf '%s' '{\"format\":\"raw\",\"virtual-size\":4096}'; fi ;;\n"
                 "commit|rebase) [ -e " + dir.at("fail") + " ] && exit 3; exit 0 ;;\n"
                 "convert) [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
                 "  eval \"out=\\${$#}\"; printf converted > \"$out\" ;;\n"
@@ -1438,6 +1438,20 @@ void disk_operation_create() {
     task = ops.run(create("failed.img"));
     check(task.state == TaskState::failed && !exists(ops.dir.at("failed.img")) && temporaries(ops.dir.path) == 0
         && ops.operations->pending() == 0, "tool failure leaves nothing behind");
+    check(unlink(ops.dir.at("fail").c_str()) == 0, "clear failure marker");
+    // Snapshotting a disk a stopped VM writes: the slot follows the overlay or turns read-only.
+    for (const auto* mode : {"follow", "readonly"}) {
+        const auto base = std::string("solo-") + mode + ".img";
+        put(ops.dir.at(base), "solo");
+        const auto id = ops.add(base);
+        ops.set_vms({{"writer", {{ops.dir.at(base), false}}}});
+        auto top = create(base + ".top"); top["format"] = "qcow2"; top["backing_id"] = id; top["attach"] = mode;
+        task = ops.run(top);
+        const auto slot = ops.slots("writer")[0];
+        const bool follow = std::string_view(mode) == "follow";
+        check(task.state == TaskState::succeeded && slot["path"] == ops.dir.at(follow ? base + ".top" : base)
+            && slot["readonly"].asBool() == !follow, std::string("overlay create moves slots: ") + mode);
+    }
 }
 void disk_slot_reattachment() {
     const auto b = random_id(true), o = random_id(true), c = random_id(true), x = random_id(true);
@@ -1467,6 +1481,19 @@ void disk_slot_reattachment() {
     after = config::reattach_disk_slots(vms, before, lone);
     check(after["vms"][2]["disks"].size() == 0 && after["vms"][0]["disks"][0] == slot("/d/o", false),
         "slot without surviving ancestor is removed; unrelated families stay");
+    // Rule 1: a new overlay of a childless row takes its writable slots, or they stay read-only.
+    Json::Value solo; solo["disks"].append(row(x, "x"));
+    Json::Value grown = solo; grown["disks"].append(row(c, "n", x));
+    Json::Value pair;
+    for (const auto readonly : {false, true}) {
+        Json::Value vm; vm["name"] = readonly ? "r" : "w"; vm["disks"].append(slot("/d/x", readonly)); pair["vms"].append(vm);
+    }
+    after = config::reattach_disk_slots(pair, solo, grown, true);
+    check(after["vms"][0]["disks"][0] == slot("/d/n", false) && after["vms"][1]["disks"][0] == slot("/d/x", true),
+        "writable slot follows the new overlay, read-only slot stays on the base");
+    after = config::reattach_disk_slots(pair, solo, grown, false);
+    check(after["vms"][0]["disks"][0] == slot("/d/x", true) && after["vms"][1]["disks"][0] == slot("/d/x", true),
+        "without following, base slots become read-only");
 }
 void disk_operation_tree() {
     DiskOps ops;
@@ -1492,6 +1519,11 @@ void disk_operation_tree() {
     put(ops.dir.at("d.qcow2"), "sibling"); put(ops.dir.at("d.qcow2.backing"), ops.dir.at("b.img"));
     const auto d = ops.add("d.qcow2", b);
     check(start_error(ops, ops.request(c, "commit")) == ErrorCode::conflict, "parent with siblings cannot take a merge");
+    check(start_error(ops, ops.request(b, "reset")) == ErrorCode::conflict, "base with overlays or no parent cannot reset");
+    task = ops.run(ops.request(d, "reset"));
+    check(task.state == TaskState::succeeded && bytes_of(ops.dir.at("d.qcow2")) == "created" && ops.row(d)["parent"] == b
+        && bytes_of(ops.dir.at("tool.log")).find("create -f qcow2 -b " + ops.dir.at("b.img") + " -F raw /proc/self/fd/") != std::string::npos,
+        "reset recreates the leaf overlay in place");
     // Crash after children were relinked: recovery completes registry and unlink.
     auto del = ops.request(d, "delete"); del["delete_files"] = true;
     task = ops.run(del);
@@ -1564,10 +1596,10 @@ void real_disk_operations(const std::string& tool) {
     check(real_head(tool, ops.dir.at("ov.qcow2"), ops.dir.at("view1.raw")) == "BASEDATA", "converted overlay reads base");
     auto make = ops.request("", "create"); make.removeMember("disk_id");
     make["folder"] = ops.dir.path; make["name"] = "child.qcow2"; make["format"] = "qcow2";
-    make["size"] = Json::Int64(1 << 20); make["backing_id"] = base_id;
+    make["backing_id"] = base_id; // No size: inherits the backing virtual size.
     task = ops.run(make);
     info = real_info(tool, ops.dir.at("child.qcow2"));
-    check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw")
+    check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw") && info["virtual-size"].asInt64() == (1 << 20)
         && ops.row(task.result["disk_id"].asString())["parent"] == base_id
         && real_head(tool, ops.dir.at("child.qcow2"), ops.dir.at("view3.raw")) == "BASEDATA", "real overlay create");
     auto clone = ops.request(overlay, "clone"); clone["folder"] = ops.dir.path; clone["name"] = "clone.qcow2";
@@ -1576,6 +1608,16 @@ void real_disk_operations(const std::string& tool) {
     check(task.state == TaskState::succeeded && info["format"] == "qcow2" && info["backing-filename"] == ops.dir.at("base.raw")
         && ops.row(task.result["disk_id"].asString())["parent"] == base_id
         && real_head(tool, ops.dir.at("clone.qcow2"), ops.dir.at("view4.raw")) == "BASEDATA", "real overlay clone keeps its parent");
+    const auto clone_id = task.result["disk_id"].asString();
+    const auto before_reset = real_info(tool, ops.dir.at("clone.qcow2"));
+    const auto clone_inode = inode_of(ops.dir.at("clone.qcow2"));
+    task = ops.run(ops.request(clone_id, "reset"));
+    info = real_info(tool, ops.dir.at("clone.qcow2"));
+    check(task.state == TaskState::succeeded && inode_of(ops.dir.at("clone.qcow2")) != clone_inode
+        && info["backing-filename"] == ops.dir.at("base.raw") && info["virtual-size"] == before_reset["virtual-size"]
+        && info["cluster-size"] == before_reset["cluster-size"]
+        && info["format-specific"]["data"]["compression-type"] == before_reset["format-specific"]["data"]["compression-type"]
+        && ops.row(clone_id)["parent"] == base_id, "real reset recreates an empty overlay with the same layout");
     ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
     task = ops.run(ops.request(overlay, "flatten"));
     check(task.state == TaskState::failed && ops.row(overlay).isMember("parent"), "flatten crash leaves registry link");

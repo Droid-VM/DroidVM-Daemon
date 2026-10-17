@@ -26,6 +26,8 @@ public:
     std::optional<std::string> backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
     config::DiskImageInfo validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
         const std::optional<std::string>& expected) const;
+    // Raw qemu-img info of the held inode; backing names in it are descriptor-relative.
+    Json::Value leased_info(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
     // Modify the retained overlay inode while storing the durable backing path.
