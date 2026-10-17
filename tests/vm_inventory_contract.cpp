@@ -197,6 +197,34 @@ void coordinated_disk_start_guard() {
     coordinator.reset();
     check(!runtime->start() && attaches == 1, "expired configuration owner rejects startup without dangling callback");
 }
+void runtime_disk_lease_admission() {
+    Fixture fixture;
+    const auto path = fixture.path + "/image";
+    Fd file(open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    check(file.get() >= 0, "create isolated leased disk");
+    auto leases = std::make_shared<config::DiskFileLeases>();
+    fixture.context.shutting_down = [] { return false; };
+    fixture.context.acquire_disks = std::make_shared<vm::RuntimeContext::AcquireDisks>(
+        [leases, path](const Json::Value&) { return leases->acquire({{path, true}}); });
+    int attaches = 0;
+    fixture.context.attach_nic = [&](const std::string&, const Json::Value&, const std::string&) {
+        ++attaches;
+        error(ErrorCode::conflict, [&] { leases->acquire({{path, true}}); });
+        throw std::runtime_error("intentional TAP rejection before VMM creation");
+    };
+    auto row = config("lease admission"); Json::Value nic; nic["network_id"] = random_id(true);
+    row["networks"] = Json::Value(Json::arrayValue); row["networks"].append(nic);
+    auto runtime = std::make_shared<vm::VmRuntime>(row["id"].asString(), row, fixture.context);
+    auto operation = leases->acquire({{path, true}});
+    check(!runtime->start() && attaches == 0, "file operation blocks VM before TAP setup");
+    operation.reset();
+    for (int i = 0; i < 2; ++i) {
+        check(!runtime->start() && attaches == i + 1, "VM holds file lease during network preparation");
+        operation = leases->acquire({{path, true}});
+        operation.reset();
+    }
+    check(runtime->state() == vm::State::stopped, "failed startup releases all disk leases");
+}
 void coordinated_disk_structure() {
     Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
     auto base = disks.snapshot(admin); auto document = base->document;
@@ -1398,6 +1426,7 @@ int main() {
         {"coordinated_vm_disk_adapter", coordinated_vm_disk_adapter},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
         {"coordinated_disk_start_guard", coordinated_disk_start_guard},
+        {"runtime_disk_lease_admission", runtime_disk_lease_admission},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},
         {"coordinated_vm_network_references", coordinated_vm_network_references},

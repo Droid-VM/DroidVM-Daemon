@@ -96,6 +96,55 @@ void disk_start_validation() {
     vm["disks"][0]["path"] = "/second/disk.qcow2";
     registry["disks"][1]["parent"] = random_id(true); refused(vm);
 }
+void disk_file_leases() {
+    Temporary temp;
+    temp.raw("image", "image"); temp.raw("other", "other");
+    const auto path = temp.path + "/image", alias = temp.path + "/alias", other = temp.path + "/other";
+    check(link(path.c_str(), alias.c_str()) == 0, "create hardlink alias");
+    config::DiskFileLeases files;
+    auto first = files.acquire({{path, false}});
+    auto second = files.acquire({{alias, false}});
+    error(ErrorCode::conflict, [&] { files.acquire({{alias, true}}); });
+    // Batch conflict must not retain its otherwise available file.
+    error(ErrorCode::conflict, [&] { files.acquire({{other, true}, {path, true}}); });
+    auto independent = files.acquire({{other, true}}); independent.reset();
+    first.reset();
+    error(ErrorCode::conflict, [&] { files.acquire({{path, true}}); });
+    second.reset();
+    auto writer = files.acquire({{alias, true}});
+    error(ErrorCode::conflict, [&] { files.acquire({{path, false}}); });
+    writer.reset();
+    error(ErrorCode::conflict, [&] { files.acquire({{path, true}, {alias, false}}); });
+    auto unchanged = files.acquire({{path, true}});
+    check(rename(path.c_str(), (temp.path + "/moved").c_str()) == 0, "move leased image");
+    temp.raw("image", "replacement");
+    error(ErrorCode::conflict, [&] { unchanged->verify(); });
+    error(ErrorCode::conflict, [&] { files.acquire({{path, true}}); });
+    unchanged.reset();
+    auto replacement = files.acquire({{path, true}}); replacement->verify();
+    error(ErrorCode::io_error, [&] { files.acquire({{temp.path + "/absent", false}}); });
+    replacement.reset();
+    std::vector<std::future<std::shared_ptr<config::DiskFileLeases::Lease>>> attempts;
+    for (int i = 0; i < 16; ++i) attempts.push_back(std::async(std::launch::async, [&] {
+        try { return files.acquire({{path, true}}); }
+        catch (const ServiceError& failure) {
+            check(failure.code() == ErrorCode::conflict, "concurrent writer only fails by conflict");
+            return std::shared_ptr<config::DiskFileLeases::Lease>();
+        }
+    }));
+    std::vector<std::shared_ptr<config::DiskFileLeases::Lease>> winners;
+    for (auto& attempt : attempts) if (auto lease = attempt.get()) winners.push_back(std::move(lease));
+    check(winners.size() == 1, "sixteen simultaneous exclusive admissions have one winner");
+}
+void disk_start_chain_leases() {
+    const auto registry = document();
+    Json::Value vm, slot;
+    slot["path"] = "/second/disk.qcow2"; slot["readonly"] = false;
+    vm["disks"] = Json::Value(Json::arrayValue); vm["disks"].append(slot);
+    const auto requests = config::disk_start_files(vm, registry);
+    check(requests.size() == 2 && requests[0].path == "/first/disk.qcow2" && !requests[0].write &&
+          requests[1].path == "/second/disk.qcow2" && requests[1].write, "VM leases writable leaf and read-only ancestor");
+}
 void historical_structure_repair() {
     auto historical = document(); historical["disks"][0]["parent"] = "broken";
     auto next = historical; next["root_extension"] = "unrelated";
@@ -429,6 +478,8 @@ int main() {
     return run({{"disk_registry_roundtrip_restart_ownership", roundtrip_restart_and_ownership},
         {"disk_structure_transition_validation", structure_transition_validation},
         {"disk_start_reference_readonly_validation", disk_start_validation},
+        {"disk_file_leases_alias_batch_release", disk_file_leases},
+        {"disk_start_chain_leases", disk_start_chain_leases},
         {"disk_historical_structure_repair", historical_structure_repair},
         {"disk_structure_long_chain_cycle", long_structure_chain},
         {"disk_registry_validation_participants_gate", validation_and_admission},

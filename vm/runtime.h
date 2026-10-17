@@ -8,6 +8,7 @@
 #include "network/switch_runtime.h"
 #include "runtime/child.h"
 #include "services/config_gate.h"
+#include "store/disk_file_leases.h"
 #include <json/json.h>
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +28,8 @@ struct RuntimeContext {
     std::shared_ptr<ConfigurationGate> configuration_gate;
     // Shared holder bound once during coordinator startup, before gate recovery.
     std::shared_ptr<std::function<void(const Json::Value&)>> validate_start;
+    using AcquireDisks = std::function<std::shared_ptr<config::DiskFileLeases::Lease>(const Json::Value&)>;
+    std::shared_ptr<AcquireDisks> acquire_disks;
     network::SwitchRuntime* identities = nullptr; // recoverable VM process identities
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;
@@ -104,6 +107,7 @@ private:
     mutable std::mutex state_mutex_;
     std::condition_variable idle_;
     Json::Value config_;
+    std::shared_ptr<config::DiskFileLeases::Lease> disk_lease_; // state_mutex_; retained across reboot
     std::optional<Json::Value> session_base_; // state_mutex_; never persisted
     State state_ = State::stopped;
     std::map<std::string, std::unique_ptr<ConsoleLog>> logs_;
@@ -134,6 +138,7 @@ private:
     int send_qmp(const std::string& command);
     void reap_and_cleanup();
     void finish_stopped(int code);
+    void release_disks();
     void cleanup_backend();
     void read_stream(int fd, std::string name, bool also_stdio);
     int send_control(const std::string& command);

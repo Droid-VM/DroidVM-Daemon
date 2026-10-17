@@ -45,7 +45,11 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     journal_ = std::make_unique<config::ConfigTransaction>(directory, owner, std::move(observer),
         std::move(targets));
     networks_ = std::make_unique<NetworkConfigService>(directory, owner, config::JsonFile::Observer{}, &events, true, gate_);
-    if (manage_disks) inventory.context_.validate_start = std::make_shared<std::function<void(const Json::Value&)>>();
+    if (manage_disks) {
+        inventory.context_.validate_start = std::make_shared<std::function<void(const Json::Value&)>>();
+        inventory.context_.acquire_disks = std::make_shared<vm::RuntimeContext::AcquireDisks>();
+        disk_files_ = std::make_shared<config::DiskFileLeases>();
+    }
     vms_ = std::make_shared<VmConfigService>(directory, owner, config::JsonFile::Observer{},
         [&inventory](const Json::Value& document) { return inventory.prepare_config(document); }, &events, gate_);
     if (manage_disks) {
@@ -60,6 +64,12 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
             if (!vm_service || !disk_service) throw std::runtime_error("Configuration owner is unavailable");
             const CallContext internal{"vm-start-validation", true, true, true};
             config::validate_disk_start(vm, vm_service->snapshot(internal)->document, disk_service->snapshot(internal)->document);
+        };
+        *inventory.context_.acquire_disks = [disks = std::weak_ptr<DiskConfigService>(disks_), files = disk_files_](const Json::Value& vm) {
+            const auto service = disks.lock();
+            if (!service) throw std::runtime_error("Disk configuration owner is unavailable");
+            const CallContext internal{"vm-disk-leases", true, true, true};
+            return files->acquire(config::disk_start_files(vm, service->snapshot(internal)->document));
         };
     }
     networks_->coordinated_removal_ = true;

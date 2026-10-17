@@ -272,16 +272,25 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
             if (!*context_.validate_start) throw std::runtime_error("VM start validation is not available");
             (*context_.validate_start)(config());
         }
+        std::shared_ptr<config::DiskFileLeases::Lease> held;
+        { std::lock_guard state(state_mutex_); held = disk_lease_; }
+        if (held) held->verify();
+        else if (context_.acquire_disks) {
+            if (!*context_.acquire_disks) throw std::runtime_error("Disk lease admission is not available");
+            held = (*context_.acquire_disks)(config());
+            std::lock_guard state(state_mutex_); disk_lease_ = std::move(held);
+        }
     } catch (const std::exception& error) {
         context_.warn("Cannot start VM: " + std::string(error.what()));
         if (auto* output = log("stdio")) output->append(std::string("start validation failed: ") + error.what() + "\n");
+        release_disks();
         return false;
     }
-    // Clear only after validation and stopped admission, before new startup diagnostics.
-    if (clear_logs) this->clear_logs();
-    if (!setup_taps()) return false;
-    { std::lock_guard state(state_mutex_); resolve_vnc(config_); }
     try {
+        // Clear only after validation and stopped admission, before new startup diagnostics.
+        if (clear_logs) this->clear_logs();
+        if (!setup_taps()) { release_disks(); return false; }
+        { std::lock_guard state(state_mutex_); resolve_vnc(config_); }
         if (!relaunch) reboot_requested_ = false;
         stopped_by_user_ = false;
         exit_code_ = -1;
@@ -301,6 +310,8 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         context_.warn("Cannot start VM " + config::string(config(), "name") + ": " + error.what());
         cleanup_taps();
         cleanup_backend();
+        release_disks();
+        { std::lock_guard state(state_mutex_); worker_ = false; }
         set_state(State::stopped);
         return false;
     }
@@ -439,6 +450,7 @@ void VmRuntime::run() {
         return;
     }
     if (access("/sys/kernel/nproc_guard/reset", F_OK) == 0) write_quiet("/sys/kernel/nproc_guard/reset", "1");
+    release_disks();
     { std::lock_guard state(state_mutex_); worker_ = false; }
     set_state(State::stopped);
     fire("exited");
@@ -659,9 +671,14 @@ void VmRuntime::finish_stopped(int code) {
     exit_code_ = code;
     cleanup_taps();
     cleanup_backend();
+    release_disks();
     { std::lock_guard state(state_mutex_); worker_ = false; }
     set_state(State::stopped);
     fire("exited");
+}
+void VmRuntime::release_disks() {
+    std::shared_ptr<config::DiskFileLeases::Lease> released;
+    { std::lock_guard state(state_mutex_); released.swap(disk_lease_); }
 }
 void VmRuntime::kill_process() {
     std::lock_guard lock(state_mutex_);
@@ -741,6 +758,7 @@ bool VmRuntime::stop() {
         // A relaunch has no live process: cancel it and release its budget.
         stopped_by_user_ = true;
         exit_code_ = 0;
+        release_disks();
         set_state(State::stopped);
         fire("exited");
         return true;

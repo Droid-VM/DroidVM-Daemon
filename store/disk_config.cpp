@@ -51,6 +51,33 @@ std::string disk_path(const Json::Value& row) {
     if (!child.empty() && child.front() == '/') child.erase(0, 1);
     return base + "/" + child;
 }
+std::vector<DiskFileLeases::Request> disk_start_files(const Json::Value& vm, const Json::Value& registry) {
+    std::map<std::string, const Json::Value*> rows, paths;
+    for (const auto& row : registry["disks"]) { rows[uuid(row)] = &row; paths[disk_path(row)] = &row; }
+    const auto valid = valid_disk_paths(registry);
+    std::map<std::string, bool> requested;
+    const auto& slots = member(vm, "disks");
+    if (slots.isArray()) for (const auto& slot : slots) {
+        auto path = string(slot, "path");
+        if (path.empty()) continue;
+        if (!valid.contains(path)) throw std::invalid_argument("Invalid disk chain for file lease");
+        requested[path] = requested[path] || !boolean(slot, "readonly");
+        const Json::Value* row = paths.at(path);
+        std::set<std::string> visited;
+        while (row && visited.insert(uuid(*row)).second) {
+            Json::Value parent; parent["id"] = member(*row, "parent");
+            std::string parent_id;
+            try { parent_id = uuid(parent); } catch (const std::invalid_argument&) { break; }
+            const auto found = rows.find(parent_id);
+            if (found == rows.end()) break;
+            row = found->second;
+            requested.try_emplace(disk_path(*row), false);
+        }
+    }
+    std::vector<DiskFileLeases::Request> result;
+    for (const auto& [path, write] : requested) result.push_back({path, write});
+    return result;
+}
 namespace {
 struct Registry {
     std::map<std::string, Json::Value> rows;

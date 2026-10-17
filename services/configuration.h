@@ -4,6 +4,7 @@
 #include "disk_config.h"
 #include "vm_config.h"
 #include "store/config_transaction.h"
+#include "store/disk_file_leases.h"
 
 namespace droidvm {
 class VmService;
@@ -20,6 +21,7 @@ public:
     VmConfigService& vms() { return *vms_; }
     NetworkConfigService& networks() { return *networks_; }
     DiskConfigService* disks() { return disks_.get(); }
+    std::shared_ptr<config::DiskFileLeases> disk_files() const { return disk_files_; }
     VmService& inventory() { return inventory_; }
     TaskService& events() { return events_; }
     // Every affected VM must admit a stopped edit. With a matching lifecycle
@@ -44,6 +46,7 @@ private:
     std::unique_ptr<NetworkConfigService> networks_;
     std::shared_ptr<VmConfigService> vms_;
     std::shared_ptr<DiskConfigService> disks_;
+    std::shared_ptr<config::DiskFileLeases> disk_files_;
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     std::shared_ptr<DiskConfigSnapshot> pending_disk_;
