@@ -472,6 +472,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     mkdir(context_.run_dir.c_str(), 0700);
     if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) == "QEMU") return launch_qemu(config, plan, failure);
     CrosvmRun run;
+    { std::lock_guard lock(state_mutex_); run.preserve_disk_paths = static_cast<bool>(disk_lease_); }
     const auto& ports = config::member(config, "serial_ports");
     auto backend_of = [](const Json::Value& port) { return config::java_enum(port, "backend", "SINK", {"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"}); };
     auto stream_of = [](const Json::Value& port) { // VMSerialConfig.getStreamName
@@ -553,6 +554,7 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
                             plan.uefi ? (plan.vars.empty() ? edk2_vars() : plan.vars) : std::string()});
     host.data_dir = context_.data_dir;
     auto run = qemu_sockets(config, host);
+    { std::lock_guard lock(state_mutex_); run.preserve_disk_paths = static_cast<bool>(disk_lease_); }
     run.file_length = [](const std::string& path) -> int64_t { struct stat info{}; return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) ? info.st_size : 0; };
     QemuLaunch command;
     try { command = qemu_command(config, run, plan, host); }
@@ -596,6 +598,9 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
 }
 bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<std::pair<std::string, std::string>>& env,
                       const std::optional<std::string>& strace_dir, const char* label, std::string& failure) {
+    std::shared_ptr<config::DiskFileLeases::Lease> lease;
+    { std::lock_guard lock(state_mutex_); lease = disk_lease_; }
+    if (lease) lease->verify();
     if (strace_dir) {
         std::error_code error;
         std::filesystem::remove_all(*strace_dir, error);
@@ -620,6 +625,16 @@ bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<st
         context_.identities->allocate(id_, identity_, network::SwitchRuntime::Kind::vm);
         identity = std::make_unique<HelperIdentity>(identity_.directory.get(), context_.identities->owner());
         identity->arm(options);
+    }
+    if (lease) {
+        // Child runs this in the parent while exec is gated. Preserve the helper
+        // identity hook, and reject path replacement during boot preparation.
+        auto before_exec = std::move(options.before_exec);
+        options.before_exec = [lease, before_exec = std::move(before_exec)](pid_t pid) {
+            lease->verify();
+            if (before_exec) before_exec(pid);
+            lease->verify();
+        };
     }
     try {
         auto process = std::make_unique<Child>(options);

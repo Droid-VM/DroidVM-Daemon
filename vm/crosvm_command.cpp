@@ -304,7 +304,7 @@ struct Builder {
         for (const auto* disk : items(item["disks"])) {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
-            path = optimized_path(std::move(path), host);
+            if (!run.preserve_disk_paths) path = optimized_path(std::move(path), host);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
             auto arg = crosvm_option_value(path);

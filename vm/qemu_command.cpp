@@ -51,7 +51,7 @@ struct Builder {
         for (const auto* disk : items(item["disks"])) {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
-            path = optimized_path(std::move(path), host);
+            if (!run.preserve_disk_paths) path = optimized_path(std::move(path), host);
             const auto file_path = path;
             path = qemu_option_value(path);
             const bool readonly = boolean(*disk, "readonly", false);

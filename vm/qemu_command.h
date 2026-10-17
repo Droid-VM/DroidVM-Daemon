@@ -30,6 +30,8 @@ struct QemuRun {
     std::map<std::string, VncRun> vnc; // per screen id, overrides screens.<id>.vnc
     // new File(path).length() for PMEM disks (0 when missing); null = always 0.
     std::function<int64_t(const std::string&)> file_length;
+    // Managed disks must use the same paths admitted by the file lease.
+    bool preserve_disk_paths = false;
 };
 struct QemuLaunch {
     std::vector<std::string> argv;

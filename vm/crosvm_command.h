@@ -60,6 +60,8 @@ struct VncRun {
     std::optional<std::string> password; // VMInstance.resolveVncConfig setVncPassword
 };
 struct CrosvmRun {
+    // Managed disks must use the same paths admitted by the file lease.
+    bool preserve_disk_paths = false;
     std::optional<std::string> control_socket_path; // CrosvmBackendInstance.controlSocketPath
     std::optional<std::string> gpu_cgroup_path; // gpuCgroupPath after prepareGpuCgroup()
     std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved

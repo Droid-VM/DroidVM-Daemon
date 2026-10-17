@@ -19,6 +19,37 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void leased_disk_paths_reach_backends() {
+    Json::Value config;
+    config["name"] = "leased-path"; config["id"] = random_id(true);
+    config["screens"]["gpu-0"]["enabled"] = false;
+    config["screens"]["simplefb"]["enabled"] = false;
+    const std::string original = "/storage/emulated/0/disk.img", optimized = "/data/media/0/disk.img";
+    vm::HostFacts host; host.optimize_sdcard = true;
+    for (bool preserve : {false, true}) {
+        vm::QemuRun qemu_run; qemu_run.preserve_disk_paths = preserve;
+        vm::CrosvmRun crosvm_run; crosvm_run.preserve_disk_paths = preserve;
+        const auto& expected = preserve ? original : optimized;
+        qemu_run.file_length = [&](const std::string& path) {
+            check(path == expected, "PMEM size lookup uses the selected disk path");
+            return 64LL * 1024 * 1024;
+        };
+        auto verify = [&](const std::vector<std::string>& argv) {
+            size_t matches = 0;
+            for (const auto& arg : argv) if (arg.find("/disk.img") != std::string::npos) {
+                ++matches;
+                check(arg.find(expected) != std::string::npos, "backend receives the admitted path for managed disks");
+            }
+            check(matches == 1, "one attached disk is checked");
+        };
+        for (const auto* bus : {"pflash", "pmem", "virtio", "scsi", "cdrom"}) {
+            Json::Value disk; disk["path"] = original; disk["bus"] = bus; disk["readonly"] = true;
+            config["disks"] = Json::Value(Json::arrayValue); config["disks"].append(disk);
+            verify(vm::qemu_command(config, qemu_run, {}, host).argv);
+            if (std::string_view(bus) != "pflash") verify(vm::crosvm_command(config, crosvm_run, {}, host).argv);
+        }
+    }
+}
 void disk_option_path_encoding() {
     using namespace vm::command;
     const std::string path = "/isolated/a,readonly=off,ro=false,[x]'\"\\.img";
@@ -1493,7 +1524,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"disk_option_path_encoding", disk_option_path_encoding},
+    return run({{"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},
+        {"disk_option_path_encoding", disk_option_path_encoding},
         {"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},
         {"replace_delete_stale_references", replacement_and_failure},
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
