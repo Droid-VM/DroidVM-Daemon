@@ -24,6 +24,22 @@
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
+struct QemuDiskImage {
+    int fd = -1; // Borrowed, >= 3; caller retains lease and preserves FD across exec.
+    std::string format; // Actual inspected format, not filename extension.
+    std::optional<std::string> parent; // Key of another entry, never a header path.
+    bool readonly = true;
+};
+struct QemuDiskGraph {
+    std::vector<std::string> argv;
+    std::map<std::string, std::string> nodes;
+    std::vector<int> preserve_fds;
+};
+// Parent-first, explicit graph. qcow2 roots have backing=null, so QEMU never
+// follows an implicit backing filename. No filesystem opens in this builder.
+// Caller must verify metadata and reject auxiliary dependencies not represented
+// here (for example qcow2 external data files) before constructing this input.
+QemuDiskGraph qemu_disk_graph(const std::map<std::string, QemuDiskImage>& images);
 struct QemuRun {
     // Set by QemuBackendInstance.start(); unset renders as Java's "null".
     std::optional<std::string> qmp_socket_path, uart_socket_path, agent_socket_path;

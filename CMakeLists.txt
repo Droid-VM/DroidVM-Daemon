@@ -86,7 +86,7 @@ add_library(droidvm_config STATIC store/network_config.cpp store/disk_config.cpp
 target_link_libraries(droidvm_config PUBLIC droidvm_wire droidvm_identity icu)
 target_include_directories(droidvm_config PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_options(droidvm_config PRIVATE -Wall -Wextra -Werror)
-add_library(droidvm_vm STATIC vm/command_common.cpp vm/crosvm_command.cpp vm/qemu_command.cpp vm/boot_plan.cpp vm/console.cpp vm/hugepage.cpp vm/nic.cpp vm/host_facts.cpp vm/input_bridge.cpp vm/usb_acm.cpp)
+add_library(droidvm_vm STATIC vm/command_common.cpp vm/crosvm_command.cpp vm/qemu_command.cpp vm/qemu_disk_graph.cpp vm/boot_plan.cpp vm/console.cpp vm/hugepage.cpp vm/nic.cpp vm/host_facts.cpp vm/input_bridge.cpp vm/usb_acm.cpp)
 target_link_libraries(droidvm_vm PUBLIC droidvm_config droidvm_child)
 target_include_directories(droidvm_vm PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_options(droidvm_vm PRIVATE -Wall -Wextra -Werror)

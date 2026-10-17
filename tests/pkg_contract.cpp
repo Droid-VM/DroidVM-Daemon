@@ -9,6 +9,7 @@
 #include "services/network_config.h"
 #include "services/configuration.h"
 #include "runtime/child.h"
+#include "vm/qemu_command.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
@@ -984,6 +985,60 @@ void leased_image_inspection(const std::string& mode) {
     check((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0,
         "parent descriptor remains close-on-exec");
 }
+void real_qemu_disk_graph(const std::string& image_tool, const std::string& system_tool) {
+    Temporary dir;
+    const auto base = dir.at("base.raw"), overlay = dir.at("overlay.qcow2");
+    put(base, std::string(1u << 20, 'A'));
+    ChildOptions create;
+    create.argv = {image_tool, "create", "-f", "qcow2", "-F", "raw", "-b", base, overlay};
+    auto result = Child(create).communicate({}, std::chrono::seconds(10), 65536);
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "create real qcow2 backing fixture");
+    config::DiskFileLeases pool;
+    auto lease = pool.acquire({{base, false}, {overlay, true}});
+    auto base_fd = lease->open_file(base), overlay_fd = lease->open_file(overlay, true);
+    const auto graph = vm::qemu_disk_graph({{base, {base_fd.get(), "raw", {}, true}},
+        {overlay, {overlay_fd.get(), "qcow2", base, false}}});
+    check(rename(base.c_str(), dir.at("old-base").c_str()) == 0 &&
+        rename(overlay.c_str(), dir.at("old-overlay").c_str()) == 0, "replace both original paths before QEMU exec");
+    put(base, "replacement base"); put(overlay, "replacement overlay");
+    ChildOptions launch;
+    launch.argv = {system_tool, "-machine", "none", "-accel", "tcg", "-nodefaults", "-display", "none", "-S", "-qmp", "stdio"};
+    launch.argv.insert(launch.argv.end(), graph.argv.begin(), graph.argv.end());
+    launch.preserve_fds = graph.preserve_fds;
+    Json::Value read;
+    read["execute"] = "human-monitor-command"; read["id"] = 3;
+    read["arguments"]["command-line"] = "qemu-io " + graph.nodes.at(overlay) + " \"read -P 65 0 512\"";
+    result = Child(launch).communicate("{\"execute\":\"qmp_capabilities\",\"id\":1}\n"
+        "{\"execute\":\"query-named-block-nodes\",\"id\":2}\n" + wire::stringify(read) +
+        "\n{\"execute\":\"quit\",\"id\":4}\n",
+        std::chrono::seconds(10), 1u << 20);
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real QEMU opens retained full graph without booting a guest");
+    bool queried = false, read_original = false;
+    size_t offset = 0;
+    while (offset < result.output.size()) {
+        auto end = result.output.find('\n', offset);
+        if (end == std::string::npos) end = result.output.size();
+        const auto line = result.output.substr(offset, end - offset); offset = end + 1;
+        if (line.empty()) continue;
+        const auto reply = parse_object(line);
+        check(!reply.isMember("error"), "QMP commands succeed");
+        if (reply["id"] == 3) {
+            const auto output = reply["return"].asString();
+            check(output.find("read 512/512 bytes") != std::string::npos && output.find("Pattern verification failed") == std::string::npos,
+                "reading through overlay reaches the original retained backing bytes");
+            read_original = true;
+        }
+        if (reply["id"] != 2) continue;
+        std::map<std::string, Json::Value> nodes;
+        for (const auto& node : reply["return"]) nodes.emplace(node["node-name"].asString(), node);
+        check(nodes.contains(graph.nodes.at(base)) && nodes.contains(graph.nodes.at(overlay)) &&
+            nodes.at(graph.nodes.at(base))["drv"] == "raw" && nodes.at(graph.nodes.at(overlay))["drv"] == "qcow2",
+            "QMP reports the explicit retained nodes with their actual drivers");
+        queried = true;
+    }
+    check(queried && read_original && bytes_of(base) == "replacement base" && bytes_of(overlay) == "replacement overlay",
+        "QEMU graph succeeds without modifying replacement paths");
+}
 void real_retained_rebase(const std::string& tool) {
     Temporary dir;
     CreatedDirectory owned(dir.path, "import");
@@ -1057,8 +1112,11 @@ int main(int argc, char** argv) {
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};
+    } else if (argc == 4 && std::string_view(argv[1]) == "--qemu-tools") {
+        const std::string image_tool = argv[2], system_tool = argv[3];
+        tests = {{"real QEMU retained block graph", [=] { real_qemu_disk_graph(image_tool, system_tool); }}};
     } else if (argc != 1) {
-        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img]\n";
+        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img | --qemu-tools /path/to/qemu-img /path/to/qemu-system]\n";
         return 2;
     }
     Json::Value report;

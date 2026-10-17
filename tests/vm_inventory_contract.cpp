@@ -19,6 +19,40 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void qemu_retained_disk_graph() {
+    std::map<std::string, vm::QemuDiskImage> images{
+        {"/a-leaf", {5, "qcow2", "/m-mid", false}},
+        {"/m-mid", {4, "qcow2", "/z-base", true}},
+        {"/z-base", {3, "raw", {}, true}},
+        {"/root", {6, "qcow2", {}, true}}};
+    const auto graph = vm::qemu_disk_graph(images);
+    check(graph.nodes.size() == 4 && graph.preserve_fds == std::vector<int>({3, 4, 5, 6}),
+        "graph orders ancestors before leaves and explicitly lists inherited descriptors");
+    std::map<std::string, Json::Value> nodes;
+    for (size_t i = 0; i < graph.argv.size(); i += 4) {
+        check(graph.argv[i] == "-add-fd" && graph.argv[i + 2] == "-blockdev", "fd registered before its block node");
+        const auto node = config::parse_json(graph.argv[i + 3]);
+        check(node["file"]["filename"] == "/dev/fdset/" + std::to_string(i / 4), "only retained FD sets used as files");
+        if (node["backing"].isString()) check(nodes.contains(node["backing"].asString()), "parent already defined");
+        nodes.emplace(node["node-name"].asString(), node);
+    }
+    check(nodes.at(graph.nodes.at("/root")).isMember("backing") &&
+        nodes.at(graph.nodes.at("/root"))["backing"].isNull(), "qcow2 root disables implicit backing lookup");
+    check(nodes.at(graph.nodes.at("/a-leaf"))["read-only"] == false &&
+        nodes.at(graph.nodes.at("/m-mid"))["read-only"] == true, "leaf and parent retain admitted access modes");
+    auto reject = [&](auto invalid) {
+        bool failed = false;
+        try { vm::qemu_disk_graph(invalid); } catch (const std::invalid_argument&) { failed = true; }
+        check(failed, "unsafe retained graph rejected before launch");
+    };
+    auto invalid = images; invalid.erase("/z-base"); reject(invalid);
+    invalid = images; invalid["/m-mid"].readonly = false; reject(invalid);
+    invalid = images; invalid["/z-base"].format = "qcow2"; invalid["/z-base"].parent = "/m-mid"; reject(invalid);
+    invalid = images; invalid["/a-leaf"].fd = 2; reject(invalid);
+    invalid = images; invalid["/a-leaf"].fd = 3; reject(invalid);
+    invalid = images; invalid["/a-leaf"].format = "raw"; reject(invalid);
+    invalid = images; invalid["/a-leaf"].format = "unknown"; reject(invalid);
+}
 void leased_disk_paths_reach_backends() {
     Json::Value config;
     config["name"] = "leased-path"; config["id"] = random_id(true);
@@ -1524,7 +1558,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},
+    return run({{"qemu_retained_disk_graph", qemu_retained_disk_graph},
+        {"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},
         {"disk_option_path_encoding", disk_option_path_encoding},
         {"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},
         {"replace_delete_stale_references", replacement_and_failure},
