@@ -10,9 +10,10 @@
 #include <map>
 
 namespace droidvm::pkg {
-Json::Value Images::info(const std::string& path) const {
+Json::Value Images::info(const std::string& path, std::vector<int> fds) const {
     ChildOptions options;
     options.argv = {qemu_img_, "info", "--output=json", path};
+    options.preserve_fds = std::move(fds);
     const auto result = Child(options).communicate({}, std::chrono::minutes(2), 8u << 20, cancelled_);
     if (result.exit_code != 0 || result.timed_out || result.cancelled || result.truncated)
         throw std::runtime_error("Failed to get image info with " + std::to_string(result.exit_code));
@@ -40,6 +41,22 @@ void Images::rebase(const std::string& overlay, const std::string& backing) cons
     const auto result = Child(options).communicate({}, std::chrono::minutes(2), 1u << 20, cancelled_);
     if (result.exit_code == 0 && !result.timed_out && !result.cancelled) return;
     throw Error("qemu-img rebase failed for " + basename(overlay) + ": " + std::to_string(result.exit_code));
+}
+void Images::rebase(const RetainedFile& overlay, const RetainedFile& backing) const {
+    overlay.verify(); backing.verify();
+    const auto descriptor_path = [](int fd) { return "/proc/self/fd/" + std::to_string(fd); };
+    // Never guess qcow2 on a failed inspection: that would persist a false backing format.
+    const auto details = info(descriptor_path(backing.fd()), {backing.fd()});
+    if (!details["format"].isString() || details["format"].asString().empty())
+        throw Error("Cannot determine imported backing format");
+    overlay.verify(); backing.verify();
+    ChildOptions options;
+    options.argv = {qemu_img_, "rebase", "-u", "-b", backing.path(), "-F", details["format"].asString(), descriptor_path(overlay.fd())};
+    options.preserve_fds = {overlay.fd()};
+    const auto result = Child(options).communicate({}, std::chrono::minutes(2), 1u << 20, cancelled_);
+    overlay.verify(); backing.verify();
+    if (result.exit_code == 0 && !result.timed_out && !result.cancelled && !result.truncated) return;
+    throw Error("qemu-img rebase failed for imported image: " + std::to_string(result.exit_code));
 }
 
 namespace {

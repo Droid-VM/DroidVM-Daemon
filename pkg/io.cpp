@@ -624,7 +624,7 @@ void CreatedDirectory::sync() const {
     verify();
 }
 RetainedFile::RetainedFile(int file, int directory, const std::string& directory_path, const std::string& name)
-    : file_(fcntl(file, F_DUPFD_CLOEXEC, 0)), directory_(fcntl(directory, F_DUPFD_CLOEXEC, 0)),
+    : file_(fcntl(file, F_DUPFD_CLOEXEC, 3)), directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)),
       directory_path_(directory_path), name_(name) {
     if (file_.get() < 0 || directory_.get() < 0) throw Error(errno_message("retain imported file", errno));
     if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos)

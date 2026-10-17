@@ -19,10 +19,12 @@ public:
     std::optional<std::string> backing_of(const std::string& path) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
+    // Modify the retained overlay inode while storing the durable backing path.
+    void rebase(const RetainedFile& overlay, const RetainedFile& backing) const;
 private:
     std::string qemu_img_;
     std::function<bool()> cancelled_;
-    Json::Value info(const std::string& path) const; // throws std::runtime_error
+    Json::Value info(const std::string& path, std::vector<int> fds = {}) const; // throws std::runtime_error
 };
 
 // DiskChainPlan: every file the selected disks need, child before parent,

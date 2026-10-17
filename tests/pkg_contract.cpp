@@ -8,6 +8,7 @@
 #include "services/vm.h"
 #include "services/network_config.h"
 #include "services/configuration.h"
+#include "runtime/child.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
@@ -884,11 +885,81 @@ void import_sync_failure() {
     check(rejected && bytes_of(owned.path() + "/disk") == "image", "fsync failure propagates without altering file");
     owned.remove();
 }
+void retained_rebase(const std::string& mode) {
+    Temporary dir;
+    CreatedDirectory owned(dir.path, "import");
+    std::unique_ptr<RetainedFile> overlay, backing;
+    for (const auto* name : {"overlay", "base"}) {
+        FileSink out(owned.fd(), name); out.append(name); out.flush();
+        auto file = std::make_unique<RetainedFile>(out.fd(), owned.fd(), owned.path(), name);
+        if (std::string_view(name) == "overlay") overlay = std::move(file); else backing = std::move(file);
+        out.close();
+    }
+    // A local helper checks descriptor inheritance and emulates header rewriting;
+    // it does not substitute for the separate real qemu-img device acceptance.
+    std::string script = "#!/system/bin/sh\nif [ \"$1\" = info ]; then\n"
+        "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
+        "[ \"$(cat \"$3\")\" = base ] || exit 22\n";
+    script += mode == "bad-format" ? "printf '%s' '{\"format\":null}'\n" : "printf '%s' '{\"format\":\"raw\"}'\n";
+    script += "exit 0\nfi\n[ \"$1\" = rebase ] && [ \"$2\" = -u ] && [ \"$3\" = -b ] && "
+        "[ \"$5\" = -F ] && [ \"$6\" = raw ] || exit 23\n"
+        "case \"$7\" in /proc/self/fd/*) ;; *) exit 24;; esac\n";
+    if (mode == "replacement")
+        script += "mv '" + overlay->path() + "' '" + owned.path() + "/moved' || exit 25\n"
+            "printf replacement > '" + overlay->path() + "'\n";
+    script += "printf '%s' \"$4\" > \"$7\"\n";
+    put(dir.at("image-helper"), script);
+    check(chmod(dir.at("image-helper").c_str(), 0700) == 0, "prepare isolated image helper");
+    bool failed = false;
+    try { Images(dir.at("image-helper")).rebase(*overlay, *backing); }
+    catch (const std::exception&) { failed = true; }
+    if (mode.empty()) {
+        check(!failed && bytes_of(overlay->path()) == backing->path(), "helper modifies retained overlay and stores stable backing path");
+        overlay->sync(); backing->sync();
+    } else if (mode == "bad-format") {
+        check(failed && bytes_of(overlay->path()) == "overlay", "invalid format never reaches rebase or falls back to qcow2");
+    } else {
+        check(failed && bytes_of(overlay->path()) == "replacement" &&
+              bytes_of(owned.path() + "/moved") == backing->path(), "path substitution cannot redirect helper writes and fails post-check");
+    }
+    check((fcntl(overlay->fd(), F_GETFD) & FD_CLOEXEC) != 0 && (fcntl(backing->fd(), F_GETFD) & FD_CLOEXEC) != 0,
+          "child inheritance never clears parent close-on-exec flags");
+}
+void real_retained_rebase(const std::string& tool) {
+    Temporary dir;
+    CreatedDirectory owned(dir.path, "import");
+    std::vector<std::unique_ptr<RetainedFile>> files;
+    for (const auto* name : {"old.raw", "new.raw", "overlay.qcow2"}) {
+        FileSink out(owned.fd(), name);
+        if (std::string_view(name) != "overlay.qcow2") out.append(std::string(1u << 20, '\0'));
+        out.flush();
+        files.push_back(std::make_unique<RetainedFile>(out.fd(), owned.fd(), owned.path(), name));
+        out.close();
+    }
+    const auto overlay_path = "/proc/self/fd/" + std::to_string(files[2]->fd());
+    ChildOptions create;
+    create.argv = {tool, "create", "-f", "qcow2", "-F", "raw", "-b", files[0]->path(), overlay_path};
+    create.preserve_fds = {files[2]->fd()};
+    auto result = Child(create).communicate({}, std::chrono::seconds(10));
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real qemu creates overlay through retained descriptor");
+    Images(tool).rebase(*files[2], *files[1]);
+    for (const auto& file : files) file->sync();
+    owned.sync();
+    ChildOptions inspect;
+    inspect.argv = {tool, "info", "--output=json", overlay_path};
+    inspect.preserve_fds = {files[2]->fd()};
+    result = Child(inspect).communicate({}, std::chrono::seconds(10));
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real qemu reads rebased overlay");
+    const auto info = parse_object(result.output);
+    check(info["format"] == "qcow2" && info["backing-filename"] == files[1]->path() &&
+          info["backing-filename-format"] == "raw", "real header stores new durable backing path and format");
+    for (const auto& file : files) file->verify();
+}
 }
 
-int main() {
+int main(int argc, char** argv) {
     using Test = std::pair<const char*, std::function<void()>>;
-    const std::vector<Test> tests{
+    std::vector<Test> tests{
         {"service authorization", service_access},
         {"service queue capacity and cancellation", service_queue_capacity},
         {"persistent import and repeated name", [] { persistent_import(""); }},
@@ -907,7 +978,16 @@ int main() {
         {"file helpers", file_helpers}, {"exclusive imported files", exclusive_import_files},
         {"cleanup boundaries", cleanup_boundaries}, {"owned import directory", owned_import_directory},
         {"replaced import parent", replaced_import_parent}, {"retained import files", retained_import_files},
-        {"import sync failure", import_sync_failure}};
+        {"import sync failure", import_sync_failure}, {"retained rebase", [] { retained_rebase(""); }},
+        {"retained rebase rejects format", [] { retained_rebase("bad-format"); }},
+        {"retained rebase resists replacement", [] { retained_rebase("replacement"); }}};
+    if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
+        const std::string tool = argv[2];
+        tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};
+    } else if (argc != 1) {
+        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img]\n";
+        return 2;
+    }
     Json::Value report;
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
     try {

@@ -176,6 +176,8 @@ public:
     RetainedFile(int file, int directory, const std::string& directory_path, const std::string& name);
     void verify() const;
     void sync() const;
+    int fd() const { return file_.get(); }
+    std::string path() const { return path_join(directory_path_, name_); }
 private:
     Fd file_, directory_;
     std::string directory_path_, name_;

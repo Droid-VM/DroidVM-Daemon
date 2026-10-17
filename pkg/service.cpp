@@ -351,6 +351,7 @@ private:
     std::string vm_dir_, vm_name_;
     std::unique_ptr<CreatedDirectory> owned_directory_;
     std::vector<std::unique_ptr<RetainedFile>> retained_files_;
+    std::map<std::string, RetainedFile*> retained_by_path_;
     bool registered_ = false;
     VmConfigService::Snapshot config_snapshot_;
     DiskConfigService::Snapshot disk_snapshot_;
@@ -579,6 +580,7 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
         }
         FileSink sink(directory, file_name(out));
         retained_files_.push_back(std::make_unique<RetainedFile>(sink.fd(), directory, dirname(out), file_name(out)));
+        retained_by_path_[out] = retained_files_.back().get();
         std::string buffer(buffer_size, '\0');
         int64_t remaining = size, written = 0;
         auto last = Clock::now();
@@ -616,7 +618,12 @@ void ImportTask::relink() {
         const auto parent = by_archive.find(disk.backing_archive);
         if (parent == by_archive.end() || !manifest_.disks[parent->second].target)
             throw Error("package is missing the backing image " + disk.backing_archive + " needed by " + disk.archive_path);
-        tool.rebase(*disk.target, *manifest_.disks[parent->second].target);
+        const auto& backing_path = *manifest_.disks[parent->second].target;
+        const auto overlay_file = retained_by_path_.find(*disk.target);
+        const auto backing_file = retained_by_path_.find(backing_path);
+        if (overlay_file == retained_by_path_.end() || backing_file == retained_by_path_.end())
+            throw Error("Imported image identity is missing");
+        tool.rebase(*overlay_file->second, *backing_file->second);
     }
 }
 void ImportTask::remap_disks() {
