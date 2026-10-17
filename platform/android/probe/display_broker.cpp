@@ -132,7 +132,7 @@ struct DisplayBroker::Impl {
 };
 DisplayBroker::DisplayBroker(Hooks hooks) : impl_(std::make_unique<Impl>()) { impl_->hooks = std::move(hooks); }
 DisplayBroker::~DisplayBroker() = default;
-void DisplayBroker::attach(const std::string& nonce) {
+void DisplayBroker::attach(const std::string& nonce, const Json::Value& client_profile) {
     std::lock_guard lock(impl_->mutex);
     try {
         if (!start_binder_pool()) throw std::runtime_error("native Binder thread pool unavailable");
@@ -140,9 +140,18 @@ void DisplayBroker::attach(const std::string& nonce) {
         ServiceManager manager;
         if (!manager.available()) throw std::runtime_error("no system context; cannot broadcast display binder");
         const auto activity = manager.find("activity");
+        Json::Value profile;
+        std::string source = "verified";
+        try {
+            profile = broadcast_profile();
+        } catch (const std::exception&) {
+            if (client_profile.isNull()) throw;
+            profile = client_broadcast_profile(client_profile);
+            source = "client";
+        }
         Json::Value report;
-        send_binder_broadcast(activity.get(), impl_->broker->asBinder().get(), nonce, broadcast_profile(), report, impl_->hooks.package);
-        impl_->hooks.log("INFO", "broadcast native-display binder (nonce=" + nonce + ")");
+        send_binder_broadcast(activity.get(), impl_->broker->asBinder().get(), nonce, profile, report, impl_->hooks.package);
+        impl_->hooks.log("INFO", "broadcast native-display binder (nonce=" + nonce + ", " + source + " profile)");
     } catch (const std::exception& error) {
         impl_->hooks.log("ERROR", std::string("native-display binder broadcast failed: ") + error.what());
     }

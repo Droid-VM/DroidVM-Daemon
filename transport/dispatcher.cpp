@@ -391,7 +391,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
         const auto nonce = legacy_id(request, "nonce");
         if (nonce.empty()) { result["message"] = "missing nonce"; return result; }
         // Broadcast failures are logged only, as NativeDisplayBinder.attach.
-        try { display_attach_(nonce); } catch (...) { result["message"] = "internal error"; return result; }
+        try { display_attach_(nonce, request["broadcast_profile"]); } catch (...) { result["message"] = "internal error"; return result; }
         result["success"] = true; return result;
     }
     try {
@@ -753,6 +753,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (display_attach_) {
                 result["commands"].append("display_attach");
                 result["native_display_binder"] = true;
+                result["display_broadcast_profile"] = "client-captured-v1";
                 result["service_api_minor"] = 10;
             }
             if (packages_) {

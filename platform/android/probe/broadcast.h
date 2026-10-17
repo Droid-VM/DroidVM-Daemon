@@ -8,6 +8,9 @@ namespace droidvm::platform {
 // The verified IActivityManager.broadcastIntent profile for this firmware;
 // throws when the running build has none (see profiles/warsaw-api37.json).
 Json::Value broadcast_profile();
+// A profile the UI captured on this firmware (BroadcastProfile.java), for
+// builds without a verified one. Throws unless it is well formed for this SDK.
+Json::Value client_broadcast_profile(const Json::Value& client);
 // Sends NATIVE_DISPLAY_BINDER to the app with {binder, nonce} nested in
 // extra.bundle, as NativeDisplayBinder.broadcast does through Context. The
 // profile's Intent targets the test package; package replaces it when set.

@@ -57,6 +57,28 @@ Json::Value broadcast_profile() {
         throw std::runtime_error("no verified broadcast profile for this firmware");
     return profile;
 }
+Json::Value client_broadcast_profile(const Json::Value& client) {
+    const auto hex = [&](const char* key, size_t limit) {
+        const auto& value = client[key];
+        if (!value.isString() || value.asString().size() % 8 || value.asString().size() > limit ||
+                value.asString().find_first_not_of("0123456789abcdef") != std::string::npos)
+            throw std::runtime_error(std::string("invalid client profile ") + key);
+        return value;
+    };
+    if (!client.isObject() || !client["sdk"].isInt() || client["sdk"].asInt() != android_get_device_api_level())
+        throw std::runtime_error("client profile is for another SDK");
+    const auto& code = client["broadcast_transaction"];
+    if (!code.isUInt() || code.asUInt() < 1 || code.asUInt() > 0xffffff || !client["extras_offset"].isUInt() ||
+            !client["target_package"].isString() || client["target_package"].asString().empty())
+        throw std::runtime_error("invalid client profile");
+    Json::Value profile;
+    profile["broadcast_transaction"] = code;
+    profile["extras_offset"] = client["extras_offset"];
+    profile["empty_intent_hex"] = hex("empty_intent_hex", 4096);
+    profile["bundle_trailer_hex"] = hex("bundle_trailer_hex", 64);
+    profile["target_package"] = client["target_package"];
+    return profile;
+}
 bool start_binder_pool() {
     // Thread-pool management, like ServiceManager, is exported by Android but
     // is not in the public NDK. Resolve it explicitly and fail closed if absent.
@@ -107,9 +129,10 @@ void send_binder_broadcast(AIBinder* activity, AIBinder* broker, const std::stri
     // through NDK APIs so the Binder object table is maintained by libbinder.
     auto hex = profile["empty_intent_hex"].asString();
     auto extras = profile["extras_offset"].asUInt();
-    if (!package.empty()) {
+    const auto target = profile.get("target_package", "cn.classfun.droidvm.migration.test").asString();
+    if (!package.empty() && package != target) {
         // The captured Intent names exactly one package, before the extras slot.
-        const auto captured = string8_hex("cn.classfun.droidvm.migration.test"), wanted = string8_hex(package);
+        const auto captured = string8_hex(target), wanted = string8_hex(package);
         const auto at = hex.find(captured);
         if (at == std::string::npos || at % 8 || at / 2 >= extras || hex.find(captured, at + 1) != std::string::npos)
             throw std::runtime_error("broadcast profile has no target package to replace");

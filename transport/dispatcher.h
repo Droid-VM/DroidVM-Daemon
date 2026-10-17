@@ -44,7 +44,7 @@ public:
         if (vms_ && !vms_swept_ && (!runtime_ || runtime_->autostart_settled())) { vms_swept_ = true; vms_->auto_up_async(); }
     }
     // NativeDisplayBinder.attach, where the platform Binder services exist.
-    void set_display_attach(std::function<void(const std::string& nonce)> attach) { display_attach_ = std::move(attach); }
+    void set_display_attach(std::function<void(const std::string& nonce, const Json::Value& profile)> attach) { display_attach_ = std::move(attach); }
     void set_usb(usb::UsbService* service) { usb_ = service; }
     void set_packages(pkg::PkgService* service) { packages_ = service; }
     void set_disk_config(DiskConfigService* service) {
@@ -105,7 +105,7 @@ private:
     VmService* vms_;
     LegacyEvents* events_;
     input::KeyboardGrab* keyboard_;
-    std::function<void(const std::string&)> display_attach_;
+    std::function<void(const std::string&, const Json::Value&)> display_attach_;
     usb::UsbService* usb_ = nullptr;
     pkg::PkgService* packages_ = nullptr;
     VmConfigService* vm_config_ = nullptr;

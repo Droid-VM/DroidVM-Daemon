@@ -449,7 +449,7 @@ int main(int argc, char** argv) {
                 hooks.package = display_package;
                 hooks.log = [&](const std::string& level, const std::string& text) { if (log) log->write(level.c_str(), "NativeDisplayBinder: " + text); };
                 display = std::make_unique<droidvm::platform::DisplayBroker>(std::move(hooks));
-                dispatcher.set_display_attach([&](const std::string& nonce) { display->attach(nonce); });
+                dispatcher.set_display_attach([&](const std::string& nonce, const Json::Value& profile) { display->attach(nonce, profile); });
             }
 #endif
             droidvm::Cleanup cleanup;

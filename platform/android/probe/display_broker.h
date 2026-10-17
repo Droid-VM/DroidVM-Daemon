@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "input/keyboard_grab.h"
+#include <json/json.h>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -28,7 +29,8 @@ public:
     ~DisplayBroker();
     // NativeDisplayBinder.attach: build the broker once and broadcast it with
     // nonce. Failures are logged, as the legacy handler returns success.
-    void attach(const std::string& nonce);
+    // client_profile is used only when this firmware has no verified profile.
+    void attach(const std::string& nonce, const Json::Value& client_profile = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
