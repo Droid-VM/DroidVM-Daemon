@@ -23,10 +23,11 @@ private:
 
 int main(int argc, char** argv) {
     try {
-        const bool coordinated = argc >= 4 && std::string_view(argv[3]) == "--coordinated";
+        const bool vm_disks = argc >= 4 && std::string_view(argv[3]) == "--vm-disks";
+        const bool coordinated = vm_disks || (argc >= 4 && std::string_view(argv[3]) == "--coordinated");
         const bool disk_config = argc == 4 && std::string_view(argv[3]) == "--disk-config";
         if (!(argc == 3 || disk_config || (coordinated && (argc == 4 || argc == 6))))
-            throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk> [--disk-config | --coordinated [--fail-once|--crash-once <stage>]]");
+            throw std::runtime_error("Usage: vm-config-fixture <isolated-directory> <apk> [--disk-config | --coordinated|--vm-disks [--fail-once|--crash-once <stage>]]");
         std::string fault;
         bool crash = false;
         if (argc == 6) {
@@ -61,7 +62,7 @@ int main(int argc, char** argv) {
                     if (fault != stage || injected.exchange(true)) return;
                     if (crash) { ::kill(getpid(), SIGKILL); ::_exit(137); }
                     throw std::runtime_error("fixture transaction fault: " + fault);
-                });
+                }, vm_disks);
             networks = std::make_unique<droidvm::NetworkService>(configuration->networks(), [](const Json::Value& value) {
                 if (droidvm::config::string(value, "bridge_type") != "gvisor" || !droidvm::network::l3_vlans(value).empty())
                     throw std::runtime_error("fixture only supports gvisor without VLANs");
