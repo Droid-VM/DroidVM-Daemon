@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "network_config.h"
+#include "disk_config.h"
 #include "vm_config.h"
 #include "store/config_transaction.h"
 
@@ -10,13 +11,15 @@ class NetworkService;
 // Construct before serving, under the daemon Instance lock. Inventory must be
 // empty; inventory, events and this service must share the SAME gate. The owner
 // keeps inventory/events alive until this coordinator is destroyed.
-// Claims both legacy ownership gates and replays the journal BEFORE loading.
+// Claims participating ownership gates and replays the journal BEFORE loading.
+// Disk participation is opt-in until registry/header/runtime coordination is complete.
 class ConfigurationService {
 public:
     ConfigurationService(int directory, uid_t owner, std::shared_ptr<ConfigurationGate> gate,
-        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer = {});
+        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer = {}, bool manage_disks = false);
     VmConfigService& vms() { return *vms_; }
     NetworkConfigService& networks() { return *networks_; }
+    DiskConfigService* disks() { return disks_.get(); }
     VmService& inventory() { return inventory_; }
     TaskService& events() { return events_; }
     // Every affected VM must admit a stopped edit. With a matching lifecycle
@@ -35,9 +38,12 @@ private:
     std::unique_ptr<config::ConfigTransaction> journal_;
     std::unique_ptr<NetworkConfigService> networks_;
     std::unique_ptr<VmConfigService> vms_;
+    std::unique_ptr<DiskConfigService> disks_;
     std::shared_ptr<VmConfigSnapshot> pending_vm_;
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     void publish_pending();
     void validate_vm_networks(const Json::Value& before, const Json::Value& after) const;
+    void validate_vm_disks(const Json::Value& before, const Json::Value& after) const;
+    void validate_disk_change(const Json::Value& before, const Json::Value& after) const;
 };
 }

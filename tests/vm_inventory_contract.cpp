@@ -106,10 +106,105 @@ struct Coordinated {
     static vm::RuntimeContext context(Fixture& fixture, const std::shared_ptr<ConfigurationGate>& gate) {
         auto result = fixture.context; result.configuration_gate = gate; return result;
     }
-    explicit Coordinated(Fixture& fixture, config::ConfigTransaction::Observer observer = {})
+    explicit Coordinated(Fixture& fixture, config::ConfigTransaction::Observer observer = {}, bool disks = false)
         : directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)), inventory(context(fixture, gate)),
-          service(directory.get(), getuid(), gate, inventory, tasks, std::move(observer)) {}
+          service(directory.get(), getuid(), gate, inventory, tasks, std::move(observer), disks) {}
 };
+Json::Value registered_disk() {
+    auto row = config("image.qcow2"); row["folder"] = "/images/";
+    return row;
+}
+void coordinated_disk_references() {
+    Fixture fixture; Coordinated c(fixture, {}, true);
+    auto& disks = *c.service.disks();
+    auto disk = registered_disk(); auto initial = disks.snapshot(admin);
+    auto document = initial->document; document["disks"].append(disk);
+    auto saved = disks.replace(admin, initial->revision, document);
+    auto row = config("disk VM"); Json::Value slot; slot["path"] = "/images/image.qcow2";
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot);
+    auto vm = c.service.vms().snapshot(admin); auto desired = vm->document; desired["vms"].append(row);
+    vm = c.service.vms().replace(admin, vm->revision, desired);
+    error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, initial->document); });
+    auto changed = document; changed["disks"][0]["folder"] = "/moved";
+    error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, changed); });
+    changed = document; changed["disks"][0]["parent"] = random_id(true);
+    error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, changed); });
+    check(disks.snapshot(admin)->revision == saved->revision, "rejected registry edits leave revision unchanged");
+    desired = vm->document; desired["vms"][0]["disks"].clear();
+    vm = c.service.vms().replace(admin, vm->revision, desired);
+    disks.replace(admin, saved->revision, initial->document);
+    desired["vms"][0]["disks"].append(slot);
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, vm->revision, desired); });
+    bool refused = false;
+    try { config::require_legacy_disk_config(c.directory.get(), getuid()); } catch (...) { refused = true; }
+    check(refused, "coordinator durably claims disk ownership");
+}
+void coordinated_historical_disk_references() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto row = config("historical disk VM"); Json::Value slot; slot["path"] = "/unregistered"; slot["extension"] = 7;
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot);
+    Json::Value document; document["vms"] = Json::Value(Json::arrayValue); document["vms"].append(row);
+    config::JsonFile(directory.get(), "vms.json", getuid()).save(document);
+    Coordinated c(fixture, {}, true); auto base = c.service.vms().snapshot(admin);
+    auto edited = base->document; edited["vms"][0]["name"] = "renamed";
+    base = c.service.vms().replace(admin, base->revision, edited);
+    for (int mode = 0; mode < 3; ++mode) {
+        edited = base->document;
+        if (mode == 0) edited["vms"][0]["disks"].append(slot);
+        if (mode == 1) edited["vms"][0]["disks"][0]["extension"] = 8;
+        if (mode == 2) {
+            auto copy = edited["vms"][0]; copy["id"] = random_id(true); copy["name"] = "copy";
+            edited["vms"].append(copy);
+        }
+        error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, base->revision, edited); });
+    }
+    edited = base->document; edited["vms"][0]["disks"].clear();
+    c.service.vms().replace(admin, base->revision, edited);
+}
+void coordinated_disk_reference_races() {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
+        auto empty = disks.snapshot(admin); auto document = empty->document; document["disks"].append(registered_disk());
+        auto baseline = disks.replace(admin, empty->revision, document);
+        auto vm = c.service.vms().snapshot(admin); auto desired = vm->document;
+        auto row = config("racing VM"); Json::Value slot; slot["path"] = "/images/image.qcow2";
+        row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot); desired["vms"].append(row);
+        std::promise<void> ready; auto begin = ready.get_future().share();
+        auto writer = std::async(std::launch::async, [&] {
+            begin.wait();
+            try { c.service.vms().replace(admin, vm->revision, desired); }
+            catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict || error.code() == ErrorCode::unavailable, "VM race rejects safely"); }
+        });
+        auto remover = std::async(std::launch::async, [&] {
+            begin.wait();
+            try { disks.replace(admin, baseline->revision, empty->document); }
+            catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict, "referenced removal rejects safely"); }
+        });
+        ready.set_value(); writer.get(); remover.get();
+        check(c.service.vms().snapshot(admin)->document["vms"].empty() || !disks.snapshot(admin)->document["disks"].empty(),
+            "concurrent disk removal and VM creation cannot publish dangling reference");
+    }
+}
+void coordinated_disk_redo_before_load() {
+    Fixture fixture; Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    Json::Value disks; disks["disks"] = Json::Value(Json::arrayValue); disks["disks"].append(registered_disk());
+    Json::Value vms; vms["vms"] = Json::Value(Json::arrayValue);
+    auto row = config("replayed VM"); Json::Value slot; slot["path"] = "/images/image.qcow2";
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot); vms["vms"].append(row);
+    {
+        config::ConfigTransaction journal(directory.get(), getuid(), [](const char* stage, size_t) {
+            if (std::string_view(stage) == "participant_synced") throw std::runtime_error("interrupt redo");
+        });
+        bool interrupted = false;
+        try { journal.commit({{"vms.json", vms}, {"disks.json", disks}}); }
+        catch (const config::TransactionError& error) { interrupted = error.decided; }
+        check(interrupted, "leave durable VM/disk redo for startup");
+    }
+    Coordinated c(fixture, {}, true);
+    check(c.service.disks()->snapshot(admin)->document == disks && c.service.vms().snapshot(admin)->document["vms"].size() == 1,
+        "coordinator replays disks and VMs before exposing inventory");
+}
 struct DeletionInput {
     Json::Value network;
     VmConfigService::Snapshot baseline;
@@ -1031,6 +1126,10 @@ int main() {
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
         {"coordinated_network_delete", coordinated_network_delete},
+        {"coordinated_disk_references", coordinated_disk_references},
+        {"coordinated_historical_disk_references", coordinated_historical_disk_references},
+        {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
+        {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},
         {"coordinated_vm_network_references", coordinated_vm_network_references},
         {"coordinated_historical_network_references", coordinated_historical_network_references},
         {"sixteen_coordinated_reference_delete_races", coordinated_reference_delete_races},

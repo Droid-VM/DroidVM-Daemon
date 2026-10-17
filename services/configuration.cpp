@@ -20,9 +20,20 @@ bool references(const Json::Value& nic, const std::string& id) {
     Json::Value target; target["id"] = nic["network_id"];
     try { return config::uuid(target) == id; } catch (const std::invalid_argument&) { return false; }
 }
+// Match the Java registry's lexical path join. This is not inode identity and
+// does not authorize file mutations; canonical paths and headers need leases.
+std::string disk_path(const Json::Value& row) {
+    const auto& folder = config::member(row, "folder");
+    const auto& name = config::member(row, "name");
+    std::string base = folder.isString() ? folder.asString() : "";
+    std::string child = name.isString() ? name.asString() : "";
+    if (!base.empty() && base.back() == '/') base.pop_back();
+    if (!child.empty() && child.front() == '/') child.erase(0, 1);
+    return base + "/" + child;
+}
 }
 ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shared_ptr<ConfigurationGate> gate,
-        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer)
+        VmService& inventory, TaskService& events, config::ConfigTransaction::Observer observer, bool manage_disks)
     : gate_(std::move(gate)), inventory_(inventory), events_(events) {
     if (!gate_ || inventory.context_.configuration_gate != gate_ || events.config_gate_ != gate_)
         throw std::invalid_argument("Configuration participants must share one gate");
@@ -38,16 +49,77 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     exclusive.require_recovery();
     config::claim_vm_config(directory, owner);
     config::claim_network_config(directory, owner);
+    if (manage_disks) config::claim_disk_config(directory, owner);
+    auto targets = std::vector<std::string>{"vms.json", "networks.json"};
+    if (manage_disks) targets.push_back("disks.json");
     journal_ = std::make_unique<config::ConfigTransaction>(directory, owner, std::move(observer),
-        std::vector<std::string>{"vms.json", "networks.json"});
+        std::move(targets));
     networks_ = std::make_unique<NetworkConfigService>(directory, owner, config::JsonFile::Observer{}, &events, true, gate_);
     vms_ = std::make_unique<VmConfigService>(directory, owner, config::JsonFile::Observer{},
         [&inventory](const Json::Value& document) { return inventory.prepare_config(document); }, &events, gate_);
+    if (manage_disks) {
+        disks_ = std::make_unique<DiskConfigService>(directory, owner, config::JsonFile::Observer{}, gate_,
+            [this](const Json::Value& before, const Json::Value& after) -> std::unique_ptr<ConfigurationCommit> {
+                validate_disk_change(before, after);
+                return {};
+            }, &events);
+        disks_->coordinated_ = true;
+    }
     networks_->coordinated_removal_ = true;
     vms_->validate_change_ = [this](const Json::Value& before, const Json::Value& after) {
         validate_vm_networks(before, after);
+        if (disks_) validate_vm_disks(before, after);
     };
     exclusive.recovered();
+}
+void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after) const {
+    const auto registry = disks_->state();
+    std::set<std::string> paths;
+    for (const auto& row : registry->document["disks"]) paths.insert(disk_path(row));
+    auto unresolved = [&](const Json::Value& slot) {
+        const auto& path = config::member(slot, "path");
+        if (path.isNull() || (path.isString() && path.asString().empty())) return false;
+        return !path.isString() || !paths.contains(path.asString());
+    };
+    std::map<std::string, std::multiset<Json::Value>> historical;
+    for (const auto& vm : before["vms"]) {
+        const auto& slots = config::member(vm, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) if (unresolved(slot))
+            historical[config::uuid(vm)].insert(slot);
+    }
+    for (const auto& vm : after["vms"]) {
+        const auto& slots = config::member(vm, "disks");
+        if (!slots.isArray()) continue;
+        auto& allowed = historical[config::uuid(vm)];
+        for (const auto& slot : slots) if (unresolved(slot)) {
+            const auto found = allowed.find(slot);
+            if (found == allowed.end())
+                throw ServiceError(ErrorCode::conflict, "VM disk reference is not registered; reload disks before saving");
+            allowed.erase(found);
+        }
+    }
+}
+void ConfigurationService::validate_disk_change(const Json::Value& before, const Json::Value& after) const {
+    // Disk writes hold the exclusive gate, so no VM writer/start can pass this
+    // check concurrently. Registry-only uploads cannot detach referenced images
+    // or alter a referenced row's metadata; those require a coordinated operation.
+    const auto vms = vms_->state();
+    std::set<std::string> referenced;
+    for (const auto& vm : vms->document["vms"]) {
+        const auto& slots = config::member(vm, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) {
+            const auto& path = config::member(slot, "path");
+            if (path.isString() && !path.asString().empty()) referenced.insert(path.asString());
+        }
+    }
+    std::map<std::string, Json::Value> old_rows, new_rows;
+    for (const auto& row : before["disks"]) old_rows.emplace(config::uuid(row), row);
+    for (const auto& row : after["disks"]) new_rows.emplace(config::uuid(row), row);
+    for (const auto& [id, row] : old_rows) {
+        const auto next = new_rows.find(id);
+        if (referenced.contains(disk_path(row)) && (next == new_rows.end() || next->second != row))
+            throw ServiceError(ErrorCode::conflict, "Referenced disk requires a coordinated update");
+    }
 }
 void ConfigurationService::validate_vm_networks(const Json::Value& before, const Json::Value& after) const {
     // Caller holds VM writer + admission. Deletion must drain that admission;

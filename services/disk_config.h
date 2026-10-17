@@ -20,7 +20,8 @@ struct DiskConfigSnapshot {
 class DiskConfigService {
 public:
     using Snapshot = std::shared_ptr<const DiskConfigSnapshot>;
-    // Startup binding; prepares under gate admission and registry writer, before IO.
+    // Startup binding; prepares under gate admission (exclusive when coordinated)
+    // and registry writer, before IO.
     // It must not re-enter this service or acquire an exclusive gate transaction.
     // Leases survive publication, including installed-but-uncertain outcomes.
     using Prepare = std::function<std::unique_ptr<ConfigurationCommit>(const Json::Value& before, const Json::Value& after)>;
@@ -37,6 +38,7 @@ private:
     config::JsonFile file_;
     std::shared_ptr<ConfigurationGate> gate_;
     Prepare prepare_;
+    bool coordinated_ = false;
     TaskService* events_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;

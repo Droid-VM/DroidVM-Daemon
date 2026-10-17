@@ -5,6 +5,7 @@
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
 #include <set>
+#include <optional>
 
 namespace droidvm {
 namespace {
@@ -73,7 +74,12 @@ DiskConfigService::Snapshot DiskConfigService::snapshot(const CallContext& calle
 }
 DiskConfigService::Snapshot DiskConfigService::replace(const CallContext& caller, const std::string& revision, Json::Value document) {
     access(caller);
-    auto admission = ConfigurationGate::enter(gate_);
+    std::optional<ConfigurationGate::Transaction> exclusive;
+    std::optional<ConfigurationGate::Admission> admission;
+    if (coordinated_) {
+        exclusive.emplace(gate_->transaction());
+        exclusive->require_available();
+    } else admission.emplace(ConfigurationGate::enter(gate_));
     if (revision.empty() || revision.size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Missing or invalid disk registry revision");
     if (state()->revision != revision)
