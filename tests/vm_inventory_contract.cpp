@@ -19,6 +19,27 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void crosvm_disk_capabilities() {
+    Json::Value caps;
+    caps["schema"] = "droidvm-disk-capabilities-v1";
+    caps["backing_chain"] = "explicit-paths-v1";
+    caps["max_backing_depth"] = 10;
+    for (const auto* name : {"proc_fd", "raw", "qcow2", "block", "scsi"}) caps[name] = true;
+    check(vm::crosvm_retained_chain_supported(caps), "versioned complete crosvm extension accepted");
+    for (const auto& name : caps.getMemberNames()) {
+        auto missing = caps; missing.removeMember(name);
+        check(!vm::crosvm_retained_chain_supported(missing), "partial capability cannot enable FD chains");
+    }
+    for (const auto* name : {"proc_fd", "raw", "qcow2", "block", "scsi"}) {
+        auto wrong = caps; wrong[name] = "true";
+        check(!vm::crosvm_retained_chain_supported(wrong), "capability booleans cannot be strings");
+        wrong[name] = false;
+        check(!vm::crosvm_retained_chain_supported(wrong), "unavailable platform or format rejected");
+    }
+    caps["max_backing_depth"] = 9;
+    check(!vm::crosvm_retained_chain_supported(caps), "insufficient depth rejected");
+    check(!vm::crosvm_retained_chain_supported(Json::Value()), "old backend without document rejected");
+}
 void crosvm_retained_disk_attachment() {
     Json::Value config;
     config["id"] = random_id(true); config["name"] = "retained-crosvm";
@@ -1659,7 +1680,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
+    return run({{"crosvm_disk_capabilities", crosvm_disk_capabilities},
+        {"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
         {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
         {"qemu_retained_disk_graph", qemu_retained_disk_graph},
         {"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},

@@ -519,6 +519,20 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
                 disk_io.push_back(std::move(fd));
             }
         }
+        if (!run.disk_backing_fds->empty()) {
+            ChildOptions probe;
+            probe.argv = {context_.data_dir + "/usr/bin/crosvm", "disk-capabilities"};
+            probe.environment = merged_environment({{"LD_LIBRARY_PATH", context_.data_dir + "/usr/lib"}, {"LD_PRELOAD", ""}});
+            const auto capabilities = Child(probe).communicate({}, 2s, 4096,
+                [this] { return stopped_by_user_ || context_.shutting_down(); });
+            if (capabilities.cancelled) throw std::runtime_error("crosvm disk capability check cancelled");
+            bool supported = false;
+            if (capabilities.exit_code == 0 && !capabilities.timed_out && !capabilities.truncated) {
+                try { supported = crosvm_retained_chain_supported(config::parse_json(capabilities.output)); }
+                catch (const std::exception&) {}
+            }
+            if (!supported) throw std::runtime_error("Installed crosvm lacks the required explicit backing-chain capability; upgrade the backend");
+        }
         lease->verify();
     }
     const auto& ports = config::member(config, "serial_ports");

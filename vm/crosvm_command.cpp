@@ -694,6 +694,14 @@ struct Builder {
 };
 }
 
+bool crosvm_retained_chain_supported(const Json::Value& caps) {
+    if (!caps.isObject() || caps["schema"] != "droidvm-disk-capabilities-v1" ||
+        caps["backing_chain"] != "explicit-paths-v1" || !caps["max_backing_depth"].isUInt() ||
+        caps["max_backing_depth"].asUInt() < 10) return false;
+    for (const auto* name : {"proc_fd", "raw", "qcow2", "block", "scsi"})
+        if (!caps[name].isBool() || !caps[name].asBool()) return false;
+    return true;
+}
 CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, const BootPlan& boot, const HostFacts& host) {
     if (!config.isObject()) throw std::invalid_argument("VM config must be an object");
     Builder builder{config, run, boot, host, data_dir(host), {}};
