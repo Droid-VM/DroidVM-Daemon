@@ -8,6 +8,7 @@
 #include "store/vm_ownership.h"
 #include "transport/dispatcher.h"
 #include "vm/qemu_command.h"
+#include "vm/command_common.h"
 #include <atomic>
 #include <dirent.h>
 #include <future>
@@ -18,6 +19,55 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void disk_option_path_encoding() {
+    using namespace vm::command;
+    const std::string path = "/isolated/a,readonly=off,ro=false,[x]'\"\\.img";
+    const std::string qemu_path = "/isolated/a,,readonly=off,,ro=false,,[x]'\"\\.img";
+    const std::string crosvm_path = "\"/isolated/a,readonly=off,ro=false,[x]'\\\"\\\\.img\"";
+    check(qemu_option_value(path) == qemu_path, "QEMU commas stay in the filename");
+    check(crosvm_option_value(path) == crosvm_path, "crosvm quotes and escapes the complete filename");
+    for (auto encode : {qemu_option_value, crosvm_option_value}) {
+        check(encode("/plain file.img") == "/plain file.img", "ordinary paths retain their existing arguments");
+        bool refused = false;
+        try { encode(std::string("/a\0b", 4)); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "NUL cannot truncate a backend path");
+    }
+    Json::Value config;
+    config["name"] = "path-contract"; config["id"] = random_id(true);
+    config["screens"]["gpu-0"]["enabled"] = false;
+    config["screens"]["simplefb"]["enabled"] = false;
+    vm::HostFacts host; host.optimize_sdcard = false;
+    vm::QemuRun run;
+    int size_queries = 0;
+    run.file_length = [&](const std::string& actual) {
+        ++size_queries;
+        check(actual == path, "PMEM stat receives the unencoded filesystem path");
+        return 64LL * 1024 * 1024;
+    };
+    for (const auto* bus : {"pflash", "pmem", "virtio", "scsi", "cdrom"}) {
+        Json::Value disk;
+        disk["path"] = path; disk["bus"] = bus; disk["readonly"] = true;
+        config["disks"] = Json::Value(Json::arrayValue); config["disks"].append(disk);
+        const auto qemu = vm::qemu_command(config, run, {}, host);
+        size_t matches = 0;
+        for (const auto& arg : qemu.argv) if (arg.find("/isolated/") != std::string::npos) {
+            ++matches;
+            check(arg.find(qemu_path + ",") != std::string::npos && arg.ends_with(",readonly=on"),
+                "encoded QEMU path cannot inject additional disk options");
+        }
+        check(matches == 1, "one QEMU disk argument");
+        if (std::string_view(bus) == "pflash") continue;
+        const auto crosvm = vm::crosvm_command(config, {}, {}, host);
+        matches = 0;
+        for (const auto& arg : crosvm.argv) if (arg.find("/isolated/") != std::string::npos) {
+            ++matches;
+            check(arg.starts_with(crosvm_path + ",") && arg.find(",ro=true") != std::string::npos,
+                "encoded crosvm path cannot inject additional disk options");
+        }
+        check(matches == 1, "one crosvm disk argument");
+    }
+    check(size_queries == 1, "only PMEM queries file size");
+}
 void qemu_disk_readonly_arguments() {
     Json::Value config;
     config["name"] = "readonly-contract";
@@ -1443,7 +1493,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},
+    return run({{"disk_option_path_encoding", disk_option_path_encoding},
+        {"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},
         {"replace_delete_stale_references", replacement_and_failure},
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},

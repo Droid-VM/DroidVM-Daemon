@@ -61,6 +61,19 @@ std::string optimized_path(std::string path, const HostFacts& host) {
     if (host.optimize_sdcard && path.starts_with(prefix)) return "/data/media/" + path.substr(prefix.size());
     return path;
 }
+std::string qemu_option_value(const std::string& value) {
+    if (value.find('\0') != std::string::npos) throw std::invalid_argument("NUL in QEMU option value");
+    std::string result;
+    for (char c : value) { result += c; if (c == ',') result += ','; }
+    return result;
+}
+std::string crosvm_option_value(const std::string& value) {
+    if (value.find('\0') != std::string::npos) throw std::invalid_argument("NUL in crosvm option value");
+    if (!value.empty() && value.find_first_of(",[]\"'") == std::string::npos) return value;
+    std::string result = "\"";
+    for (char c : value) { if (c == '\\' || c == '"') result += '\\'; result += c; }
+    return result + '"';
+}
 
 std::optional<Screen> find_screen(const Json::Value& config, const char* id) {
     const auto& screens = member(config, "screens");

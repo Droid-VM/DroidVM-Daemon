@@ -307,7 +307,7 @@ struct Builder {
             path = optimized_path(std::move(path), host);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
-            auto arg = path;
+            auto arg = crosvm_option_value(path);
             if (bus == "SCSI") {
                 arg += ",lock=false";
                 if (readonly) arg += ",ro=true";

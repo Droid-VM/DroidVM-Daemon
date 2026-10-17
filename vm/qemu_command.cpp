@@ -52,6 +52,8 @@ struct Builder {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
             path = optimized_path(std::move(path), host);
+            const auto file_path = path;
+            path = qemu_option_value(path);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
             if (bus == "PFLASH") {
@@ -68,7 +70,7 @@ struct Builder {
                 add({"-device", "scsi-hd,drive=" + id + ",bus=scsi0.0,bootindex=" + decimal(boot_index++)});
             } else if (bus == "PMEM") {
                 const auto id = "pmem" + decimal(pmem++);
-                int64_t size = run.file_length ? run.file_length(path) : 0;
+                int64_t size = run.file_length ? run.file_length(file_path) : 0;
                 if (size <= 0) size = 64LL * 1024 * 1024;
                 add({"-object", "memory-backend-file,id=" + id + ",mem-path=" + path + ",share=on,size=" + decimal(size)
                     + (readonly ? ",readonly=on" : "")});

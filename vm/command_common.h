@@ -52,6 +52,9 @@ std::vector<const Json::Value*> items(const Json::Value& value);
 std::string data_dir(const HostFacts& host);
 // VMBackendInstance.patchOptimizedPath
 std::string optimized_path(std::string path, const HostFacts& host);
+// Values embedded in backend option lists, not shell escaping.
+std::string qemu_option_value(const std::string& value);
+std::string crosvm_option_value(const std::string& value);
 
 // --- VMScreenConfig ---
 struct Screen {
