@@ -14,9 +14,15 @@
 #include <fcntl.h>
 #include <map>
 #include <optional>
+#include <cstdlib>
 #include <set>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/xattr.h>
+#include <unistd.h>
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
 
 namespace droidvm::pkg {
 namespace {
@@ -55,6 +61,65 @@ Fd open_directory(const std::string& path) {
     Fd directory(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (directory.get() < 0) throw ServiceError(ErrorCode::io_error, errno_message("open disk directory", errno));
     return directory;
+}
+// Installs a new image without replacing a file at the target. FUSE storage
+// (/storage/emulated) has no hard links: fall back to a no-replace rename, and
+// where that flag is unsupported to a rename after checking the target is free.
+// Returns true when the temporary name was consumed by a rename.
+bool install_without_replacing(int directory, const std::string& from, const std::string& to) {
+    if (linkat(directory, from.c_str(), directory, to.c_str(), 0) == 0) return false;
+    int error = errno;
+    if (error == EPERM || error == EOPNOTSUPP || error == ENOSYS || error == EXDEV || error == EMLINK) {
+        if (syscall(SYS_renameat2, directory, from.c_str(), directory, to.c_str(), RENAME_NOREPLACE) == 0) return true;
+        error = errno;
+        if (error == EINVAL || error == ENOSYS || error == EOPNOTSUPP) {
+            struct stat existing{};
+            if (fstatat(directory, to.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0) error = EEXIST;
+            else if (errno != ENOENT) error = errno;
+            else if (renameat(directory, from.c_str(), directory, to.c_str()) == 0) return true;
+            else error = errno;
+        }
+    }
+    throw ServiceError(error == EEXIST ? ErrorCode::conflict : ErrorCode::io_error, errno_message("install new disk image", error));
+}
+// qemu-img -p prints "    (12.34/100%)\r"; reported in hundredths of a percent.
+class ToolProgress {
+public:
+    ToolProgress(TaskControl& control, std::string phase) : control_(control), phase_(std::move(phase)) {}
+    void operator()(std::string_view chunk) {
+        pending_.append(chunk);
+        for (auto end = pending_.find("/100%)"); end != std::string::npos; end = pending_.find("/100%)")) {
+            const auto start = pending_.rfind('(', end);
+            if (start != std::string::npos) {
+                const auto number = pending_.substr(start + 1, end - start - 1);
+                char* stop = nullptr;
+                const double value = std::strtod(number.c_str(), &stop);
+                if (!number.empty() && stop && *stop == '\0' && value >= 0)
+                    report(std::min<uint64_t>(10000, static_cast<uint64_t>(value * 100 + 0.5)));
+            }
+            pending_.erase(0, end + 6);
+        }
+        if (pending_.size() > 64) pending_.erase(0, pending_.size() - 64);
+    }
+private:
+    TaskControl& control_;
+    std::string phase_, pending_;
+    std::optional<uint64_t> last_;
+    void report(uint64_t value) {
+        if (last_ && value <= *last_) return;
+        last_ = value;
+        try { control_.progress({phase_, "basis_points", value, 10000}); } catch (const ServiceError&) {}
+    }
+};
+// Exit code plus the tool's last diagnostic line.
+std::string tool_failure(const std::string& action, const ChildOutput& output) {
+    auto message = "qemu-img " + action + " failed with " + std::to_string(output.exit_code);
+    auto text = output.error;
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+    const auto cut = text.find_last_of("\r\n");
+    const auto line = cut == std::string::npos ? text : text.substr(cut + 1);
+    if (!line.empty()) message += ": " + line.substr(0, 300);
+    return message;
 }
 // Removes only the exact journaled temporary inode, never a replacement.
 bool remove_temporary(int directory, const std::string& name, const std::optional<Identity>& expected) {
@@ -106,7 +171,7 @@ void rebase_header(const std::string& tool, int fd, const std::string& backing, 
     options.preserve_fds = {fd};
     const auto result = Child(options).communicate({}, std::chrono::minutes(2), 1u << 20);
     if (result.exit_code != 0 || result.timed_out || result.truncated)
-        throw ServiceError(ErrorCode::io_error, "qemu-img rebase failed with " + std::to_string(result.exit_code));
+        throw ServiceError(ErrorCode::io_error, tool_failure("rebase", result));
     sync_or_throw(fd, "sync rebased disk");
 }
 std::set<std::string> registered_ids(const Json::Value& disks) {
@@ -477,7 +542,7 @@ std::vector<std::string> DiskOperationService::Operation::command(int output) co
         if (size_ > 0) argv.push_back(std::to_string(size_));
         return argv;
     }
-    argv.insert(argv.end(), {"convert", "-O", target_format_});
+    argv.insert(argv.end(), {"convert", "-p", "-O", target_format_});
     // convert reads the whole chain; keep an overlay's own layer over its parent.
     if (action_ != "flatten" && chain_.size() > 1) argv.insert(argv.end(), {"-B", chain_[1].path, "-F", chain_[1].format});
     if (!settings.empty()) argv.insert(argv.end(), {"-o", settings});
@@ -529,7 +594,7 @@ TaskCompletion DiskOperationService::Operation::resize(TaskControl& control) {
     const auto output = Child(options).communicate({}, std::chrono::minutes(30), 1u << 20);
     lease_->verify();
     if (output.exit_code != 0 || output.timed_out || output.truncated)
-        throw ServiceError(ErrorCode::io_error, "qemu-img resize failed with " + std::to_string(output.exit_code));
+        throw ServiceError(ErrorCode::io_error, tool_failure("resize", output));
     sync_or_throw(io.get(), "sync resized disk");
     return TaskCompletion::success(result());
 }
@@ -567,6 +632,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     // Journal the name before the file exists, so any crash leaves a findable owner.
     owner_.put_record(record);
     std::optional<Identity> created;
+    bool renamed = false;
     auto discard = [&] {
         try {
             if (remove_temporary(directory.get(), temporary, created)) owner_.drop_record(id_);
@@ -599,11 +665,12 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         options.preserve_fds = {output.get()};
         for (const auto& member : chain_) options.preserve_fds.push_back(lease_->read_fd(member.path));
         const auto stopping = owner_.stopping_;
+        ToolProgress progress(control, action_);
         const auto converted = Child(options).communicate({}, std::chrono::hours(24), 1u << 20,
-            [&control, stopping] { return control.cancellation_requested() || stopping->load(); });
+            [&control, stopping] { return control.cancellation_requested() || stopping->load(); }, std::ref(progress));
         if (converted.cancelled) { discard(); return TaskCompletion::cancelled(); }
         if (converted.exit_code != 0 || converted.timed_out || converted.truncated)
-            throw ServiceError(ErrorCode::io_error, "qemu-img " + action_ + " failed with " + std::to_string(converted.exit_code));
+            throw ServiceError(ErrorCode::io_error, tool_failure(action_, converted));
         sync_or_throw(output.get(), "sync written disk");
         fault("converted");
         struct stat current{};
@@ -615,10 +682,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         owner_.put_record(record);
         if (installs()) {
             // Never replace a file that appeared at the target meanwhile.
-            if (linkat(directory.get(), temporary.c_str(), directory.get(), name.c_str(), 0) != 0) {
-                const int error = errno;
-                throw ServiceError(error == EEXIST ? ErrorCode::conflict : ErrorCode::io_error, errno_message("install new disk image", error));
-            }
+            renamed = install_without_replacing(directory.get(), temporary, name);
         }
     } catch (const Abandoned&) {
         throw;
@@ -628,7 +692,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     }
     // Past this point the only safe direction is forward: the journal decides.
     if (installs()) {
-        if (unlinkat(directory.get(), temporary.c_str(), 0) != 0)
+        if (!renamed && unlinkat(directory.get(), temporary.c_str(), 0) != 0)
             throw ServiceError(ErrorCode::io_error, errno_message("remove installed disk temporary name", errno));
     } else if (renameat(directory.get(), temporary.c_str(), directory.get(), name.c_str()) != 0)
         throw ServiceError(ErrorCode::io_error, errno_message("replace disk image", errno));
@@ -708,12 +772,13 @@ TaskCompletion DiskOperationService::Operation::merge(TaskControl& control) {
         node["file"]["filename"] = descriptor(top.get());
         node["backing"]["file"]["filename"] = descriptor(base.get());
         ChildOptions options;
-        options.argv = {tool(), "commit", "-d", "json:" + wire::stringify(node)};
+        options.argv = {tool(), "commit", "-p", "-d", "json:" + wire::stringify(node)};
         options.preserve_fds = {top.get(), base.get()};
         for (size_t i = 2; i < chain_.size(); ++i) options.preserve_fds.push_back(lease_->read_fd(chain_[i].path));
-        const auto result = Child(options).communicate({}, std::chrono::hours(24), 1u << 20);
+        ToolProgress progress(control, "commit");
+        const auto result = Child(options).communicate({}, std::chrono::hours(24), 1u << 20, {}, std::ref(progress));
         if (result.exit_code != 0 || result.timed_out || result.truncated)
-            throw ServiceError(ErrorCode::io_error, "qemu-img commit failed with " + std::to_string(result.exit_code));
+            throw ServiceError(ErrorCode::io_error, tool_failure("commit", result));
         sync_or_throw(base.get(), "sync merged parent disk");
         lease_->verify();
         fault("committed");

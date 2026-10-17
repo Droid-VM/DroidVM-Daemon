@@ -141,7 +141,7 @@ int Child::stop(std::chrono::milliseconds grace) {
     return *exit_;
 }
 ChildOutput Child::communicate(std::string_view input, std::chrono::milliseconds timeout, size_t capture_bytes,
-                               std::function<bool()> cancelled) {
+                               std::function<bool()> cancelled, std::function<void(std::string_view)> on_output) {
     if (timeout.count() < 0 || capture_bytes > (16u << 20) || (input_.get() < 0 && !input.empty()))
         throw std::invalid_argument("invalid child IO budget");
     ChildOutput result;
@@ -156,6 +156,7 @@ ChildOutput Child::communicate(std::string_view input, std::chrono::milliseconds
             if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
             if (count < 0) fail("read child pipe");
             if (count == 0) { fd = Fd(); break; }
+            if (on_output && &fd == &output_) on_output(std::string_view(bytes, static_cast<size_t>(count)));
             const size_t keep = std::min<size_t>(count, capture_bytes - result.output.size() - result.error.size());
             destination.append(bytes, keep);
             result.truncated |= keep < static_cast<size_t>(count);

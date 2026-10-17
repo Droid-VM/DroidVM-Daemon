@@ -50,8 +50,10 @@ public:
     // draining output during the grace period. stop() still owns final reaping.
     void request_stop();
     int stop(std::chrono::milliseconds grace = std::chrono::seconds(3));
+    // on_output sees every stdout chunk as it arrives, before the capture budget applies.
     ChildOutput communicate(std::string_view input = {}, std::chrono::milliseconds timeout = std::chrono::seconds(30),
-        size_t capture_bytes = 256u << 10, std::function<bool()> cancelled = {});
+        size_t capture_bytes = 256u << 10, std::function<bool()> cancelled = {},
+        std::function<void(std::string_view)> on_output = {});
 private:
     pid_t pid_ = -1;
     Fd process_, input_, output_, error_;

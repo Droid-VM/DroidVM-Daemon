@@ -1145,7 +1145,8 @@ struct DiskOps {
                 "case \"$1\" in\n"
                 "info) real=$(readlink \"$3\"); if [ -e \"$real.backing\" ]; then printf '{\"format\":\"qcow2\",\"virtual-size\":4096,\"backing-filename\":\"%s\"}' \"$(cat \"$real.backing\")\"; else printf '%s' '{\"format\":\"raw\",\"virtual-size\":4096}'; fi ;;\n"
                 "commit|rebase) [ -e " + dir.at("fail") + " ] && exit 3; exit 0 ;;\n"
-                "convert) [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
+                "convert) printf '    (0.00/100%%)\\r    (37.50/100%%)\\r'; [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
+                "  printf '    (100.00/100%%)\\r'\n"
                 "  eval \"out=\\${$#}\"; printf converted > \"$out\" ;;\n"
                 "create) [ -e " + dir.at("fail") + " ] && exit 3; eval \"out=\\${$(($# - 1))}\"; printf created > \"$out\" ;;\n"
                 "resize) ;;\n"
@@ -1413,6 +1414,25 @@ void disk_operation_create() {
     check(task.state == TaskState::succeeded && bytes_of(ops.dir.at("copy.img")) == "converted"
         && ops.row(task.result["disk_id"].asString())["name"] == "copy.img" && bytes_of(ops.dir.at("a.img")) == "original",
         "clone writes a new registered copy and leaves the source");
+    check(task.progress.unit == "basis_points" && task.progress.completed == 10000 && task.progress.total == 10000u,
+        "clone reports qemu-img progress");
+    // FUSE shared storage has no hard links; installing there must still never replace.
+    const std::string shared = "/storage/emulated/0/.droidvm-contract-" + random_id(false);
+    if (access("/storage/emulated/0", W_OK) == 0) {
+        check(mkdir(shared.c_str(), 0770) == 0, "create shared storage test directory");
+        auto onto = ops.request(a, "clone"); onto["folder"] = shared; onto["name"] = "copy.img";
+        task = ops.run(onto);
+        const bool installed = task.state == TaskState::succeeded && bytes_of(shared + "/copy.img") == "converted";
+        ops.fault = [&](const char* stage) { if (std::string_view(stage) == "converted") put(shared + "/taken.img", "foreign"); };
+        onto = ops.request(a, "clone"); onto["folder"] = shared; onto["name"] = "taken.img";
+        task = ops.run(onto);
+        ops.fault = {};
+        const bool kept = task.state == TaskState::failed && task.error == ErrorCode::conflict && bytes_of(shared + "/taken.img") == "foreign";
+        const auto leftovers = temporaries(shared);
+        unlink((shared + "/copy.img").c_str()); unlink((shared + "/taken.img").c_str()); rmdir(shared.c_str());
+        check(installed, "clone installs onto shared storage without hard links");
+        check(kept && leftovers == 0, "shared storage install refuses an existing target and leaves no temporary");
+    }
     // A file appearing at the target while the tool runs wins; nothing is replaced.
     ops.fault = [&](const char* stage) { if (std::string_view(stage) == "converted") put(ops.dir.at("race.img"), "foreign"); };
     task = ops.run(create("race.img"));
@@ -1546,7 +1566,7 @@ void disk_operation_tree() {
         && ops.row(c)["parent"] == b && ops.slots("merge")[0]["path"] == ops.dir.at("b.img")
         && ops.slots("merge")[0]["readonly"] == true && ops.slots("leaf")[0]["path"] == ops.dir.at("c.qcow2"),
         "merge relinks children, moves slots and removes the overlay");
-    check(log.find("commit -d json:") != std::string::npos
+    check(log.find("commit -p -d json:") != std::string::npos
         && log.find("rebase -u -b " + ops.dir.at("b.img") + " -F raw /proc/self/fd/") != std::string::npos, "merge commands");
     put(ops.dir.at("c.qcow2.backing"), ops.dir.at("b.img"));
     // Two overlays on one parent: merging either would change the other's view.
@@ -1650,6 +1670,7 @@ void real_disk_operations(const std::string& tool) {
     check(task.state == TaskState::succeeded && info["format"] == "qcow2" && info["backing-filename"] == ops.dir.at("base.raw")
         && ops.row(task.result["disk_id"].asString())["parent"] == base_id
         && real_head(tool, ops.dir.at("clone.qcow2"), ops.dir.at("view4.raw")) == "BASEDATA", "real overlay clone keeps its parent");
+    check(task.progress.unit == "basis_points" && task.progress.completed == 10000, "real clone reports qemu-img progress");
     const auto clone_id = task.result["disk_id"].asString();
     const auto before_reset = real_info(tool, ops.dir.at("clone.qcow2"));
     const auto clone_inode = inode_of(ops.dir.at("clone.qcow2"));
