@@ -144,6 +144,9 @@ void disk_start_chain_leases() {
     const auto requests = config::disk_start_files(vm, registry);
     check(requests.size() == 2 && requests[0].path == "/first/disk.qcow2" && !requests[0].write &&
           requests[1].path == "/second/disk.qcow2" && requests[1].write, "VM leases writable leaf and read-only ancestor");
+    const auto parents = config::disk_start_parents(vm, registry);
+    check(parents.size() == 2 && !parents.at("/first/disk.qcow2") &&
+        parents.at("/second/disk.qcow2") == "/first/disk.qcow2", "expected headers cover leaf and root ancestor");
 }
 void leased_read_descriptor() {
     Temporary temp;

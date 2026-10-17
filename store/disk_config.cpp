@@ -78,6 +78,24 @@ std::vector<DiskFileLeases::Request> disk_start_files(const Json::Value& vm, con
     for (const auto& [path, write] : requested) result.push_back({path, write});
     return result;
 }
+std::map<std::string, std::optional<std::string>> disk_start_parents(const Json::Value& vm, const Json::Value& registry) {
+    const auto files = disk_start_files(vm, registry);
+    std::map<std::string, const Json::Value*> by_path;
+    std::map<std::string, std::string> by_id;
+    for (const auto& row : registry["disks"]) {
+        by_path.emplace(disk_path(row), &row);
+        by_id.emplace(uuid(row), disk_path(row));
+    }
+    std::map<std::string, std::optional<std::string>> result;
+    for (const auto& file : files) {
+        auto& parent_path = result[file.path];
+        const auto& parent = member(*by_path.at(file.path), "parent");
+        if (parent.isNull() || (parent.isString() && parent.asString().empty())) continue;
+        Json::Value id; id["id"] = parent;
+        parent_path = by_id.at(uuid(id));
+    }
+    return result;
+}
 namespace {
 struct Registry {
     std::map<std::string, Json::Value> rows;

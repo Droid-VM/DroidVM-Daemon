@@ -4,6 +4,7 @@
 #include <set>
 #include <string>
 #include <map>
+#include <optional>
 #include "disk_file_leases.h"
 
 namespace droidvm::config {
@@ -23,4 +24,5 @@ DiskReferences disk_references(const Json::Value& vms, const Json::Value& regist
 // must resolve, and base/shared slots must be read-only in the effective session.
 void validate_disk_start(const Json::Value& vm, const Json::Value& vms, const Json::Value& registry);
 std::vector<DiskFileLeases::Request> disk_start_files(const Json::Value& vm, const Json::Value& registry);
+std::map<std::string, std::optional<std::string>> disk_start_parents(const Json::Value& vm, const Json::Value& registry);
 }

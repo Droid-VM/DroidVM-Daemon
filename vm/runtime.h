@@ -30,6 +30,9 @@ struct RuntimeContext {
     std::shared_ptr<std::function<void(const Json::Value&)>> validate_start;
     using AcquireDisks = std::function<std::shared_ptr<config::DiskFileLeases::Lease>(const Json::Value&)>;
     std::shared_ptr<AcquireDisks> acquire_disks;
+    using ValidateDisks = std::function<void(const Json::Value&, const config::DiskFileLeases::Lease&,
+        const std::function<bool()>&)>;
+    std::shared_ptr<ValidateDisks> validate_disks;
     network::SwitchRuntime* identities = nullptr; // recoverable VM process identities
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;

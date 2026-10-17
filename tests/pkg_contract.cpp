@@ -367,8 +367,8 @@ void joint_import(const std::string& fault) {
     Fd directory(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     auto gate = std::make_shared<ConfigurationGate>();
     vm::RuntimeContext runtime;
-    runtime.cache_dir = dir.path; runtime.owner = getuid(); runtime.configuration_gate = gate;
-    runtime.shutting_down = [] { return true; };
+    runtime.cache_dir = dir.path; runtime.data_dir = dir.path; runtime.owner = getuid(); runtime.configuration_gate = gate;
+    runtime.shutting_down = [] { return false; };
     VmService vms(runtime);
     TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
     bool armed = false, injected = false;
@@ -430,6 +430,25 @@ void joint_import(const std::string& fault) {
         check(vm_view->document["vms"][0]["disks"][0]["path"] == path_join(row["folder"].asString(), row["name"].asString()),
               "persisted VM references registered imported image");
         check(bytes_of(dir.at("output/joint-import/disk.img")) == "payload", "joint import preserves image bytes");
+    }
+    if (fault.empty()) {
+        // Exercise the coordinator's real worker binding without starting any VMM.
+        const auto image = dir.at("output/joint-import/disk.img");
+        check(make_dirs(dir.at("usr/bin")), "create isolated image tool directory");
+        put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
+            "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
+            "[ \"$(cat \"$3\")\" = payload ] || exit 22\n"
+            "printf inspected > '" + dir.at("inspected") + "'\n"
+            "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":\"" + image + "\"}'\n");
+        check(chmod(dir.at("usr/bin/qemu-img").c_str(), 0700) == 0, "enable isolated image tool");
+        auto instance = vms.runtime(caller, vm_view->document["vms"][0]["id"].asString());
+        check(instance->start(), "valid registry enters image-validation worker");
+        const auto end = TaskService::Clock::now() + 3s;
+        while (instance->state() != vm::State::stopped && TaskService::Clock::now() < end) std::this_thread::sleep_for(1ms);
+        check(instance->state() == vm::State::stopped && exists(dir.at("inspected")),
+            "unregistered backing stops worker before boot or VMM creation");
+        auto available = configuration.disk_files()->acquire({{image, true}});
+        available->verify();
     }
     tasks.shutdown();
 }
@@ -927,9 +946,9 @@ void retained_rebase(const std::string& mode) {
 }
 void leased_image_inspection(const std::string& mode) {
     Temporary dir;
-    put(dir.at("overlay"), "original"); put(dir.at("base.raw"), "base");
+    put(dir.at("overlay"), "original"); put(dir.at("base.raw"), "base"); put(dir.at("other.raw"), "other");
     config::DiskFileLeases pool;
-    auto lease = pool.acquire({{dir.at("overlay"), false}});
+    auto lease = pool.acquire({{dir.at("overlay"), false}, {dir.at("base.raw"), false}, {dir.at("other.raw"), false}});
     const int fd = lease->read_fd(dir.at("overlay"));
     std::string script = "#!/system/bin/sh\n[ \"$1\" = info ] && [ \"$2\" = --output=json ] || exit 20\n"
         "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
@@ -949,7 +968,16 @@ void leased_image_inspection(const std::string& mode) {
     bool failed = false;
     try { parent = Images(dir.at("image-helper")).backing_of(*lease, dir.at("overlay")); }
     catch (const std::exception&) { failed = true; }
-    if (mode.empty()) check(!failed && parent == dir.at("base.raw"), "relative backing uses original image directory, not descriptor directory");
+    if (mode.empty()) {
+        check(!failed && parent == dir.at("base.raw"), "relative backing uses original image directory, not descriptor directory");
+        Images images(dir.at("image-helper"));
+        images.validate_backing(*lease, dir.at("overlay"), dir.at("base.raw"));
+        fails_any([&] { images.validate_backing(*lease, dir.at("overlay"), std::nullopt); }, "unregistered actual backing rejected");
+        fails_any([&] { images.validate_backing(*lease, dir.at("overlay"), dir.at("other.raw")); }, "different registered parent inode rejected");
+        put(dir.at("image-helper"), "#!/system/bin/sh\nprintf '%s' '{\"format\":\"raw\"}'\n");
+        images.validate_backing(*lease, dir.at("overlay"), std::nullopt);
+        fails_any([&] { images.validate_backing(*lease, dir.at("overlay"), dir.at("base.raw")); }, "missing declared backing rejected");
+    }
     else check(failed, "failed inspection or replaced path must not become a base image");
     if (mode == "replacement") check(bytes_of(dir.at("moved")) == "original" &&
         bytes_of(dir.at("overlay")) == "replacement", "descriptor inspection does not follow a substituted path");
@@ -991,9 +1019,10 @@ void real_retained_rebase(const std::string& tool) {
     result = Child(relative).communicate({}, std::chrono::seconds(10));
     check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real qemu writes relative backing name");
     config::DiskFileLeases pool;
-    auto lease = pool.acquire({{files[2]->path(), false}});
+    auto lease = pool.acquire({{files[2]->path(), false}, {files[1]->path(), false}});
     check(Images(tool).backing_of(*lease, files[2]->path()) == files[1]->path(),
         "real qemu inspection resolves relative backing from leased original path");
+    Images(tool).validate_backing(*lease, files[2]->path(), files[1]->path());
 }
 }
 

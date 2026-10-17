@@ -7,6 +7,7 @@
 #include <sys/random.h>
 #include <cerrno>
 #include <climits>
+#include <sys/stat.h>
 #include <map>
 
 namespace droidvm::pkg {
@@ -14,7 +15,7 @@ Json::Value Images::info(const std::string& path, std::vector<int> fds) const {
     ChildOptions options;
     options.argv = {qemu_img_, "info", "--output=json", path};
     options.preserve_fds = std::move(fds);
-    const auto result = Child(options).communicate({}, std::chrono::minutes(2), 8u << 20, cancelled_);
+    const auto result = Child(options).communicate({}, inspection_timeout_, 8u << 20, cancelled_);
     if (result.exit_code != 0 || result.timed_out || result.cancelled || result.truncated)
         throw std::runtime_error("Failed to get image info with " + std::to_string(result.exit_code));
     return parse_object(result.output);
@@ -56,6 +57,18 @@ std::optional<std::string> Images::backing_of(const config::DiskFileLeases::Leas
     if (!is_file(backing)) throw Error("missing backing image: " + backing);
     lease.verify();
     return backing;
+}
+void Images::validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
+        const std::optional<std::string>& expected) const {
+    const auto actual = backing_of(lease, path);
+    if (actual.has_value() != expected.has_value())
+        throw Error("Image backing chain disagrees with disk registry");
+    if (!expected) return;
+    struct stat held{}, current{};
+    if (fstat(lease.read_fd(*expected), &held) != 0 || stat(actual->c_str(), &current) != 0
+            || !S_ISREG(current.st_mode) || held.st_dev != current.st_dev || held.st_ino != current.st_ino)
+        throw Error("Image backing file is not the registered leased parent");
+    lease.verify();
 }
 void Images::rebase(const std::string& overlay, const std::string& backing) const {
     std::string format;

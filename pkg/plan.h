@@ -4,6 +4,7 @@
 #include "store/disk_file_leases.h"
 #include <json/json.h>
 #include <functional>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <string>
@@ -13,8 +14,9 @@ namespace droidvm::pkg {
 // ImageUtils over <data>/usr/bin/qemu-img.
 class Images {
 public:
-    explicit Images(std::string qemu_img, std::function<bool()> cancelled = {})
-        : qemu_img_(std::move(qemu_img)), cancelled_(std::move(cancelled)) {}
+    explicit Images(std::string qemu_img, std::function<bool()> cancelled = {},
+        std::chrono::milliseconds inspection_timeout = std::chrono::minutes(2))
+        : qemu_img_(std::move(qemu_img)), cancelled_(std::move(cancelled)), inspection_timeout_(inspection_timeout) {}
     // backingOf: canonical backing path, or none. Throws Error for an
     // unreadable qcow2 or a backing file that is not there.
     std::optional<std::string> backing_of(const std::string& path) const;
@@ -22,6 +24,8 @@ public:
     // /proc/self/fd; failed/malformed inspection never means "no backing".
     // The returned parent still needs its own lease before it is inspected/read.
     std::optional<std::string> backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
+    void validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
+        const std::optional<std::string>& expected) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
     // Modify the retained overlay inode while storing the durable backing path.
@@ -29,6 +33,7 @@ public:
 private:
     std::string qemu_img_;
     std::function<bool()> cancelled_;
+    std::chrono::milliseconds inspection_timeout_;
     Json::Value info(const std::string& path, std::vector<int> fds = {}) const; // throws std::runtime_error
 };
 

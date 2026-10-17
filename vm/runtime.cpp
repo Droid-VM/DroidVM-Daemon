@@ -359,6 +359,19 @@ void VmRuntime::cleanup_taps() {
 }
 void VmRuntime::run() {
     auto stdio = [&](const std::string& text) { if (auto* log = this->log("stdio")) log->append(text); };
+    if (context_.validate_disks) {
+        try {
+            if (!*context_.validate_disks) throw std::runtime_error("Disk image validation is not available");
+            std::shared_ptr<config::DiskFileLeases::Lease> lease;
+            { std::lock_guard lock(state_mutex_); lease = disk_lease_; }
+            if (!lease) throw std::runtime_error("Disk lease is missing before image validation");
+            (*context_.validate_disks)(config(), *lease, [this] { return stopped_by_user_ || context_.shutting_down(); });
+        } catch (const std::exception& error) {
+            stdio(std::string("disk image validation failed: ") + error.what() + "\n");
+            finish_stopped(-1);
+            return;
+        }
+    }
     BootPlan plan;
     try {
         std::optional<std::string> entry;

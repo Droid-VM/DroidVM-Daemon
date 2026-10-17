@@ -7,6 +7,8 @@
 #include "store/network_config.h"
 #include "store/disk_config.h"
 #include "store/vm_ownership.h"
+#include "vm/command_common.h"
+#include "pkg/plan.h"
 #include <map>
 #include <set>
 
@@ -48,6 +50,7 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     if (manage_disks) {
         inventory.context_.validate_start = std::make_shared<std::function<void(const Json::Value&)>>();
         inventory.context_.acquire_disks = std::make_shared<vm::RuntimeContext::AcquireDisks>();
+        inventory.context_.validate_disks = std::make_shared<vm::RuntimeContext::ValidateDisks>();
         disk_files_ = std::make_shared<config::DiskFileLeases>();
     }
     vms_ = std::make_shared<VmConfigService>(directory, owner, config::JsonFile::Observer{},
@@ -70,6 +73,22 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
             if (!service) throw std::runtime_error("Disk configuration owner is unavailable");
             const CallContext internal{"vm-disk-leases", true, true, true};
             return files->acquire(config::disk_start_files(vm, service->snapshot(internal)->document));
+        };
+        vm::HostFacts host; host.data_dir = inventory.context_.data_dir;
+        const auto tool = vm::command::data_dir(host) + "/usr/bin/qemu-img";
+        *inventory.context_.validate_disks = [disks = std::weak_ptr<DiskConfigService>(disks_), tool](
+                const Json::Value& vm, const config::DiskFileLeases::Lease& lease, const std::function<bool()>& cancelled) {
+            const auto service = disks.lock();
+            if (!service) throw std::runtime_error("Disk configuration owner is unavailable");
+            const CallContext internal{"vm-image-validation", true, true, true};
+            const auto parents = config::disk_start_parents(vm, service->snapshot(internal)->document);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for (const auto& [path, parent] : parents) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+                if (cancelled() || remaining.count() <= 0) throw std::runtime_error("Disk image validation cancelled or timed out");
+                pkg::Images(tool, cancelled, remaining).validate_backing(lease, path, parent);
+            }
+            lease.verify();
         };
     }
     networks_->coordinated_removal_ = true;
