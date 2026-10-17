@@ -794,6 +794,50 @@ void cleanup_boundaries() {
     catch (const Error&) { rejected = true; }
     check(rejected && bytes_of(dir.at("outside/keep")) == "keep", "parent traversal cleanup root rejected");
 }
+void owned_import_directory() {
+    Temporary dir;
+    CreatedDirectory first(dir.path, "import");
+    CreatedDirectory second(dir.path, "import");
+    check(first.path() == dir.at("import") && second.path() == dir.at("import_1"), "mkdir chooses distinct names atomically");
+    {
+        FileSink out(first.fd(), "image"); out.append("original"); out.close();
+    }
+    check(rename(first.path().c_str(), dir.at("moved").c_str()) == 0, "move owned directory");
+    check(make_dirs(first.path()), "install replacement directory");
+    put(first.path() + "/keep", "replacement");
+    bool rejected = false;
+    try { first.remove(); } catch (const Error&) { rejected = true; }
+    check(rejected && bytes_of(first.path() + "/keep") == "replacement" &&
+          bytes_of(dir.at("moved/image")) == "original", "cleanup refuses substituted root without touching either tree");
+    {
+        FileSink out(first.fd(), "anchored"); out.append("fd target"); out.close();
+    }
+    check(bytes_of(dir.at("moved/anchored")) == "fd target" && !exists(first.path() + "/anchored"),
+          "file creation follows retained directory handle instead of replacement path");
+    rejected = false;
+    try { FileSink out(first.fd(), "../escape"); } catch (const Error&) { rejected = true; }
+    check(rejected && !exists(dir.at("escape")), "anchored extraction rejects traversal");
+    delete_tree(first.path());
+    check(rename(dir.at("moved").c_str(), first.path().c_str()) == 0, "restore original directory");
+    first.verify(); first.remove(); first.remove(); second.remove();
+    check(!exists(dir.at("import")) && !exists(dir.at("import_1")), "owned cleanup succeeds and repeated removal is idempotent");
+}
+void replaced_import_parent() {
+    Temporary dir;
+    check(make_dirs(dir.at("parent")), "create import parent");
+    CreatedDirectory owned(dir.at("parent"), "import");
+    { FileSink out(owned.fd(), "image"); out.append("original"); out.close(); }
+    check(rename(dir.at("parent").c_str(), dir.at("old-parent").c_str()) == 0 &&
+          make_dirs(dir.at("parent/import")), "replace import parent path");
+    put(dir.at("parent/import/keep"), "replacement");
+    bool rejected = false;
+    try { owned.remove(); } catch (const Error&) { rejected = true; }
+    check(rejected && bytes_of(dir.at("old-parent/import/image")) == "original" &&
+          bytes_of(dir.at("parent/import/keep")) == "replacement", "replacement parent leaves both trees intact");
+    delete_tree(dir.at("parent"));
+    check(rename(dir.at("old-parent").c_str(), dir.at("parent").c_str()) == 0, "restore original parent");
+    owned.remove();
+}
 }
 
 int main() {
@@ -815,7 +859,8 @@ int main() {
         {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},
         {"network import plan", network_plan}, {"lease offsets", lease_offsets}, {"org.json behaviour", json_contract},
         {"file helpers", file_helpers}, {"exclusive imported files", exclusive_import_files},
-        {"cleanup boundaries", cleanup_boundaries}};
+        {"cleanup boundaries", cleanup_boundaries}, {"owned import directory", owned_import_directory},
+        {"replaced import parent", replaced_import_parent}};
     Json::Value report;
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
     try {

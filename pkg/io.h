@@ -105,6 +105,8 @@ class FileSink final : public Sink {
 public:
     enum class Mode { truncate, create_new };
     explicit FileSink(const std::string& path, Mode mode = Mode::truncate);
+    // Exclusive file creation relative to an already opened extraction directory.
+    FileSink(int directory, const std::string& name);
     ~FileSink() override;
     void write(const char* data, size_t size) override;
     uint64_t position() const { return position_ + pending_.size(); }
@@ -151,4 +153,18 @@ bool exists(const std::string& path);
 int64_t file_length(const std::string& path); // File.length(): 0 when unknown
 bool make_dirs(const std::string& path); // File.mkdirs()
 void delete_tree(const std::string& path);
+// Retains the parent and new directory identities for an import's whole lifetime.
+// Destruction closes handles only; removal is explicit and rejects replacement.
+class CreatedDirectory {
+public:
+    CreatedDirectory(const std::string& parent, const std::string& basename);
+    const std::string& path() const { return path_; }
+    int fd() const { return directory_.get(); }
+    void verify() const;
+    void remove();
+private:
+    std::string parent_path_, name_, path_;
+    Fd parent_, directory_;
+    bool removed_ = false;
+};
 }

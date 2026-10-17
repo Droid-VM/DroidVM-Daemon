@@ -140,6 +140,13 @@ FileSink::FileSink(const std::string& path, Mode mode)
     pending_.reserve(buffer_size);
 }
 FileSink::~FileSink() { try { flush(); } catch (...) {} }
+FileSink::FileSink(int directory, const std::string& name) {
+    if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos)
+        throw Error("Invalid extraction filename");
+    fd_ = Fd(openat(directory, name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644));
+    if (fd_.get() < 0) throw Error(name + ": " + errno_message("open", errno));
+    pending_.reserve(buffer_size);
+}
 void FileSink::write(const char* data, size_t size) {
     if (fd_.get() < 0) throw Error("Stream Closed");
     if (pending_.size() + size > buffer_size) {
@@ -503,11 +510,17 @@ bool make_dirs(const std::string& path) {
     return mkdir(path.c_str(), 0777) == 0;
 }
 namespace {
-void delete_at(int parent, const std::string& name) {
+void delete_at(int parent, const std::string& name, int expected = -1) {
     struct stat observed{};
     if (fstatat(parent, name.c_str(), &observed, AT_SYMLINK_NOFOLLOW) != 0) {
-        if (errno == ENOENT) return;
+        if (errno == ENOENT && expected < 0) return;
         throw Error(errno_message("stat cleanup entry", errno));
+    }
+    if (expected >= 0) {
+        struct stat identity{};
+        if (fstat(expected, &identity) != 0) throw Error(errno_message("stat owned directory", errno));
+        if (identity.st_dev != observed.st_dev || identity.st_ino != observed.st_ino || !S_ISDIR(observed.st_mode))
+            throw Error("Owned cleanup directory was replaced");
     }
     if (!S_ISDIR(observed.st_mode)) {
         if (unlinkat(parent, name.c_str(), 0) != 0 && errno != ENOENT)
@@ -559,5 +572,38 @@ void delete_tree(const std::string& path) {
         throw Error(errno_message("open cleanup parent", errno));
     }
     delete_at(parent.get(), name);
+}
+CreatedDirectory::CreatedDirectory(const std::string& parent, const std::string& basename)
+    : parent_path_(parent), parent_(open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+    if (parent_.get() < 0) throw Error(errno_message("open import parent", errno));
+    if (basename.empty() || basename == "." || basename == ".." || basename.find('/') != std::string::npos
+            || basename.find('\0') != std::string::npos) throw Error("Invalid import directory name");
+    for (unsigned i = 0; ; ++i) {
+        name_ = basename + (i ? "_" + std::to_string(i) : "");
+        if (mkdirat(parent_.get(), name_.c_str(), 0700) == 0) break;
+        if (errno != EEXIST) throw Error(errno_message("create import directory", errno));
+        if (i == 10000) throw Error("Too many occupied import directory names");
+    }
+    path_ = path_join(parent_path_, name_);
+    directory_ = Fd(openat(parent_.get(), name_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (directory_.get() < 0) throw Error(errno_message("open import directory", errno));
+    verify();
+}
+void CreatedDirectory::verify() const {
+    if (removed_) throw Error("Import directory was already removed");
+    struct stat original_parent{}, current_parent{}, original{}, current{};
+    if (fstat(parent_.get(), &original_parent) != 0 || stat(parent_path_.c_str(), &current_parent) != 0
+            || fstat(directory_.get(), &original) != 0
+            || fstatat(parent_.get(), name_.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0)
+        throw Error(errno_message("verify import directory", errno));
+    if (original_parent.st_dev != current_parent.st_dev || original_parent.st_ino != current_parent.st_ino
+            || original.st_dev != current.st_dev || original.st_ino != current.st_ino || !S_ISDIR(current.st_mode))
+        throw Error("Import directory path was replaced");
+}
+void CreatedDirectory::remove() {
+    if (removed_) return;
+    verify();
+    delete_at(parent_.get(), name_, directory_.get());
+    removed_ = true;
 }
 }

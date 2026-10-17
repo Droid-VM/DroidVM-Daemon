@@ -16,6 +16,9 @@
 #include <chrono>
 #include <map>
 #include <set>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace droidvm::pkg {
 namespace {
@@ -346,6 +349,7 @@ private:
     NetworkAction fallback_;
     std::vector<NetworkPlanEntry> plan_;
     std::string vm_dir_, vm_name_;
+    std::unique_ptr<CreatedDirectory> owned_directory_;
     bool registered_ = false;
     VmConfigService::Snapshot config_snapshot_;
     DiskConfigService::Snapshot disk_snapshot_;
@@ -367,7 +371,7 @@ private:
     void resolve_leases();
     void resolve_lease(Json::Value& nic, Family family);
     std::string unique_vm_name(const std::string& name) const;
-    std::string create_vm_dir(const std::string& name) const;
+    std::string create_vm_dir(const std::string& name);
     bool discard();
     void emit(Json::Value data, const char* phase) const;
 };
@@ -397,6 +401,7 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         if (context_.vm_config) config_snapshot_ = context_.vm_config->snapshot(internal);
         if (context_.configuration) disk_snapshot_ = context_.configuration->disks()->snapshot(internal);
         unpack();
+        owned_directory_->verify();
         // Network creation and VM registration are observable shared state.
         // Finish cancellable extraction/cleanup before entering this commit.
         if (!control.enter_commit()) throw Error("task cancelled");
@@ -465,8 +470,8 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         data["error_code"] = error_code_name(failure_code);
         if (registered_) {
             data["vm_id"] = vm_["id"];
-            data["retained_directory"] = vm_dir_;
         }
+        if (registered_ || !cleaned) data["retained_directory"] = vm_dir_;
         emit(data, "error");
         if (!cleaned) return TaskCompletion::failure(ErrorCode::io_error, "Failed to clean up imported files");
         if (control.cancellation_requested()) return TaskCompletion::cancelled();
@@ -499,6 +504,7 @@ void ImportTask::unpack() {
     vm_["id"] = random_uuid();
     vm_["name"] = vm_name_;
     relink();
+    owned_directory_->verify();
     remap_disks();
     remap_boots();
 }
@@ -538,7 +544,6 @@ void ImportTask::on_entry(const std::string& name, int64_t size, Source& content
     }
     if (auto* boot = manifest_.find_boot(name)) {
         const auto dir = path_join(vm_dir_, "boot");
-        if (!exists(dir) && !make_dirs(dir)) throw Error("Cannot create " + dir);
         const auto target = unique_file(dir, component(boot->name, "boot.img"));
         copy(content, target, size, static_cast<int>(disks_.size() + boots_.size()));
         boot->target = target;
@@ -554,7 +559,18 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
     data["bytes_total"] = Json::Int64(size);
     emit(data, "pack");
     {
-        FileSink sink(out, FileSink::Mode::create_new);
+        owned_directory_->verify();
+        int directory = owned_directory_->fd();
+        Fd boot_directory;
+        if (dirname(out) != vm_dir_) {
+            if (dirname(out) != path_join(vm_dir_, "boot")) throw Error("Extraction escaped import directory");
+            if (mkdirat(directory, "boot", 0700) != 0 && errno != EEXIST)
+                throw Error(errno_message("create boot directory", errno));
+            boot_directory = Fd(openat(directory, "boot", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            if (boot_directory.get() < 0) throw Error(errno_message("open boot directory", errno));
+            directory = boot_directory.get();
+        }
+        FileSink sink(directory, file_name(out));
         std::string buffer(buffer_size, '\0');
         int64_t remaining = size, written = 0;
         auto last = Clock::now();
@@ -580,6 +596,7 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
     emit(data, "pack");
 }
 void ImportTask::relink() {
+    owned_directory_->verify();
     // The packed headers still name the exporting phone's paths.
     std::map<std::string, size_t> by_archive;
     for (const auto index : disks_) by_archive[manifest_.disks[index].archive_path] = index;
@@ -741,17 +758,18 @@ std::string ImportTask::unique_vm_name(const std::string& name) const {
     while (taken.contains(name + " (" + std::to_string(i) + ")")) ++i;
     return name + " (" + std::to_string(i) + ")";
 }
-std::string ImportTask::create_vm_dir(const std::string& name) const {
+std::string ImportTask::create_vm_dir(const std::string& name) {
     const auto base = safe_file_name(name, "vm");
-    auto dir = path_join(target_, base);
-    for (int i = 1; exists(dir); ++i) dir = path_join(target_, base + "_" + std::to_string(i));
-    if (!make_dirs(dir)) throw Error("Cannot create " + dir);
-    return dir;
+    owned_directory_ = std::make_unique<CreatedDirectory>(target_, base);
+    return owned_directory_->path();
 }
 bool ImportTask::discard() {
     // Everything a failed import wrote is inside the one folder it created.
     if (vm_dir_.empty() || registered_) return true;
-    try { delete_tree(vm_dir_); vm_dir_.clear(); return true; } catch (const std::exception& error) {
+    try {
+        if (!owned_directory_) throw Error("Import directory identity is unavailable");
+        owned_directory_->remove(); vm_dir_.clear(); return true;
+    } catch (const std::exception& error) {
         context_.log("WARN", "VMImportTask: Failed to clean up " + vm_dir_ + ": " + error.what());
         return false;
     }
