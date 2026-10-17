@@ -22,6 +22,7 @@ namespace {
 void crosvm_retained_disk_attachment() {
     Json::Value config;
     config["id"] = random_id(true); config["name"] = "retained-crosvm";
+    config["hypervisor"] = "kvm"; // Pure argv fixture; no VMM is launched.
     config["screens"]["gpu-0"]["enabled"] = false; config["screens"]["simplefb"]["enabled"] = false;
     config["disks"] = Json::Value(Json::arrayValue);
     vm::CrosvmRun run; run.disk_fds.emplace();
@@ -128,7 +129,7 @@ void leased_disk_paths_reach_backends() {
     config["screens"]["gpu-0"]["enabled"] = false;
     config["screens"]["simplefb"]["enabled"] = false;
     const std::string original = "/storage/emulated/0/disk.img", optimized = "/data/media/0/disk.img";
-    vm::HostFacts host; host.optimize_sdcard = true;
+    vm::HostFacts host; host.optimize_sdcard = true; host.has_kvm = true;
     for (bool preserve : {false, true}) {
         vm::QemuRun qemu_run; qemu_run.preserve_disk_paths = preserve;
         vm::CrosvmRun crosvm_run; crosvm_run.preserve_disk_paths = preserve;
@@ -170,7 +171,7 @@ void disk_option_path_encoding() {
     config["name"] = "path-contract"; config["id"] = random_id(true);
     config["screens"]["gpu-0"]["enabled"] = false;
     config["screens"]["simplefb"]["enabled"] = false;
-    vm::HostFacts host; host.optimize_sdcard = false;
+    vm::HostFacts host; host.optimize_sdcard = false; host.has_kvm = true;
     vm::QemuRun run;
     int size_queries = 0;
     run.file_length = [&](const std::string& actual) {
@@ -270,6 +271,7 @@ void configuration_gate_domains_and_recovery() {
     NetworkConfigService networks(directory.get(), getuid(), {}, &tasks, true, gate);
     auto network = config("network"); network["schema"] = 2; network["bridge_name"] = "brtest";
     const auto network_id = networks.create(admin, network);
+    const auto saved_network = networks.get(admin, network_id);
     auto document = vms.snapshot(admin)->document;
     auto row = config("vm"); const auto id = row["id"].asString();
     document["vms"].append(row);
@@ -308,7 +310,7 @@ void configuration_gate_domains_and_recovery() {
         recovery.recovered();
         refused(); // Successful recovery still hides publication until exit.
     }
-    check(vms.snapshot(admin)->revision == saved->revision && networks.get(admin, network_id) == network,
+    check(vms.snapshot(admin)->revision == saved->revision && networks.get(admin, network_id) == saved_network,
         "gate alone never changes configuration");
     check(!runtime->start() && fixture.starts == 1, "recovered runtime reaches normal admission");
     tasks.release_snapshot(admin, old_view.id);
@@ -666,7 +668,8 @@ struct DeletionInput {
 };
 DeletionInput seed_deletion(Coordinated& c) {
     auto network = config("target"); network["schema"] = 2; network["bridge_name"] = "brtest";
-    c.service.networks().create(admin, network);
+    const auto network_id = c.service.networks().create(admin, network);
+    network = c.service.networks().get(admin, network_id);
     auto other = config("other network"); other["schema"] = 2; other["bridge_name"] = "brother";
     c.service.networks().create(admin, other);
     auto row = config("referencing VM"), unrelated = config("unrelated VM");
@@ -1127,7 +1130,7 @@ void coordinated_delete_adapter() {
         assert_error(dispatcher.execute_background(admin, "network_config_delete_begin", bad), "INVALID_ARGUMENT");
         assert_error(dispatcher.execute_background({}, "network_config_delete_begin", begin), "UNAUTHENTICATED");
         auto started = dispatcher.execute_background(admin, "network_config_delete_begin", begin);
-        check(started["success"] == true && started["chunk_bytes"] == 49152, "delete upload begun");
+        check(started["success"] == true && started["chunk_bytes"].asUInt64() == 49152, "delete upload begun");
         // Encode a real request payload, keeping this fixture independent of the
         // production decoder. Full-size chunk handling is covered by upload tests.
         const auto encoded = encode_chunk(std::string(bytes.data(), bytes.size()));
@@ -1189,7 +1192,7 @@ void conditional_network_adapter() {
     check(started["success"] == true && started["chunk_bytes"] == Json::UInt64(48u << 10), "network staging begins");
     Json::Value chunk; chunk["upload_id"] = started["upload_id"]; chunk["offset"] = 0;
     chunk["data"] = "eyJvcGVyYXRpb25zIjpbXX0=";
-    check(dispatcher.execute_background(admin, "network_config_import_append", chunk)["received"] == 17, "network staging accepts strict base64");
+    check(dispatcher.execute_background(admin, "network_config_import_append", chunk)["received"].asUInt64() == 17, "network staging accepts strict base64");
     auto committed = dispatcher.execute_background(admin, "network_config_import_commit", chunk);
     check(committed["success"] == true && committed["network_ids"].isArray() && committed["network_ids"].empty(),
         "network staging consumes an empty atomic import");

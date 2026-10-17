@@ -447,7 +447,8 @@ void disk_read_adapter_and_binding() {
     ClientSession unauthenticated;
     check(dispatcher.execute(unauthenticated, "disk_config_snapshot", {})["error"]["code"] == "UNAUTHENTICATED", "disk read requires authentication");
     auto status = dispatcher.execute(session, "disk_config_status", {});
-    check(status["count"] == 0 && status["revision"] == service.snapshot(admin)->revision, "status describes disk registry version");
+    check(status["success"] == true && status["count"].isUInt() && status["count"].asUInt() == 0 &&
+          status["revision"] == service.snapshot(admin)->revision, "status describes disk registry version");
     auto page = dispatcher.execute(session, "disk_config_snapshot", {});
     check(page["success"] == true && page["items"][0]["revision"] == status["revision"], "adapter uses versioned fixed document");
     Json::Value release; release["snapshot_id"] = page["snapshot_id"];
@@ -461,7 +462,7 @@ void disk_read_adapter_and_binding() {
     check(upload["success"] == true, "disk upload begin");
     dispatcher.set_disk_config(&service); // Idempotent binding retains the shared manager.
     Json::Value chunk; chunk["upload_id"] = upload["upload_id"]; chunk["offset"] = 0; chunk["data"] = "eyJkaXNrcyI6W119";
-    check(dispatcher.execute_background(admin, "disk_config_upload_append", chunk)["received"] == 12, "disk upload strict base64 adapter");
+    check(dispatcher.execute_background(admin, "disk_config_upload_append", chunk)["received"].asUInt64() == 12, "disk upload strict base64 adapter");
     Json::Value commit; commit["upload_id"] = upload["upload_id"];
     check(dispatcher.execute_background(admin, "disk_config_upload_commit", commit)["persisted"] == true, "disk upload acknowledgement reports durable version");
     check(dispatcher.execute_background(admin, "disk_config_upload_commit", commit)["error"]["code"] == "NOT_FOUND", "disk upload consumed once");

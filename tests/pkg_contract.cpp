@@ -371,7 +371,9 @@ void joint_import(const std::string& fault) {
     runtime.cache_dir = dir.path; runtime.data_dir = dir.path; runtime.owner = getuid(); runtime.configuration_gate = gate;
     runtime.shutting_down = [] { return false; };
     VmService vms(runtime);
-    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    TaskLimits limits;
+    limits.background_workers = 1;
+    TaskService tasks(limits, [] { return TaskService::Clock::now(); }, {}, gate);
     bool armed = false, injected = false;
     ConfigurationService configuration(directory.get(), getuid(), gate, vms, tasks,
         [&](const char* stage, size_t) {
@@ -1016,18 +1018,22 @@ void real_qemu_disk_graph(const std::string& image_tool, const std::string& syst
         std::chrono::seconds(10), 1u << 20);
     check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real QEMU opens retained full graph without booting a guest");
     bool queried = false, read_original = false;
+    std::string read_output;
     size_t offset = 0;
     while (offset < result.output.size()) {
         auto end = result.output.find('\n', offset);
         if (end == std::string::npos) end = result.output.size();
         const auto line = result.output.substr(offset, end - offset); offset = end + 1;
         if (line.empty()) continue;
-        const auto reply = parse_object(line);
+        // qemu-io may write directly to stdout instead of the HMP capture buffer.
+        if (line.front() != '{') { read_output += line + "\n"; continue; }
+        Json::Value reply;
+        try { reply = parse_object(line); }
+        catch (const std::exception&) { throw std::runtime_error("Unexpected QMP output: " + line); }
         check(!reply.isMember("error"), "QMP commands succeed");
         if (reply["id"] == 3) {
-            const auto output = reply["return"].asString();
-            check(output.find("read 512/512 bytes") != std::string::npos && output.find("Pattern verification failed") == std::string::npos,
-                "reading through overlay reaches the original retained backing bytes");
+            check(reply["return"].isString(), "HMP read completes with a string response");
+            read_output += reply["return"].asString();
             read_original = true;
         }
         if (reply["id"] != 2) continue;
@@ -1038,6 +1044,9 @@ void real_qemu_disk_graph(const std::string& image_tool, const std::string& syst
             "QMP reports the explicit retained nodes with their actual drivers");
         queried = true;
     }
+    check(read_output.find("read 512/512 bytes") != std::string::npos &&
+          read_output.find("Pattern verification failed") == std::string::npos,
+          "reading through overlay reaches the original retained backing bytes");
     check(queried && read_original && bytes_of(base) == "replacement base" && bytes_of(overlay) == "replacement overlay",
         "QEMU graph succeeds without modifying replacement paths");
 }
