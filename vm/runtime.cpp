@@ -480,6 +480,8 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         RuntimeContext::DiskImages images;
         { std::lock_guard lock(state_mutex_); lease = disk_lease_; images = disk_images_; }
         run.disk_fds.emplace();
+        run.disk_backing_fds.emplace();
+        std::map<std::string, int> parent_fds;
         const auto& slots = config::member(config, "disks");
         if (slots.isArray()) for (const auto& slot : slots) {
             const auto path = config::string(slot, "path");
@@ -487,9 +489,30 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
             const auto bus = config::java_enum(slot, "bus", "VIRTIO", {"VIRTIO", "SCSI", "CDROM", "PFLASH", "PMEM"});
             if (bus == "PFLASH") continue;
             const auto& image = images.at(path);
-            if (image.parent) throw std::runtime_error("crosvm cannot yet open a retained backing chain; backend FD-chain support is required");
-            if ((image.format != "raw" && image.format != "qcow2") || (bus == "PMEM" && image.format != "raw"))
+            if ((image.format != "raw" && image.format != "qcow2") ||
+                (image.parent && image.format != "qcow2") || (bus == "PMEM" && (image.format != "raw" || image.parent)))
                 throw std::runtime_error("Unsupported retained crosvm disk format for this bus");
+            if (bus != "PMEM") {
+                auto& chain = (*run.disk_backing_fds)[path];
+                chain.clear();
+                std::set<std::string> seen{path};
+                auto parent = image.parent;
+                while (parent) {
+                    if (chain.size() == 10 || !seen.insert(*parent).second)
+                        throw std::runtime_error("Invalid retained crosvm backing depth or cycle");
+                    const auto& ancestor = images.at(*parent);
+                    if ((ancestor.format != "raw" && ancestor.format != "qcow2") ||
+                        (ancestor.parent && ancestor.format != "qcow2"))
+                        throw std::runtime_error("Unsupported retained crosvm backing format");
+                    if (!parent_fds.contains(*parent)) {
+                        auto fd = lease->open_file(*parent, false);
+                        parent_fds.emplace(*parent, fd.get());
+                        disk_io.push_back(std::move(fd));
+                    }
+                    chain.push_back(parent_fds.at(*parent));
+                    parent = ancestor.parent;
+                }
+            }
             if (!run.disk_fds->contains(path)) {
                 auto fd = lease->open_file(path, !config::boolean(slot, "readonly") && bus != "CDROM");
                 run.disk_fds->emplace(path, fd.get());

@@ -62,9 +62,11 @@ struct VncRun {
 struct CrosvmRun {
     // Managed disks must use the same paths admitted by the file lease.
     bool preserve_disk_paths = false;
-    // Present only after inspecting self-contained images; backing chains need
-    // a backend extension before they can be admitted through this interface.
+    // Retained leaf descriptors. No pathname fallback is allowed when present.
     std::optional<std::map<std::string, int>> disk_fds;
+    // Immediate parent first; empty explicitly requires a root image. Requires
+    // the crosvm backing-chain extension for block/SCSI (PMEM remains raw).
+    std::optional<std::map<std::string, std::vector<int>>> disk_backing_fds;
     std::optional<std::string> control_socket_path; // CrosvmBackendInstance.controlSocketPath
     std::optional<std::string> gpu_cgroup_path; // gpuCgroupPath after prepareGpuCgroup()
     std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved

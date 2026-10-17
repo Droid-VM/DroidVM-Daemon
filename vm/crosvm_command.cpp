@@ -308,13 +308,26 @@ struct Builder {
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
             if (bus == "PFLASH") continue; // Not implemented by the legacy crosvm backend either.
+            std::string backing;
+            if (run.disk_backing_fds && bus != "PMEM") {
+                const auto found = run.disk_backing_fds->find(path);
+                if (!run.disk_fds || found == run.disk_backing_fds->end() || found->second.size() > 10)
+                    throw std::invalid_argument("Missing or excessive retained crosvm backing chain");
+                backing = ",backing-chain=[";
+                for (const auto fd : found->second) {
+                    if (fd < 3) throw std::invalid_argument("Invalid retained crosvm backing descriptor");
+                    if (backing.back() != '[') backing += ',';
+                    backing += "/proc/self/fd/" + std::to_string(fd);
+                }
+                backing += ']';
+            }
             if (run.disk_fds) {
                 const auto found = run.disk_fds->find(path);
                 if (found == run.disk_fds->end() || found->second < 3)
                     throw std::invalid_argument("Missing retained crosvm disk descriptor");
                 path = "/proc/self/fd/" + std::to_string(found->second);
             }
-            auto arg = crosvm_option_value(path);
+            auto arg = crosvm_option_value(path) + backing;
             if (bus == "SCSI") {
                 arg += ",lock=false";
                 if (readonly) arg += ",ro=true";
@@ -688,6 +701,10 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
     builder.command(launch);
     launch.argv = std::move(builder.args);
     if (run.disk_fds) for (const auto& [path, fd] : *run.disk_fds) launch.preserve_fds.push_back(fd);
+    if (run.disk_backing_fds) for (const auto& [path, chain] : *run.disk_backing_fds) for (const auto fd : chain) {
+        if (std::find(launch.preserve_fds.begin(), launch.preserve_fds.end(), fd) == launch.preserve_fds.end())
+            launch.preserve_fds.push_back(fd);
+    }
     builder.environment(launch);
     return launch;
 }

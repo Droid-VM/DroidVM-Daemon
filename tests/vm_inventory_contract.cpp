@@ -43,6 +43,35 @@ void crosvm_retained_disk_attachment() {
         }
     }
     check(attached == 4 && launch.preserve_fds.size() == 4, "four supported buses inherit all retained descriptors");
+    run.disk_backing_fds.emplace();
+    (*run.disk_backing_fds)["/storage/emulated/0/virtio"] = {7, 8};
+    (*run.disk_backing_fds)["/storage/emulated/0/scsi"] = {8};
+    (*run.disk_backing_fds)["/storage/emulated/0/cdrom"] = {};
+    const auto chained = vm::crosvm_command(config, run, {}, {});
+    size_t explicit_chains = 0;
+    for (const auto& arg : chained.argv) {
+        if (arg.starts_with("/proc/self/fd/3,"))
+            check(arg.find("backing-chain=[/proc/self/fd/7,/proc/self/fd/8]") != std::string::npos,
+                "virtio backing descriptors preserve nearest-parent order");
+        if (arg.starts_with("/proc/self/fd/4,"))
+            check(arg.find("backing-chain=[/proc/self/fd/8]") != std::string::npos, "SCSI inherits its parent");
+        if (arg.starts_with("/proc/self/fd/5,"))
+            check(arg.find("backing-chain=[]") != std::string::npos, "CDROM explicitly requires a root image");
+        if (arg.find("backing-chain=") != std::string::npos) ++explicit_chains;
+    }
+    check(explicit_chains == 3 && chained.preserve_fds == std::vector<int>({5, 6, 4, 3, 8, 7}),
+        "only block buses use chains and shared parent descriptors are inherited once");
+    auto invalid_chain = run;
+    invalid_chain.disk_backing_fds->erase("/storage/emulated/0/cdrom");
+    bool chain_refused = false;
+    try { vm::crosvm_command(config, invalid_chain, {}, {}); } catch (const std::invalid_argument&) { chain_refused = true; }
+    check(chain_refused, "missing explicit root cannot fall back to header paths");
+    for (const auto& chain : {std::vector<int>{2}, std::vector<int>(11, 8)}) {
+        invalid_chain = run; (*invalid_chain.disk_backing_fds)["/storage/emulated/0/virtio"] = chain;
+        chain_refused = false;
+        try { vm::crosvm_command(config, invalid_chain, {}, {}); } catch (const std::invalid_argument&) { chain_refused = true; }
+        check(chain_refused, "invalid descriptor or excessive depth is rejected");
+    }
     run.disk_fds->erase("/storage/emulated/0/virtio");
     bool refused = false;
     try { vm::crosvm_command(config, run, {}, {}); } catch (const std::invalid_argument&) { refused = true; }
