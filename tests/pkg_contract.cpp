@@ -753,6 +753,47 @@ void file_helpers() {
     delete_tree(dir.at("x"));
     check(!exists(dir.at("x")), "delete tree");
 }
+void exclusive_import_files() {
+    Temporary dir;
+    auto reject = [&](const std::string& path) {
+        bool rejected = false;
+        try { FileSink out(path, FileSink::Mode::create_new); out.append("overwrite"); out.close(); }
+        catch (const Error&) { rejected = true; }
+        check(rejected, "exclusive extraction rejects occupied path");
+    };
+    {
+        FileSink out(dir.at("new"), FileSink::Mode::create_new);
+        out.append("original"); out.close();
+    }
+    reject(dir.at("new"));
+    check(bytes_of(dir.at("new")) == "original", "existing image not truncated");
+    check(symlink(dir.at("new").c_str(), dir.at("alias").c_str()) == 0, "create image alias");
+    reject(dir.at("alias"));
+    check(bytes_of(dir.at("new")) == "original", "symlink target not truncated");
+    check(symlink(dir.at("missing").c_str(), dir.at("dangling").c_str()) == 0, "create dangling alias");
+    reject(dir.at("dangling"));
+    check(!exists(dir.at("missing")), "dangling symlink target not created");
+}
+void cleanup_boundaries() {
+    Temporary dir;
+    check(make_dirs(dir.at("outside")) && make_dirs(dir.at("owned/nested")), "prepare cleanup trees");
+    put(dir.at("outside/keep"), "keep"); put(dir.at("owned/nested/remove"), "remove");
+    check(symlink(dir.at("outside").c_str(), dir.at("owned/link").c_str()) == 0, "create external directory alias");
+    delete_tree(dir.at("owned"));
+    check(!exists(dir.at("owned")) && bytes_of(dir.at("outside/keep")) == "keep", "cleanup never follows descendant symlink");
+    check(symlink(dir.at("outside").c_str(), dir.at("root-link").c_str()) == 0, "create cleanup root alias");
+    delete_tree(dir.at("root-link"));
+    check(bytes_of(dir.at("outside/keep")) == "keep", "cleanup unlinks root symlink only");
+    delete_tree(dir.at("already-missing"));
+    bool rejected = false;
+    try { delete_tree(dir.at("outside/keep/not-a-directory")); }
+    catch (const Error&) { rejected = true; }
+    check(rejected, "invalid cleanup parent reports failure instead of success");
+    rejected = false;
+    try { delete_tree(dir.at("outside/..")); }
+    catch (const Error&) { rejected = true; }
+    check(rejected && bytes_of(dir.at("outside/keep")) == "keep", "parent traversal cleanup root rejected");
+}
 }
 
 int main() {
@@ -773,7 +814,8 @@ int main() {
         {"compression corruption", compression_corruption}, {"header", header_contract}, {"manifest", manifest_contract},
         {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},
         {"network import plan", network_plan}, {"lease offsets", lease_offsets}, {"org.json behaviour", json_contract},
-        {"file helpers", file_helpers}};
+        {"file helpers", file_helpers}, {"exclusive imported files", exclusive_import_files},
+        {"cleanup boundaries", cleanup_boundaries}};
     Json::Value report;
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
     try {

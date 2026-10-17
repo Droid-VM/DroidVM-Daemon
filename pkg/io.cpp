@@ -133,7 +133,9 @@ size_t FileSource::read(char* data, size_t size) {
     return count;
 }
 
-FileSink::FileSink(const std::string& path) : fd_(open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) {
+FileSink::FileSink(const std::string& path, Mode mode)
+    : fd_(open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC |
+        (mode == Mode::create_new ? O_EXCL | O_NOFOLLOW : O_TRUNC), 0644)) {
     if (fd_.get() < 0) throw Error(path + ": " + errno_message("open", errno));
     pending_.reserve(buffer_size);
 }
@@ -500,20 +502,62 @@ bool make_dirs(const std::string& path) {
     if (!parent.empty() && !exists(parent)) make_dirs(parent);
     return mkdir(path.c_str(), 0777) == 0;
 }
-void delete_tree(const std::string& path) {
-    struct stat info{};
-    if (lstat(path.c_str(), &info) != 0) return;
-    if (S_ISDIR(info.st_mode)) {
-        if (DIR* dir = opendir(path.c_str())) {
-            std::vector<std::string> names;
-            while (auto* entry = readdir(dir)) {
-                const std::string name = entry->d_name;
-                if (name != "." && name != "..") names.push_back(name);
-            }
-            closedir(dir);
-            for (const auto& name : names) delete_tree(path + "/" + name);
+namespace {
+void delete_at(int parent, const std::string& name) {
+    struct stat observed{};
+    if (fstatat(parent, name.c_str(), &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return;
+        throw Error(errno_message("stat cleanup entry", errno));
+    }
+    if (!S_ISDIR(observed.st_mode)) {
+        if (unlinkat(parent, name.c_str(), 0) != 0 && errno != ENOENT)
+            throw Error(errno_message("unlink cleanup entry", errno));
+        return;
+    }
+    Fd child(openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (child.get() < 0) throw Error(errno_message("open cleanup directory", errno));
+    struct stat opened{};
+    if (fstat(child.get(), &opened) != 0) throw Error(errno_message("stat cleanup directory", errno));
+    if (opened.st_dev != observed.st_dev || opened.st_ino != observed.st_ino)
+        throw Error("Cleanup directory changed before traversal");
+    // Enumerate and recurse relative to the opened directory, never by reconstructing
+    // paths that can follow a replaced ancestor symlink.
+    const int duplicate = fcntl(child.get(), F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) throw Error(errno_message("duplicate cleanup directory", errno));
+    DIR* raw = fdopendir(duplicate);
+    if (!raw) { const int error = errno; ::close(duplicate); throw Error(errno_message("read cleanup directory", error)); }
+    std::unique_ptr<DIR, int(*)(DIR*)> directory(raw, closedir);
+    for (;;) {
+        errno = 0;
+        auto* entry = readdir(directory.get());
+        if (!entry) {
+            if (errno) throw Error(errno_message("read cleanup directory", errno));
+            break;
         }
-        rmdir(path.c_str());
-    } else unlink(path.c_str());
+        const std::string entry_name = entry->d_name;
+        if (entry_name != "." && entry_name != "..") delete_at(child.get(), entry_name);
+    }
+    struct stat current{};
+    if (fstatat(parent, name.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0)
+        throw Error(errno_message("verify cleanup directory", errno));
+    if (current.st_dev != opened.st_dev || current.st_ino != opened.st_ino)
+        throw Error("Cleanup directory changed during traversal");
+    if (unlinkat(parent, name.c_str(), AT_REMOVEDIR) != 0)
+        throw Error(errno_message("remove cleanup directory", errno));
+}
+}
+void delete_tree(const std::string& path) {
+    const auto normalized = java_path(path);
+    const auto name = file_name(normalized);
+    if (name.empty() || name == "." || name == ".." || normalized == "/")
+        throw Error("Invalid cleanup root");
+    auto parent_path = dirname(normalized);
+    if (parent_path.empty()) parent_path = ".";
+    Fd parent(open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (parent.get() < 0) {
+        if (errno == ENOENT) return;
+        throw Error(errno_message("open cleanup parent", errno));
+    }
+    delete_at(parent.get(), name);
 }
 }

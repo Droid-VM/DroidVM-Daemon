@@ -554,7 +554,7 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
     data["bytes_total"] = Json::Int64(size);
     emit(data, "pack");
     {
-        FileSink sink(out);
+        FileSink sink(out, FileSink::Mode::create_new);
         std::string buffer(buffer_size, '\0');
         int64_t remaining = size, written = 0;
         auto last = Clock::now();

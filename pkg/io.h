@@ -103,7 +103,8 @@ private:
 // FileOutputStream (truncate) or RandomAccessFile "rw" with setLength(0).
 class FileSink final : public Sink {
 public:
-    explicit FileSink(const std::string& path);
+    enum class Mode { truncate, create_new };
+    explicit FileSink(const std::string& path, Mode mode = Mode::truncate);
     ~FileSink() override;
     void write(const char* data, size_t size) override;
     uint64_t position() const { return position_ + pending_.size(); }
