@@ -145,6 +145,23 @@ void disk_start_chain_leases() {
     check(requests.size() == 2 && requests[0].path == "/first/disk.qcow2" && !requests[0].write &&
           requests[1].path == "/second/disk.qcow2" && requests[1].write, "VM leases writable leaf and read-only ancestor");
 }
+void leased_read_descriptor() {
+    Temporary temp;
+    temp.raw("image", "original");
+    const auto path = temp.path + "/image";
+    config::DiskFileLeases pool;
+    auto lease = pool.acquire({{path, false}});
+    const int fd = lease->read_fd(path);
+    check(fd >= 3 && (fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0 &&
+        (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY, "borrowed descriptor is read-only and safe for explicit child inheritance");
+    error(ErrorCode::invalid_argument, [&] { lease->read_fd(temp.path + "/unleased"); });
+    check(rename(path.c_str(), (temp.path + "/moved").c_str()) == 0, "move leased input");
+    temp.raw("image", "replacement");
+    char bytes[8];
+    check(pread(fd, bytes, sizeof(bytes), 0) == 8 && std::string(bytes, sizeof(bytes)) == "original",
+        "borrowed descriptor continues to identify the admitted inode");
+    error(ErrorCode::conflict, [&] { lease->read_fd(path); });
+}
 void historical_structure_repair() {
     auto historical = document(); historical["disks"][0]["parent"] = "broken";
     auto next = historical; next["root_extension"] = "unrelated";
@@ -479,6 +496,7 @@ int main() {
         {"disk_structure_transition_validation", structure_transition_validation},
         {"disk_start_reference_readonly_validation", disk_start_validation},
         {"disk_file_leases_alias_batch_release", disk_file_leases},
+        {"disk_lease_read_descriptor", leased_read_descriptor},
         {"disk_start_chain_leases", disk_start_chain_leases},
         {"disk_historical_structure_repair", historical_structure_repair},
         {"disk_structure_long_chain_cycle", long_structure_chain},

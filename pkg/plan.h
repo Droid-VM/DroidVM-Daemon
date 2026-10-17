@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "format.h"
+#include "store/disk_file_leases.h"
 #include <json/json.h>
 #include <functional>
 #include <optional>
@@ -17,6 +18,10 @@ public:
     // backingOf: canonical backing path, or none. Throws Error for an
     // unreadable qcow2 or a backing file that is not there.
     std::optional<std::string> backing_of(const std::string& path) const;
+    // Inspect the held inode. Resolve relative header names against path, not
+    // /proc/self/fd; failed/malformed inspection never means "no backing".
+    // The returned parent still needs its own lease before it is inspected/read.
+    std::optional<std::string> backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
     // Modify the retained overlay inode while storing the durable backing path.

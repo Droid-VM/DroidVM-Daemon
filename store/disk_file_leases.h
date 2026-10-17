@@ -20,6 +20,10 @@ public:
         Lease(const Lease&) = delete;
         Lease& operator=(const Lease&) = delete;
         void verify() const;
+        // Borrowed read-only descriptor, >= 3 and CLOEXEC. Keep this Lease alive
+        // and explicitly preserve the descriptor when passing it to a child.
+        // Use pread or reopen /proc/self/fd/N for an independent file offset.
+        int read_fd(const std::string& path) const;
     private:
         friend class DiskFileLeases;
         struct File { std::string path; Fd fd; };

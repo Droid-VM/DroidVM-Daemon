@@ -925,6 +925,37 @@ void retained_rebase(const std::string& mode) {
     check((fcntl(overlay->fd(), F_GETFD) & FD_CLOEXEC) != 0 && (fcntl(backing->fd(), F_GETFD) & FD_CLOEXEC) != 0,
           "child inheritance never clears parent close-on-exec flags");
 }
+void leased_image_inspection(const std::string& mode) {
+    Temporary dir;
+    put(dir.at("overlay"), "original"); put(dir.at("base.raw"), "base");
+    config::DiskFileLeases pool;
+    auto lease = pool.acquire({{dir.at("overlay"), false}});
+    const int fd = lease->read_fd(dir.at("overlay"));
+    std::string script = "#!/system/bin/sh\n[ \"$1\" = info ] && [ \"$2\" = --output=json ] || exit 20\n"
+        "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
+        "[ \"$(cat \"$3\")\" = original ] || exit 22\n";
+    if (mode == "replacement") {
+        script += "mv '" + dir.at("overlay") + "' '" + dir.at("moved") + "' || exit 23\n"
+            "printf replacement > '" + dir.at("overlay") + "'\n"
+            "[ \"$(cat \"$3\")\" = original ] || exit 24\n";
+    }
+    if (mode == "failure") script += "exit 25\n";
+    else if (mode == "malformed") script += "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":5}'\n";
+    else script += "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":\"base.raw\","
+        "\"full-backing-filename\":\"/proc/self/fd/base.raw\"}'\n";
+    put(dir.at("image-helper"), script);
+    check(chmod(dir.at("image-helper").c_str(), 0700) == 0, "prepare leased image helper");
+    std::optional<std::string> parent;
+    bool failed = false;
+    try { parent = Images(dir.at("image-helper")).backing_of(*lease, dir.at("overlay")); }
+    catch (const std::exception&) { failed = true; }
+    if (mode.empty()) check(!failed && parent == dir.at("base.raw"), "relative backing uses original image directory, not descriptor directory");
+    else check(failed, "failed inspection or replaced path must not become a base image");
+    if (mode == "replacement") check(bytes_of(dir.at("moved")) == "original" &&
+        bytes_of(dir.at("overlay")) == "replacement", "descriptor inspection does not follow a substituted path");
+    check((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0,
+        "parent descriptor remains close-on-exec");
+}
 void real_retained_rebase(const std::string& tool) {
     Temporary dir;
     CreatedDirectory owned(dir.path, "import");
@@ -954,6 +985,15 @@ void real_retained_rebase(const std::string& tool) {
     check(info["format"] == "qcow2" && info["backing-filename"] == files[1]->path() &&
           info["backing-filename-format"] == "raw", "real header stores new durable backing path and format");
     for (const auto& file : files) file->verify();
+    ChildOptions relative;
+    relative.argv = {tool, "rebase", "-u", "-b", "new.raw", "-F", "raw", overlay_path};
+    relative.preserve_fds = {files[2]->fd()};
+    result = Child(relative).communicate({}, std::chrono::seconds(10));
+    check(result.exit_code == 0 && !result.timed_out && !result.truncated, "real qemu writes relative backing name");
+    config::DiskFileLeases pool;
+    auto lease = pool.acquire({{files[2]->path(), false}});
+    check(Images(tool).backing_of(*lease, files[2]->path()) == files[1]->path(),
+        "real qemu inspection resolves relative backing from leased original path");
 }
 }
 
@@ -980,7 +1020,11 @@ int main(int argc, char** argv) {
         {"replaced import parent", replaced_import_parent}, {"retained import files", retained_import_files},
         {"import sync failure", import_sync_failure}, {"retained rebase", [] { retained_rebase(""); }},
         {"retained rebase rejects format", [] { retained_rebase("bad-format"); }},
-        {"retained rebase resists replacement", [] { retained_rebase("replacement"); }}};
+        {"retained rebase resists replacement", [] { retained_rebase("replacement"); }},
+        {"leased image relative backing", [] { leased_image_inspection(""); }},
+        {"leased image inspection failure", [] { leased_image_inspection("failure"); }},
+        {"leased image malformed metadata", [] { leased_image_inspection("malformed"); }},
+        {"leased image replacement", [] { leased_image_inspection("replacement"); }}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};

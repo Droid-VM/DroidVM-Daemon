@@ -32,6 +32,13 @@ void DiskFileLeases::Lease::verify() const {
             throw ServiceError(ErrorCode::conflict, "Disk file changed after lease admission");
     }
 }
+int DiskFileLeases::Lease::read_fd(const std::string& path) const {
+    for (const auto& file : files_) if (file.path == path) {
+        verify();
+        return file.fd.get();
+    }
+    throw ServiceError(ErrorCode::invalid_argument, "Disk path is not held by this lease");
+}
 std::shared_ptr<DiskFileLeases::Lease> DiskFileLeases::acquire(const std::vector<Request>& requests) {
     std::map<std::string, bool> paths, keys, inodes;
     for (const auto& request : requests) {
@@ -45,6 +52,11 @@ std::shared_ptr<DiskFileLeases::Lease> DiskFileLeases::acquire(const std::vector
         struct stat identity{};
         if (file.get() < 0 || fstat(file.get(), &identity) != 0 || !S_ISREG(identity.st_mode))
             throw ServiceError(ErrorCode::io_error, "Cannot open a regular disk file for lease admission");
+        if (file.get() < 3) {
+            Fd raised(fcntl(file.get(), F_DUPFD_CLOEXEC, 3));
+            if (raised.get() < 0) throw ServiceError(ErrorCode::io_error, "Cannot retain disk descriptor above stdio");
+            file = std::move(raised);
+        }
         const auto inode = "inode:" + std::to_string(identity.st_dev) + ":" + std::to_string(identity.st_ino);
         const auto previous = inodes.find(inode);
         if (previous != inodes.end() && (write || previous->second))

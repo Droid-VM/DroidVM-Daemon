@@ -33,6 +33,30 @@ std::optional<std::string> Images::backing_of(const std::string& path) const {
     if (!is_file(backing)) throw Error("missing backing image: " + backing);
     return backing;
 }
+std::optional<std::string> Images::backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const {
+    const int fd = lease.read_fd(path);
+    const auto details = info("/proc/self/fd/" + std::to_string(fd), {fd});
+    lease.verify();
+    if (!details["format"].isString() || details["format"].asString().empty())
+        throw Error("Cannot determine leased image format");
+    const auto& value = details["backing-filename"];
+    if (value.isNull()) {
+        if (!details["full-backing-filename"].isNull())
+            throw Error("Leased image is missing its original backing filename");
+        return std::nullopt;
+    }
+    if (!value.isString()) throw Error("Invalid leased image backing filename");
+    auto backing = value.asString();
+    if (backing.empty() || backing.find('\0') != std::string::npos)
+        throw Error("Invalid leased image backing filename");
+    // qemu-img's full-backing-filename is relative to the descriptor pseudo-path
+    // and therefore cannot be used to reconstruct the original backing chain.
+    if (backing.front() != '/') backing = path_join(dirname(path), backing);
+    backing = canonical_path(backing);
+    if (!is_file(backing)) throw Error("missing backing image: " + backing);
+    lease.verify();
+    return backing;
+}
 void Images::rebase(const std::string& overlay, const std::string& backing) const {
     std::string format;
     try { format = opt_string(info(backing), "format", "qcow2"); } catch (const std::exception&) { format = "qcow2"; }
