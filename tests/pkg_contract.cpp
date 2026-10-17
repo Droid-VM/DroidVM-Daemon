@@ -1146,6 +1146,7 @@ struct DiskOps {
                 "info) printf '%s' '{\"format\":\"raw\"}' ;;\n"
                 "convert) [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
                 "  eval \"out=\\${$#}\"; printf converted > \"$out\" ;;\n"
+                "create) [ -e " + dir.at("fail") + " ] && exit 3; eval \"out=\\${$(($# - 1))}\"; printf created > \"$out\" ;;\n"
                 "resize) ;;\n"
                 "*) exit 9 ;;\nesac\n");
             check(chmod(dir.at("usr/bin/qemu-img").c_str(), 0700) == 0, "enable fake image tool");
@@ -1349,6 +1350,70 @@ void disk_operation_journal() {
     check(log.find("resize --shrink json:{\"driver\":\"raw\",\"file\":{\"driver\":\"file\",\"filename\":\"/proc/self/fd/") != std::string::npos
         && log.find("1048576") != std::string::npos, "resize uses retained descriptor and exact size");
 }
+void disk_operation_create() {
+    DiskOps ops;
+    put(ops.dir.at("a.img"), "original");
+    const auto a = ops.add("a.img");
+    auto create = [&](const std::string& name) {
+        auto value = ops.request("", "create");
+        value.removeMember("disk_id");
+        value["folder"] = ops.dir.path; value["name"] = name; value["format"] = "raw"; value["size"] = Json::Int64(4096);
+        return value;
+    };
+    auto task = ops.run(create("new.img"));
+    const auto id = task.result["disk_id"].asString();
+    struct stat info{}, folder{};
+    check(task.state == TaskState::succeeded && ops.row(id)["name"] == "new.img" && !ops.row(id).isMember("parent")
+        && bytes_of(ops.dir.at("new.img")) == "created", "create installs and registers a new image");
+    check(stat(ops.dir.at("new.img").c_str(), &info) == 0 && stat(ops.dir.path.c_str(), &folder) == 0
+        && info.st_uid == folder.st_uid && (info.st_mode & 07777) == 0644 && info.st_nlink == 1, "new image owned like its folder");
+    check(start_error(ops, create("new.img")) == ErrorCode::conflict, "registered target path rejected");
+    put(ops.dir.at("stray.img"), "stray");
+    check(start_error(ops, create("stray.img")) == ErrorCode::conflict, "existing unregistered file is never overwritten");
+    for (const auto* name : {"..", "a/b", ".dvm-x.tmp", ""})
+        check(start_error(ops, create(name)) == ErrorCode::invalid_argument, "invalid new disk name rejected");
+    auto bad = create("bad.img"); bad["folder"] = ops.dir.path + "/../x";
+    check(start_error(ops, bad) == ErrorCode::invalid_argument, "non-normalized folder rejected");
+    bad = create("bad.img"); bad["format"] = "iso";
+    check(start_error(ops, bad) == ErrorCode::invalid_argument, "uncreatable format rejected");
+    bad = create("bad.img"); bad["backing_id"] = a;
+    check(start_error(ops, bad) == ErrorCode::invalid_argument, "raw image cannot have backing");
+    auto overlay = create("overlay.qcow2"); overlay["format"] = "qcow2"; overlay["backing_id"] = a;
+    task = ops.run(overlay);
+    check(task.state == TaskState::succeeded && ops.row(task.result["disk_id"].asString())["parent"] == a
+        && bytes_of(ops.dir.at("tool.log")).find("create -f qcow2 -b " + ops.dir.at("a.img") + " -F raw") != std::string::npos,
+        "overlay create links registered backing by durable path");
+    auto clone = ops.request(a, "clone"); clone["folder"] = ops.dir.path; clone["name"] = "copy.img";
+    task = ops.run(clone);
+    check(task.state == TaskState::succeeded && bytes_of(ops.dir.at("copy.img")) == "converted"
+        && ops.row(task.result["disk_id"].asString())["name"] == "copy.img" && bytes_of(ops.dir.at("a.img")) == "original",
+        "clone writes a new registered copy and leaves the source");
+    // A file appearing at the target while the tool runs wins; nothing is replaced.
+    ops.fault = [&](const char* stage) { if (std::string_view(stage) == "converted") put(ops.dir.at("race.img"), "foreign"); };
+    task = ops.run(create("race.img"));
+    check(task.state == TaskState::failed && task.error == ErrorCode::conflict && bytes_of(ops.dir.at("race.img")) == "foreign"
+        && temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0, "racing target file is kept");
+    // Crash after installation but before registration rolls the file back.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
+    task = ops.run(create("lost.img"));
+    check(task.state == TaskState::failed && exists(ops.dir.at("lost.img")) && ops.operations->pending() == 1, "crash leaves unregistered image");
+    ops.fault = {};
+    check(start_error(ops, create("lost.img")) == ErrorCode::conflict, "pending target cannot be reused");
+    ops.restart();
+    check(!exists(ops.dir.at("lost.img")) && ops.operations->pending() == 0 && temporaries(ops.dir.path) == 0, "replay removes unregistered image");
+    for (const auto& row : ops.configuration->disks()->snapshot(ops.caller)->document["disks"])
+        check(row["name"] != "lost.img", "rolled-back image has no registry row");
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "prepared") throw std::runtime_error("crash"); };
+    task = ops.run(create("half.img"));
+    ops.fault = {};
+    check(temporaries(ops.dir.path) == 1 && !exists(ops.dir.at("half.img")), "crash before installation keeps only the temporary");
+    ops.restart();
+    check(temporaries(ops.dir.path) == 0 && ops.operations->pending() == 0, "replay removes the temporary");
+    put(ops.dir.at("fail"), "");
+    task = ops.run(create("failed.img"));
+    check(task.state == TaskState::failed && !exists(ops.dir.at("failed.img")) && temporaries(ops.dir.path) == 0
+        && ops.operations->pending() == 0, "tool failure leaves nothing behind");
+}
 Json::Value real_info(const std::string& tool, const std::string& path) {
     ChildOptions options;
     options.argv = {tool, "info", "--output=json", path};
@@ -1383,6 +1448,20 @@ void real_disk_operations(const std::string& tool) {
     check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw")
         && info["format-specific"]["data"]["compression-type"] == "zstd", "real convert keeps durable backing");
     check(real_head(tool, ops.dir.at("ov.qcow2"), ops.dir.at("view1.raw")) == "BASEDATA", "converted overlay reads base");
+    auto make = ops.request("", "create"); make.removeMember("disk_id");
+    make["folder"] = ops.dir.path; make["name"] = "child.qcow2"; make["format"] = "qcow2";
+    make["size"] = Json::Int64(1 << 20); make["backing_id"] = base_id;
+    task = ops.run(make);
+    info = real_info(tool, ops.dir.at("child.qcow2"));
+    check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw")
+        && ops.row(task.result["disk_id"].asString())["parent"] == base_id
+        && real_head(tool, ops.dir.at("child.qcow2"), ops.dir.at("view3.raw")) == "BASEDATA", "real overlay create");
+    auto clone = ops.request(overlay, "clone"); clone["folder"] = ops.dir.path; clone["name"] = "clone.qcow2";
+    task = ops.run(clone);
+    info = real_info(tool, ops.dir.at("clone.qcow2"));
+    check(task.state == TaskState::succeeded && info["format"] == "qcow2" && info["backing-filename"] == ops.dir.at("base.raw")
+        && ops.row(task.result["disk_id"].asString())["parent"] == base_id
+        && real_head(tool, ops.dir.at("clone.qcow2"), ops.dir.at("view4.raw")) == "BASEDATA", "real overlay clone keeps its parent");
     ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
     task = ops.run(ops.request(overlay, "flatten"));
     check(task.state == TaskState::failed && ops.row(overlay).isMember("parent"), "flatten crash leaves registry link");
@@ -1425,7 +1504,8 @@ int main(int argc, char** argv) {
         {"leased image malformed metadata", [] { leased_image_inspection("malformed"); }},
         {"leased image external data rejected", [] { leased_image_inspection("external-data"); }},
         {"leased image replacement", [] { leased_image_inspection("replacement"); }},
-        {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal}};
+        {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal},
+        {"disk operation create and clone", disk_operation_create}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};

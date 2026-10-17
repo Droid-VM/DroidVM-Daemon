@@ -79,6 +79,12 @@ std::optional<Identity> record_identity(const Json::Value& record) {
 class DiskOperationService::Operation {
 public:
     Operation(DiskOperationService& owner, const Json::Value& request);
+    ~Operation() {
+        std::lock_guard lock(owner_.journal_mutex_);
+        owner_.running_.erase(id_);
+    }
+    Operation(const Operation&) = delete;
+    Operation& operator=(const Operation&) = delete;
     TaskCompletion run(TaskControl& control);
     const std::string& disk_id() const { return disk_id_; }
 private:
@@ -87,7 +93,16 @@ private:
     std::string id_ = random_id(false), action_, disk_id_, target_format_, compress_ = "none";
     int64_t size_ = 0;
     bool shrink_ = false, preallocate_ = false;
-    std::vector<Member> chain_; // Operated image first, then registered ancestors.
+    // create/clone write a new registered image instead of replacing one.
+    bool fresh_ = false;
+    std::string folder_, name_, new_parent_;
+    // In place: operated image first. create: the backing chain. clone: the
+    // source chain. Ancestors always follow their child.
+    std::vector<Member> chain_;
+    std::string target() const { return fresh_ ? path_join(folder_, name_) : chain_.front().path; }
+    void load_chain(const std::map<std::string, Json::Value>& rows, const std::set<std::string>& valid, const std::string& start);
+    std::vector<std::string> command(int output) const;
+    void register_new();
     ConfigurationService::DiskReservation reservation_;
     std::shared_ptr<config::DiskFileLeases::Lease> lease_;
     std::string tool() const { return path_join(data_root(owner_.context_), "usr/bin/qemu-img"); }
@@ -106,17 +121,51 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     const auto& revision = request["disk_revision"];
     if (!revision.isString() || revision.asString().empty() || revision.asString().size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Disk revision is required");
-    disk_id_ = row_id(request["disk_id"]);
     action_ = request["action"].isString() ? request["action"].asString() : "";
-    if (action_ != "resize" && action_ != "convert" && action_ != "flatten")
+    if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone")
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
+    fresh_ = action_ == "create" || action_ == "clone";
+    if (fresh_) {
+        const auto& folder = request["folder"];
+        const auto& name = request["name"];
+        if (!folder.isString() || !name.isString()) throw ServiceError(ErrorCode::invalid_argument, "Folder and name are required");
+        folder_ = folder.asString(); name_ = name.asString();
+        const auto component = [](std::string_view part) { return part.empty() || part == "." || part == ".."; };
+        if (folder_.empty() || folder_.front() != '/' || folder_.find('\0') != std::string::npos || folder_.size() > 4096
+                || (folder_.size() > 1 && folder_.back() == '/'))
+            throw ServiceError(ErrorCode::invalid_argument, "Folder must be a normalized absolute path");
+        for (size_t start = 1; folder_.size() > 1 && start <= folder_.size();) {
+            const auto end = std::min(folder_.find('/', start), folder_.size());
+            if (component(std::string_view(folder_).substr(start, end - start)))
+                throw ServiceError(ErrorCode::invalid_argument, "Folder must be a normalized absolute path");
+            start = end + 1;
+        }
+        if (component(name_) || name_.size() > 255 || name_.find('/') != std::string::npos
+                || name_.find('\0') != std::string::npos || name_.starts_with(".dvm-"))
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid disk file name");
+    }
+    if (action_ == "create") {
+        if (!request["format"].isString()) throw ServiceError(ErrorCode::invalid_argument, "Format is required");
+        target_format_ = request["format"].asString();
+        if (target_format_ != "qcow2" && target_format_ != "raw" && target_format_ != "vhdx" && target_format_ != "vdi" && target_format_ != "vmdk")
+            throw ServiceError(ErrorCode::invalid_argument, "Unsupported image format");
+        if (!request["size"].isInt64() || request["size"].asInt64() <= 0)
+            throw ServiceError(ErrorCode::invalid_argument, "Create requires a positive byte size");
+        size_ = request["size"].asInt64();
+        if (request.isMember("backing_id")) {
+            if (target_format_ != "qcow2") throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 images can have a backing disk");
+            disk_id_ = row_id(request["backing_id"]);
+        }
+    } else disk_id_ = row_id(request["disk_id"]);
     if (action_ == "resize") {
         if (!request["size"].isInt64() || request["size"].asInt64() <= 0)
             throw ServiceError(ErrorCode::invalid_argument, "Resize requires a positive byte size");
         size_ = request["size"].asInt64();
         shrink_ = request["shrink"].isBool() && request["shrink"].asBool();
     } else {
-        if (request.isMember("format")) {
+        if (action_ == "clone" && request.isMember("format"))
+            throw ServiceError(ErrorCode::invalid_argument, "Clone keeps the source format");
+        if (action_ != "create" && request.isMember("format")) {
             if (!request["format"].isString() || (request["format"].asString() != "qcow2" && request["format"].asString() != "raw"))
                 throw ServiceError(ErrorCode::invalid_argument, "Target format must be qcow2 or raw");
             target_format_ = request["format"].asString();
@@ -138,8 +187,61 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     for (const auto& row : snapshot->document["disks"]) {
         try { rows.emplace(row_id(row["id"]), row); } catch (const ServiceError&) {}
     }
+    if (!disk_id_.empty()) load_chain(rows, valid, disk_id_);
+    if (fresh_) {
+        const auto path = target();
+        for (const auto& [id, row] : rows)
+            if (config::disk_path(row) == path) throw ServiceError(ErrorCode::conflict, "A registered disk already uses this path");
+        struct stat existing{};
+        if (lstat(path.c_str(), &existing) == 0 || errno != ENOENT)
+            throw ServiceError(ErrorCode::conflict, "Target disk file already exists");
+        if (action_ == "create" && !chain_.empty()) new_parent_ = chain_.front().id;
+        if (action_ == "clone" && chain_.size() > 1) new_parent_ = chain_[1].id;
+    } else {
+        size_t children = 0;
+        for (const auto& [id, row] : rows) {
+            try { if (parent_id(row) == disk_id_) ++children; } catch (const ServiceError&) {}
+        }
+        if (action_ != "flatten" && children)
+            throw ServiceError(ErrorCode::conflict, "Other disks are overlays of this disk; their content would change");
+        if (action_ == "flatten" && chain_.size() < 2)
+            throw ServiceError(ErrorCode::conflict, "Disk is not an overlay");
+    }
+    {
+        std::lock_guard lock(owner_.journal_mutex_);
+        for (const auto& record : owner_.records_)
+            if ((!fresh_ && record["disk_id"].asString() == disk_id_) || record["path"].asString() == target())
+                throw ServiceError(ErrorCode::unavailable, "An interrupted operation on this disk must be recovered first");
+    }
+    // A new row is reserved by its future ID; reads only share their sources.
+    std::set<std::string> shared;
+    for (size_t i = fresh_ ? 0 : 1; i < chain_.size(); ++i) shared.insert(chain_[i].id);
+    if (fresh_) disk_id_ = random_id(true);
+    reservation_ = configuration->reserve_disks(revision.asString(), {disk_id_}, shared);
+    std::vector<config::DiskFileLeases::Request> files;
+    for (size_t i = 0; i < chain_.size(); ++i) files.push_back({chain_[i].path, i == 0 && !fresh_});
+    if (!files.empty()) lease_ = configuration->disk_files()->acquire(files);
+    const auto stopping = owner_.stopping_;
+    const Images images(tool(), [stopping] { return stopping->load(); }, std::chrono::seconds(10));
+    for (auto& member : chain_) {
+        try { member.format = images.validate_backing(*lease_, member.path, member.parent).format; }
+        catch (const ServiceError&) { throw; }
+        catch (const std::exception& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+        if (member.format != "qcow2" && member.format != "raw")
+            throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 and raw images are supported");
+    }
+    if (target_format_.empty()) target_format_ = chain_.front().format;
+    if (action_ == "clone" && chain_.size() > 1 && target_format_ != "qcow2")
+        throw ServiceError(ErrorCode::conflict, "Registered overlay is not a qcow2 image");
+    if (action_ == "convert" && chain_.size() > 1 && target_format_ != "qcow2")
+        throw ServiceError(ErrorCode::invalid_argument, "Converting an overlay to raw would flatten it; use flatten");
+    if (compress_ != "none" && target_format_ != "qcow2")
+        throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 images can be compressed");
+}
+void DiskOperationService::Operation::load_chain(const std::map<std::string, Json::Value>& rows,
+        const std::set<std::string>& valid, const std::string& start) {
     std::set<std::string> seen;
-    for (auto id = std::optional<std::string>(disk_id_); id;) {
+    for (auto id = std::optional<std::string>(start); id;) {
         const auto found = rows.find(*id);
         if (found == rows.end()) throw ServiceError(chain_.empty() ? ErrorCode::not_found : ErrorCode::conflict,
             chain_.empty() ? "Disk not found" : "Registered parent disk is missing");
@@ -151,40 +253,28 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         chain_.push_back({*id, path, {}, {}});
         id = parent_id(found->second);
     }
-    size_t children = 0;
-    for (const auto& [id, row] : rows) {
-        try { if (parent_id(row) == disk_id_) ++children; } catch (const ServiceError&) {}
+}
+std::vector<std::string> DiskOperationService::Operation::command(int output) const {
+    std::string settings;
+    if (preallocate_) settings = "preallocation=falloc";
+    if (compress_ != "none") settings += std::string(settings.empty() ? "" : ",") + "compression_type=" + (compress_ == "zstd" ? "zstd" : "zlib");
+    std::vector<std::string> argv{tool()};
+    if (action_ == "create") {
+        // The header stores the durable backing path; qemu-img checks it by
+        // that path while the read lease pins the admitted inode.
+        argv.insert(argv.end(), {"create", "-f", target_format_});
+        if (!chain_.empty()) argv.insert(argv.end(), {"-b", chain_.front().path, "-F", chain_.front().format});
+        if (!settings.empty()) argv.insert(argv.end(), {"-o", settings});
+        argv.insert(argv.end(), {descriptor(output), std::to_string(size_)});
+        return argv;
     }
-    if (action_ != "flatten" && children)
-        throw ServiceError(ErrorCode::conflict, "Other disks are overlays of this disk; their content would change");
-    if (action_ == "flatten" && chain_.size() < 2)
-        throw ServiceError(ErrorCode::conflict, "Disk is not an overlay");
-    {
-        std::lock_guard lock(owner_.journal_mutex_);
-        for (const auto& record : owner_.records_)
-            if (record["disk_id"].asString() == disk_id_ || record["path"].asString() == chain_.front().path)
-                throw ServiceError(ErrorCode::unavailable, "An interrupted operation on this disk must be recovered first");
-    }
-    std::set<std::string> ancestors;
-    for (size_t i = 1; i < chain_.size(); ++i) ancestors.insert(chain_[i].id);
-    reservation_ = configuration->reserve_disks(revision.asString(), {disk_id_}, ancestors);
-    std::vector<config::DiskFileLeases::Request> files{{chain_.front().path, true}};
-    for (size_t i = 1; i < chain_.size(); ++i) files.push_back({chain_[i].path, false});
-    lease_ = configuration->disk_files()->acquire(files);
-    const auto stopping = owner_.stopping_;
-    const Images images(tool(), [stopping] { return stopping->load(); }, std::chrono::seconds(10));
-    for (auto& member : chain_) {
-        try { member.format = images.validate_backing(*lease_, member.path, member.parent).format; }
-        catch (const ServiceError&) { throw; }
-        catch (const std::exception& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
-        if (member.format != "qcow2" && member.format != "raw")
-            throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 and raw images are supported");
-    }
-    if (target_format_.empty()) target_format_ = chain_.front().format;
-    if (action_ == "convert" && chain_.size() > 1 && target_format_ != "qcow2")
-        throw ServiceError(ErrorCode::invalid_argument, "Converting an overlay to raw would flatten it; use flatten");
-    if (compress_ != "none" && target_format_ != "qcow2")
-        throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 images can be compressed");
+    argv.insert(argv.end(), {"convert", "-O", target_format_});
+    // convert reads the whole chain; keep an overlay's own layer over its parent.
+    if (action_ != "flatten" && chain_.size() > 1) argv.insert(argv.end(), {"-B", chain_[1].path, "-F", chain_[1].format});
+    if (!settings.empty()) argv.insert(argv.end(), {"-o", settings});
+    if (compress_ != "none") argv.push_back("-c");
+    argv.insert(argv.end(), {"json:" + wire::stringify(graph(0)), descriptor(output)});
+    return argv;
 }
 // Explicit node tree: qcow2 nodes never resolve header names relative to the
 // /proc descriptor path, and the operated image never follows a backing link
@@ -202,7 +292,7 @@ Json::Value DiskOperationService::Operation::graph(size_t index, int writable_fd
 TaskCompletion DiskOperationService::Operation::run(TaskControl& control) {
     try {
         if (owner_.stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
-        lease_->verify();
+        if (lease_) lease_->verify();
         return action_ == "resize" ? resize(control) : rewrite(control);
     } catch (const Abandoned& error) {
         return TaskCompletion::failure(ErrorCode::internal, error.what());
@@ -233,20 +323,28 @@ TaskCompletion DiskOperationService::Operation::resize(TaskControl& control) {
     return TaskCompletion::success(result());
 }
 TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
-    const auto& target = chain_.front();
-    const auto name = file_name(target.path);
-    const auto directory_path = dirname(target.path);
+    const auto path = target();
+    const auto name = file_name(path);
+    const auto directory_path = dirname(path);
     const auto directory = open_directory(directory_path);
-    struct stat source{}, entry{};
-    if (fstat(lease_->read_fd(target.path), &source) != 0 || fstatat(directory.get(), name.c_str(), &entry, AT_SYMLINK_NOFOLLOW) != 0
-            || !same(source, entry))
-        throw ServiceError(ErrorCode::conflict, "Disk file changed after lease admission");
+    struct stat source{};
+    if (fresh_) {
+        // New images belong to the folder owner, like files the app creates there.
+        if (fstat(directory.get(), &source) != 0) throw ServiceError(ErrorCode::io_error, errno_message("inspect disk folder", errno));
+        source.st_mode = 0644;
+    } else {
+        struct stat entry{};
+        if (fstat(lease_->read_fd(path), &source) != 0 || fstatat(directory.get(), name.c_str(), &entry, AT_SYMLINK_NOFOLLOW) != 0
+                || !same(source, entry))
+            throw ServiceError(ErrorCode::conflict, "Disk file changed after lease admission");
+    }
     const auto temporary = ".dvm-" + id_ + ".tmp";
     Json::Value record;
     record["id"] = id_; record["action"] = action_; record["disk_id"] = disk_id_;
-    record["path"] = target.path; record["directory"] = directory_path; record["temporary"] = temporary;
+    record["path"] = path; record["directory"] = directory_path; record["temporary"] = temporary;
     record["phase"] = "prepared";
-    if (chain_.size() > 1) record["parent_id"] = chain_[1].id;
+    if (fresh_) record["fresh"] = true;
+    if (!fresh_ && chain_.size() > 1) record["parent_id"] = chain_[1].id;
     // Journal the name before the file exists, so any crash leaves a findable owner.
     owner_.put_record(record);
     std::optional<Identity> created;
@@ -269,23 +367,16 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         // Keep the replacement accessible exactly like the original image.
         if (fchown(output.get(), source.st_uid, source.st_gid) != 0 || fchmod(output.get(), source.st_mode & 07777) != 0)
             throw ServiceError(ErrorCode::io_error, errno_message("copy disk ownership", errno));
-        char label[256];
-        const auto length = fgetxattr(lease_->read_fd(target.path), "security.selinux", label, sizeof(label));
-        if (length > 0 && fsetxattr(output.get(), "security.selinux", label, static_cast<size_t>(length), 0) != 0)
-            owner_.context_.log("WARN", "DiskOperation: could not copy SELinux label: " + errno_message("fsetxattr", errno));
+        if (!fresh_) {
+            char label[256];
+            const auto length = fgetxattr(lease_->read_fd(path), "security.selinux", label, sizeof(label));
+            if (length > 0 && fsetxattr(output.get(), "security.selinux", label, static_cast<size_t>(length), 0) != 0)
+                owner_.context_.log("WARN", "DiskOperation: could not copy SELinux label: " + errno_message("fsetxattr", errno));
+        }
         fault("prepared");
         control.progress({action_, "", 0, {}});
         ChildOptions options;
-        options.argv = {tool(), "convert", "-O", target_format_};
-        if (action_ == "convert" && chain_.size() > 1)
-            options.argv.insert(options.argv.end(), {"-B", chain_[1].path, "-F", chain_[1].format});
-        std::string settings;
-        if (preallocate_) settings = "preallocation=falloc";
-        if (compress_ != "none") settings += std::string(settings.empty() ? "" : ",") + "compression_type=" + (compress_ == "zstd" ? "zstd" : "zlib");
-        if (!settings.empty()) options.argv.insert(options.argv.end(), {"-o", settings});
-        if (compress_ != "none") options.argv.push_back("-c");
-        options.argv.push_back("json:" + wire::stringify(graph(0)));
-        options.argv.push_back(descriptor(output.get()));
+        options.argv = command(output.get());
         options.preserve_fds = {output.get()};
         for (const auto& member : chain_) options.preserve_fds.push_back(lease_->read_fd(member.path));
         const auto stopping = owner_.stopping_;
@@ -293,16 +384,23 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
             [&control, stopping] { return control.cancellation_requested() || stopping->load(); });
         if (converted.cancelled) { discard(); return TaskCompletion::cancelled(); }
         if (converted.exit_code != 0 || converted.timed_out || converted.truncated)
-            throw ServiceError(ErrorCode::io_error, "qemu-img convert failed with " + std::to_string(converted.exit_code));
-        sync_or_throw(output.get(), "sync converted disk");
+            throw ServiceError(ErrorCode::io_error, "qemu-img " + action_ + " failed with " + std::to_string(converted.exit_code));
+        sync_or_throw(output.get(), "sync written disk");
         fault("converted");
         struct stat current{};
         if (fstatat(directory.get(), temporary.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0 || !same(current, made))
             throw ServiceError(ErrorCode::conflict, "Disk operation temporary file was replaced");
-        lease_->verify();
+        if (lease_) lease_->verify();
         if (!control.enter_commit()) { discard(); return TaskCompletion::cancelled(); }
         record["phase"] = "replacing";
         owner_.put_record(record);
+        if (fresh_) {
+            // Never replace a file that appeared at the target meanwhile.
+            if (linkat(directory.get(), temporary.c_str(), directory.get(), name.c_str(), 0) != 0) {
+                const int error = errno;
+                throw ServiceError(error == EEXIST ? ErrorCode::conflict : ErrorCode::io_error, errno_message("install new disk image", error));
+            }
+        }
     } catch (const Abandoned&) {
         throw;
     } catch (...) {
@@ -310,20 +408,46 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         throw;
     }
     // Past this point the only safe direction is forward: the journal decides.
-    if (renameat(directory.get(), temporary.c_str(), directory.get(), name.c_str()) != 0)
+    if (fresh_) {
+        if (unlinkat(directory.get(), temporary.c_str(), 0) != 0)
+            throw ServiceError(ErrorCode::io_error, errno_message("remove installed disk temporary name", errno));
+    } else if (renameat(directory.get(), temporary.c_str(), directory.get(), name.c_str()) != 0)
         throw ServiceError(ErrorCode::io_error, errno_message("replace disk image", errno));
     sync_or_throw(directory.get(), "sync disk directory");
     fault("replaced");
-    if (action_ == "flatten") {
-        try { finish_flatten(); }
-        catch (const std::exception& error) {
-            owner_.context_.log("WARN", "DiskOperation: flatten registry update deferred: " + std::string(error.what()));
+    if (fresh_ || action_ == "flatten") {
+        try { fresh_ ? register_new() : finish_flatten(); }
+        catch (const ServiceError& error) {
+            owner_.context_.log("WARN", "DiskOperation: registry update deferred: " + std::string(error.what()));
+            // A definite rejection leaves the new file unregistered: roll it back.
+            if (fresh_ && error.code() != ErrorCode::commit_uncertain && error.code() != ErrorCode::internal
+                    && error.code() != ErrorCode::unavailable) {
+                try { if (owner_.replay_one(record)) owner_.drop_record(id_); }
+                catch (const std::exception& cleanup) {
+                    owner_.context_.log("WARN", "DiskOperation: rollback deferred: " + std::string(cleanup.what()));
+                }
+                return TaskCompletion::failure(error.code(), error.what());
+            }
             return TaskCompletion::failure(ErrorCode::commit_uncertain,
-                "Image was flattened but its registry link could not be cleared; recover disk operations");
+                "Image was written but the disk registry update is uncertain; recover disk operations");
         }
     }
     owner_.drop_record(id_);
     return TaskCompletion::success(result());
+}
+void DiskOperationService::Operation::register_new() {
+    auto& configuration = *owner_.context_.configuration;
+    const auto vms = configuration.vms().snapshot(internal);
+    const auto disks = configuration.disks()->snapshot(internal);
+    auto document = disks->document;
+    const auto path = target();
+    for (const auto& row : document["disks"])
+        if (config::disk_path(row) == path) throw ServiceError(ErrorCode::conflict, "A registered disk already uses this path");
+    Json::Value row;
+    row["id"] = disk_id_; row["name"] = name_; row["folder"] = folder_;
+    if (!new_parent_.empty()) row["parent"] = new_parent_;
+    document["disks"].append(std::move(row));
+    configuration.replace_vm_disks(internal, vms->revision, disks->revision, vms->document, std::move(document), reservation_);
 }
 void DiskOperationService::Operation::finish_flatten() {
     auto& configuration = *owner_.context_.configuration;
@@ -344,7 +468,7 @@ Json::Value DiskOperationService::Operation::result() const {
     Json::Value value;
     value["disk_id"] = disk_id_;
     value["action"] = action_;
-    value["path"] = chain_.front().path;
+    value["path"] = target();
     value["format"] = action_ == "resize" ? chain_.front().format : target_format_;
     return value;
 }
@@ -382,6 +506,7 @@ void DiskOperationService::put_record(const Json::Value& record) {
         if (!error.installed) throw ServiceError(ErrorCode::io_error, error.what());
     }
     records_ = std::move(next);
+    running_.insert(record["id"].asString());
 }
 void DiskOperationService::drop_record(const std::string& id) {
     std::lock_guard lock(journal_mutex_);
@@ -406,6 +531,7 @@ bool DiskOperationService::replay_one(const Json::Value& record) {
     const auto identity = record_identity(record);
     struct stat current{};
     const bool temporary_present = fstatat(directory.get(), temporary.c_str(), &current, AT_SYMLINK_NOFOLLOW) == 0;
+    if (record["fresh"].asBool()) return replay_new(directory.get(), record);
     if (record["phase"].asString() == "prepared" || temporary_present) {
         // The image was never replaced; only the partial copy remains.
         if (!remove_temporary(directory.get(), temporary, identity))
@@ -436,10 +562,42 @@ bool DiskOperationService::replay_one(const Json::Value& record) {
     }
     return true;
 }
+// A new image counts only once registered; otherwise the exact installed
+// inode is rolled back. Foreign files at either name are never removed.
+bool DiskOperationService::replay_new(int directory, const Json::Value& record) {
+    const auto identity = record_identity(record);
+    const auto temporary = record["temporary"].asString();
+    const auto path = record["path"].asString();
+    const auto name = file_name(path);
+    if (dirname(path) != record["directory"].asString() || name.empty() || name.find('/') != std::string::npos)
+        throw std::runtime_error("Malformed disk operation record");
+    struct stat final_entry{}, temporary_entry{};
+    const auto matches = [&](const struct stat& entry) {
+        return identity && S_ISREG(entry.st_mode) && entry.st_dev == identity->device && entry.st_ino == identity->inode;
+    };
+    const bool installed = fstatat(directory, name.c_str(), &final_entry, AT_SYMLINK_NOFOLLOW) == 0 && matches(final_entry);
+    if (!installed) {
+        if (!remove_temporary(directory, temporary, identity))
+            throw std::runtime_error("Disk operation temporary file changed; inspect " + temporary);
+        return true;
+    }
+    if (fstatat(directory, temporary.c_str(), &temporary_entry, AT_SYMLINK_NOFOLLOW) == 0 && matches(temporary_entry)) {
+        if (unlinkat(directory, temporary.c_str(), 0) != 0 && errno != ENOENT)
+            throw ServiceError(ErrorCode::io_error, errno_message("remove installed disk temporary name", errno));
+        sync_or_throw(directory, "sync disk directory");
+    }
+    for (const auto& row : context_.configuration->disks()->snapshot(internal)->document["disks"])
+        if (config::disk_path(row) == path) return true;
+    if (!remove_temporary(directory, name, identity))
+        throw std::runtime_error("Unregistered new disk changed; inspect " + path);
+    return true;
+}
 void DiskOperationService::replay() {
     Json::Value records;
-    { std::lock_guard lock(journal_mutex_); records = records_; }
+    std::set<std::string> running;
+    { std::lock_guard lock(journal_mutex_); records = records_; running = running_; }
     for (const auto& record : records) {
+        if (running.contains(record["id"].asString())) continue;
         try { if (replay_one(record)) drop_record(record["id"].asString()); }
         catch (const std::exception& error) {
             context_.log("WARN", "DiskOperation: recovery of " + record["id"].asString() + " deferred: " + error.what());

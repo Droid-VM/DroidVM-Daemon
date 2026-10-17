@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <sys/types.h>
 
@@ -52,11 +53,13 @@ private:
     std::unique_ptr<config::JsonFile> journal_;
     mutable std::mutex journal_mutex_;
     Json::Value records_{Json::arrayValue};
+    std::set<std::string> running_; // Records owned by live operations; replay skips them.
     std::shared_ptr<std::atomic<bool>> stopping_ = std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<size_t>> active_ = std::make_shared<std::atomic<size_t>>(0);
     void put_record(const Json::Value& record);
     void drop_record(const std::string& id);
     void replay();
     bool replay_one(const Json::Value& record);
+    bool replay_new(int directory, const Json::Value& record);
 };
 }
