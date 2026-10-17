@@ -157,6 +157,8 @@ private:
     bool shrink_ = false, preallocate_ = false;
     // create/clone write a new registered image instead of replacing one.
     bool fresh_ = false;
+    // convert into another file: the image moves to folder_/name_ with its row and slots.
+    bool relocate_ = false;
     std::string folder_, name_, new_parent_;
     // In place: operated image first. create: the backing chain. clone: the
     // source chain. Ancestors always follow their child.
@@ -166,7 +168,9 @@ private:
     bool delete_files_ = false;
     std::string reset_options_;
     bool follow_ = true; // create: writable slots on a childless backing follow the overlay.
-    std::string target() const { return fresh_ ? path_join(folder_, name_) : chain_.front().path; }
+    bool installs() const { return fresh_ || relocate_; }
+    std::string target() const { return installs() ? path_join(folder_, name_) : chain_.front().path; }
+    void relocate_registry();
     TaskCompletion merge(TaskControl& control);
     TaskCompletion remove(TaskControl& control);
     void admit_tree(const Json::Value& request, const std::string& revision);
@@ -200,7 +204,8 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         return;
     }
     fresh_ = action_ == "create" || action_ == "clone";
-    if (fresh_) {
+    relocate_ = action_ == "convert" && (request.isMember("folder") || request.isMember("name"));
+    if (installs()) {
         const auto& folder = request["folder"];
         const auto& name = request["name"];
         if (!folder.isString() || !name.isString()) throw ServiceError(ErrorCode::invalid_argument, "Folder and name are required");
@@ -271,7 +276,8 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         try { rows.emplace(row_id(row["id"]), row); } catch (const ServiceError&) {}
     }
     if (!disk_id_.empty()) load_chain(rows, valid, disk_id_);
-    if (fresh_) {
+    if (relocate_ && target() == chain_.front().path) relocate_ = false; // Same file: in place.
+    if (installs()) {
         const auto path = target();
         for (const auto& [id, row] : rows)
             if (config::disk_path(row) == path) throw ServiceError(ErrorCode::conflict, "A registered disk already uses this path");
@@ -280,7 +286,9 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
             throw ServiceError(ErrorCode::conflict, "Target disk file already exists");
         if (action_ == "create" && !chain_.empty()) new_parent_ = chain_.front().id;
         if (action_ == "clone" && chain_.size() > 1) new_parent_ = chain_[1].id;
-    } else {
+    }
+    if (!fresh_) {
+        // Moving or rewriting a base would break or change its overlays.
         size_t children = 0;
         for (const auto& [id, row] : rows) {
             try { if (parent_id(row) == disk_id_) ++children; } catch (const ServiceError&) {}
@@ -537,7 +545,9 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         source.st_mode = 0644;
     } else {
         struct stat entry{};
-        if (fstat(lease_->read_fd(path), &source) != 0 || fstatat(directory.get(), name.c_str(), &entry, AT_SYMLINK_NOFOLLOW) != 0
+        const auto source_directory = open_directory(dirname(chain_.front().path));
+        if (fstat(lease_->read_fd(chain_.front().path), &source) != 0
+                || fstatat(source_directory.get(), file_name(chain_.front().path).c_str(), &entry, AT_SYMLINK_NOFOLLOW) != 0
                 || !same(source, entry))
             throw ServiceError(ErrorCode::conflict, "Disk file changed after lease admission");
     }
@@ -546,7 +556,13 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     record["id"] = id_; record["action"] = action_; record["disk_id"] = disk_id_;
     record["path"] = path; record["directory"] = directory_path; record["temporary"] = temporary;
     record["phase"] = "prepared";
-    if (fresh_) record["fresh"] = true;
+    if (installs()) record["fresh"] = true;
+    if (relocate_) {
+        // The moved-from inode is removed only after the row points at the new file.
+        Json::Value moved; moved["path"] = chain_.front().path;
+        put_identity(moved, Identity{source.st_dev, source.st_ino});
+        record["relocated_from"] = std::move(moved);
+    }
     if (!fresh_ && chain_.size() > 1) record["parent_id"] = chain_[1].id;
     // Journal the name before the file exists, so any crash leaves a findable owner.
     owner_.put_record(record);
@@ -572,7 +588,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
             throw ServiceError(ErrorCode::io_error, errno_message("copy disk ownership", errno));
         if (!fresh_) {
             char label[256];
-            const auto length = fgetxattr(lease_->read_fd(path), "security.selinux", label, sizeof(label));
+            const auto length = fgetxattr(lease_->read_fd(chain_.front().path), "security.selinux", label, sizeof(label));
             if (length > 0 && fsetxattr(output.get(), "security.selinux", label, static_cast<size_t>(length), 0) != 0)
                 owner_.context_.log("WARN", "DiskOperation: could not copy SELinux label: " + errno_message("fsetxattr", errno));
         }
@@ -597,7 +613,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         if (!control.enter_commit()) { discard(); return TaskCompletion::cancelled(); }
         record["phase"] = "replacing";
         owner_.put_record(record);
-        if (fresh_) {
+        if (installs()) {
             // Never replace a file that appeared at the target meanwhile.
             if (linkat(directory.get(), temporary.c_str(), directory.get(), name.c_str(), 0) != 0) {
                 const int error = errno;
@@ -611,19 +627,19 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         throw;
     }
     // Past this point the only safe direction is forward: the journal decides.
-    if (fresh_) {
+    if (installs()) {
         if (unlinkat(directory.get(), temporary.c_str(), 0) != 0)
             throw ServiceError(ErrorCode::io_error, errno_message("remove installed disk temporary name", errno));
     } else if (renameat(directory.get(), temporary.c_str(), directory.get(), name.c_str()) != 0)
         throw ServiceError(ErrorCode::io_error, errno_message("replace disk image", errno));
     sync_or_throw(directory.get(), "sync disk directory");
     fault("replaced");
-    if (fresh_ || action_ == "flatten") {
-        try { fresh_ ? register_new() : finish_flatten(); }
+    if (installs() || action_ == "flatten") {
+        try { fresh_ ? register_new() : relocate_ ? relocate_registry() : finish_flatten(); }
         catch (const ServiceError& error) {
             owner_.context_.log("WARN", "DiskOperation: registry update deferred: " + std::string(error.what()));
             // A definite rejection leaves the new file unregistered: roll it back.
-            if (fresh_ && error.code() != ErrorCode::commit_uncertain && error.code() != ErrorCode::internal
+            if (installs() && error.code() != ErrorCode::commit_uncertain && error.code() != ErrorCode::internal
                     && error.code() != ErrorCode::unavailable) {
                 try { if (owner_.replay_one(record)) owner_.drop_record(id_); }
                 catch (const std::exception& cleanup) {
@@ -635,8 +651,37 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
                 "Image was written but the disk registry update is uncertain; recover disk operations");
         }
     }
+    fault("registered");
+    if (relocate_ && !unlink_exact(chain_.front().path, record_identity(record["relocated_from"])))
+        owner_.context_.log("WARN", "DiskOperation: moved-from image " + chain_.front().path + " changed; left in place");
     owner_.drop_record(id_);
     return TaskCompletion::success(result());
+}
+// The row keeps its ID and moves with every VM slot that named the old path.
+void DiskOperationService::Operation::relocate_registry() {
+    auto& configuration = *owner_.context_.configuration;
+    const auto vms = configuration.vms().snapshot(internal);
+    const auto disks = configuration.disks()->snapshot(internal);
+    const auto from = chain_.front().path, to = target();
+    auto document = disks->document;
+    bool found = false;
+    for (auto& row : document["disks"]) {
+        if (!row.isObject()) continue;
+        try { if (row_id(row["id"]) != disk_id_) continue; } catch (const ServiceError&) { continue; }
+        if (config::disk_path(row) != from) throw ServiceError(ErrorCode::conflict, "Moved disk registry entry changed");
+        row["folder"] = folder_; row["name"] = name_;
+        found = true;
+    }
+    if (!found) throw ServiceError(ErrorCode::conflict, "Moved disk registry entry disappeared");
+    for (const auto& row : document["disks"])
+        if (config::disk_path(row) == from) throw ServiceError(ErrorCode::conflict, "Another disk entry still uses the moved image");
+    auto machines = vms->document;
+    for (auto& vm : machines["vms"]) {
+        if (!vm.isObject() || !vm["disks"].isArray()) continue;
+        for (auto& slot : vm["disks"])
+            if (slot.isObject() && slot["path"].isString() && slot["path"].asString() == from) slot["path"] = to;
+    }
+    configuration.replace_vm_disks(internal, vms->revision, disks->revision, std::move(machines), std::move(document), reservation_);
 }
 // qemu-img commit writes the overlay's clusters into its parent in place. The
 // overlay keeps them (-d), so its view stays exact if this is interrupted;
@@ -973,7 +1018,12 @@ bool DiskOperationService::replay_new(int directory, const Json::Value& record) 
         sync_or_throw(directory, "sync disk directory");
     }
     for (const auto& row : context_.configuration->disks()->snapshot(internal)->document["disks"])
-        if (config::disk_path(row) == path) return true;
+        if (config::disk_path(row) == path) {
+            const auto& moved = record["relocated_from"];
+            if (moved.isObject() && !unlink_exact(moved["path"].asString(), record_identity(moved)))
+                context_.log("WARN", "DiskOperation: moved-from image " + moved["path"].asString() + " changed; left in place");
+            return true;
+        }
     if (!remove_temporary(directory, name, identity))
         throw std::runtime_error("Unregistered new disk changed; inspect " + path);
     return true;

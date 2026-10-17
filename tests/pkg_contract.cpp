@@ -1453,6 +1453,40 @@ void disk_operation_create() {
             && slot["readonly"].asBool() == !follow, std::string("overlay create moves slots: ") + mode);
     }
 }
+void disk_operation_relocate() {
+    DiskOps ops;
+    put(ops.dir.at("a.img"), "original");
+    const auto a = ops.add("a.img");
+    ops.set_vms({{"user", {{ops.dir.at("a.img"), false}}}});
+    auto move = [&](const std::string& name) {
+        auto value = ops.request(a, "convert");
+        value["folder"] = ops.dir.path; value["name"] = name;
+        return value;
+    };
+    put(ops.dir.at("taken.img"), "taken");
+    check(start_error(ops, move("taken.img")) == ErrorCode::conflict, "relocation never overwrites a file");
+    // Crash before the registry moves: the new file is rolled back, the original stays.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
+    auto task = ops.run(move("moved.img"));
+    check(task.state == TaskState::failed && exists(ops.dir.at("moved.img")), "crash leaves installed copy");
+    ops.fault = {};
+    ops.restart();
+    check(!exists(ops.dir.at("moved.img")) && bytes_of(ops.dir.at("a.img")) == "original" && ops.row(a)["name"] == "a.img"
+        && ops.operations->pending() == 0, "unregistered relocation rolls back");
+    // Crash after the registry moved: replay removes only the moved-from inode.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "registered") throw std::runtime_error("crash"); };
+    task = ops.run(move("moved.img"));
+    check(task.state == TaskState::failed && exists(ops.dir.at("a.img")) && ops.row(a)["name"] == "moved.img", "crash after registry move");
+    ops.fault = {};
+    ops.restart();
+    check(!exists(ops.dir.at("a.img")) && bytes_of(ops.dir.at("moved.img")) == "converted" && ops.operations->pending() == 0
+        && ops.slots("user")[0]["path"] == ops.dir.at("moved.img") && ops.slots("user")[0]["readonly"] == false,
+        "replay finishes relocation and its slot move");
+    auto again = ops.request(a, "convert"); again["folder"] = ops.dir.path; again["name"] = "final.img";
+    task = ops.run(again);
+    check(task.state == TaskState::succeeded && task.result["path"] == ops.dir.at("final.img") && !exists(ops.dir.at("moved.img"))
+        && ops.row(a)["name"] == "final.img" && ops.slots("user")[0]["path"] == ops.dir.at("final.img"), "live relocation");
+}
 void disk_slot_reattachment() {
     const auto b = random_id(true), o = random_id(true), c = random_id(true), x = random_id(true);
     auto row = [](const std::string& id, const std::string& name, const std::string& parent = {}) {
@@ -1602,6 +1636,14 @@ void real_disk_operations(const std::string& tool) {
     check(task.state == TaskState::succeeded && info["backing-filename"] == ops.dir.at("base.raw") && info["virtual-size"].asInt64() == (1 << 20)
         && ops.row(task.result["disk_id"].asString())["parent"] == base_id
         && real_head(tool, ops.dir.at("child.qcow2"), ops.dir.at("view3.raw")) == "BASEDATA", "real overlay create");
+    auto relocate = ops.request(task.result["disk_id"].asString(), "convert");
+    relocate["folder"] = ops.dir.path; relocate["name"] = "child-moved.qcow2"; relocate["compress"] = "zstd";
+    const auto child_id = task.result["disk_id"].asString();
+    task = ops.run(relocate);
+    info = real_info(tool, ops.dir.at("child-moved.qcow2"));
+    check(task.state == TaskState::succeeded && !exists(ops.dir.at("child.qcow2")) && info["backing-filename"] == ops.dir.at("base.raw")
+        && info["format-specific"]["data"]["compression-type"] == "zstd" && ops.row(child_id)["name"] == "child-moved.qcow2"
+        && real_head(tool, ops.dir.at("child-moved.qcow2"), ops.dir.at("view6.raw")) == "BASEDATA", "real relocating convert");
     auto clone = ops.request(overlay, "clone"); clone["folder"] = ops.dir.path; clone["name"] = "clone.qcow2";
     task = ops.run(clone);
     info = real_info(tool, ops.dir.at("clone.qcow2"));
@@ -1684,7 +1726,7 @@ int main(int argc, char** argv) {
         {"leased image replacement", [] { leased_image_inspection("replacement"); }},
         {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal},
         {"disk operation create and clone", disk_operation_create}, {"disk slot reattachment", disk_slot_reattachment},
-        {"disk operation merge and delete", disk_operation_tree}};
+        {"disk operation merge and delete", disk_operation_tree}, {"disk operation relocation", disk_operation_relocate}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};
