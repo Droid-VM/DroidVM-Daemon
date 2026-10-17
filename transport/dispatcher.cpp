@@ -91,6 +91,7 @@ bool usb_command(const std::string& command) {
     return std::find(usb_commands.begin(), usb_commands.end(), command) != usb_commands.end();
 }
 bool package_command(const std::string& command) { return command == "vm_export" || command == "vm_import"; }
+bool disk_operation_command(const std::string& command) { return command == "disk_operation_start" || command == "disk_operation_recover"; }
 bool vm_command(const std::string& command) {
     return std::find(vm_commands.begin(), vm_commands.end(), command) != vm_commands.end();
 }
@@ -177,6 +178,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 bool RequestDispatcher::background(const std::string& command) const {
     if (disk_config_ && disk_upload_command(command)) return true;
     if (configuration_ && configuration_command(command)) return true;
+    if (disk_operations_ && disk_operation_command(command)) return true;
     if (networks_ && network_upload_command(command)) return true;
     return (vm_config_ && (command == "vm_config_apply" || command == "vm_start_configured" || vm_upload_command(command))) || (display_attach_ && command == "display_attach") || (usb_ && usb_command(command)) || (packages_ && package_command(command)) ||
         (host_network_ && host_command(command)) || (vms_ && vm_command(command)) || (keyboard_ && keyboard_command(command)) ||
@@ -233,6 +235,24 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             return result;
         } catch (const ServiceError& error) { return failure(error); }
         catch (...) { return failure(ServiceError(ErrorCode::internal, "Configuration outcome unknown; recover and reload before further operations")); }
+    }
+    if (disk_operations_ && disk_operation_command(command)) {
+        try {
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Disk operation request must be an object");
+            Json::Value body(Json::objectValue);
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command == "disk_operation_recover") throw ServiceError(ErrorCode::invalid_argument, "Unexpected disk operation field");
+                if (key != "disk_revision" && key != "disk_id" && key != "action" && key != "size" && key != "shrink"
+                        && key != "format" && key != "compress" && key != "preallocate")
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected disk operation field");
+                body[key] = request[key];
+            }
+            auto result = command == "disk_operation_start" ? disk_operations_->start(caller, body) : disk_operations_->recover(caller);
+            result["success"] = true;
+            return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Disk operation admission failed")); }
     }
     if (vm_config_ && command == "vm_start_configured") {
         try {
@@ -664,7 +684,7 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
-        && !(configuration_ && configuration_command(command))
+        && !(configuration_ && configuration_command(command)) && !(disk_operations_ && disk_operation_command(command))
         && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot" || disk_upload_command(command)))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
@@ -788,6 +808,14 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : vm_disk_upload_commands) result["commands"].append(name);
                 result["service_api_minor"] = 24;
             }
+            if (disk_operations_) {
+                result["commands"].append("disk_operation_start");
+                result["commands"].append("disk_operation_recover");
+                result["disk_operations"] = "revisioned-tasks-v1";
+                result["disk_operation_actions"] = Json::Value(Json::arrayValue);
+                for (const auto* action : {"resize", "convert", "flatten"}) result["disk_operation_actions"].append(action);
+                result["service_api_minor"] = 25;
+            }
         }
         return result;
     }
@@ -796,7 +824,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
         if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
         Json::Value result;
         result["success"] = true;
-        if (configuration_ && configuration_command(command)) {
+        if ((configuration_ && configuration_command(command)) || (disk_operations_ && disk_operation_command(command))) {
             return execute_background(caller, command, request);
         } else if (disk_config_ && disk_upload_command(command)) {
             return execute_background(caller, command, request);

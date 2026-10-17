@@ -14,6 +14,7 @@
 #include "input/keyboard_grab.h"
 #include "usb/service.h"
 #include "pkg/service.h"
+#include "pkg/disk_operation.h"
 
 namespace droidvm {
 struct ClientSession {
@@ -82,6 +83,12 @@ public:
             });
         configuration_ = service;
     }
+    // Startup only, after set_configuration with the same coordinated owner.
+    void set_disk_operations(pkg::DiskOperationService* service) {
+        if (!service || !configuration_ || !configuration_->disks() || disk_operations_)
+            throw std::invalid_argument("Disk operations require the coordinated disk owner");
+        disk_operations_ = service;
+    }
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
     TaskService& workers() { return tasks_; }
@@ -104,6 +111,7 @@ private:
     VmConfigService* vm_config_ = nullptr;
     DiskConfigService* disk_config_ = nullptr;
     ConfigurationService* configuration_ = nullptr;
+    pkg::DiskOperationService* disk_operations_ = nullptr;
     std::unique_ptr<VmConfigUploads> vm_uploads_;
     bool vms_swept_ = false;
     Json::Value execute_vm(const CallContext& caller, const std::string& command, const Json::Value& request);

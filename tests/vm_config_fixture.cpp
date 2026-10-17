@@ -51,7 +51,9 @@ int main(int argc, char** argv) {
         auto gate = coordinated || disk_config ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
         context.configuration_gate = gate;
         droidvm::VmService inventory(context);
-        droidvm::TaskService tasks({}, [] { return droidvm::TaskService::Clock::now(); }, {}, gate);
+        droidvm::TaskLimits limits;
+        if (vm_disks) limits.background_workers = 1; // disk operations
+        droidvm::TaskService tasks(limits, [] { return droidvm::TaskService::Clock::now(); }, {}, gate);
         std::unique_ptr<droidvm::VmConfigService> configs;
         std::unique_ptr<droidvm::ConfigurationService> configuration;
         std::unique_ptr<droidvm::NetworkService> networks;
@@ -78,6 +80,16 @@ int main(int argc, char** argv) {
         droidvm::RequestDispatcher dispatcher(system, tasks, configuration ? &configuration->networks() : nullptr, nullptr, networks.get(), nullptr, &inventory);
         if (configuration) dispatcher.set_configuration(configuration.get());
         else dispatcher.set_vm_config(configs.get());
+        // The runner provides <isolated-directory>/usr/bin/qemu-img; images stay in test paths.
+        std::unique_ptr<droidvm::pkg::DiskOperationService> operations;
+        if (vm_disks) {
+            droidvm::pkg::DiskOperationContext operation_context;
+            operation_context.configuration = configuration.get();
+            operation_context.data_dir = argv[1];
+            operation_context.directory = instance.directory_fd(); operation_context.owner = getuid();
+            operations = std::make_unique<droidvm::pkg::DiskOperationService>(std::move(operation_context));
+            dispatcher.set_disk_operations(operations.get());
+        }
         if (disks) dispatcher.set_disk_config(disks.get());
         const auto token = droidvm::random_id(false);
         try {
