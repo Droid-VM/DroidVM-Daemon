@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
+#include <sched.h>
 #include <map>
 #include <optional>
 #include <cstdlib>
@@ -111,6 +112,30 @@ private:
         try { control_.progress({phase_, "basis_points", value, 10000}); } catch (const ServiceError&) {}
     }
 };
+// The settings' qemu-img core list, as "taskset" applied it before.
+std::vector<int> parse_cpus(const Json::Value& request) {
+    if (!request.isMember("cpus")) return {};
+    const auto& list = request["cpus"];
+    if (!list.isArray() || list.empty() || list.size() > CPU_SETSIZE)
+        throw ServiceError(ErrorCode::invalid_argument, "CPU list must be a non-empty array");
+    std::set<int> cpus;
+    for (const auto& item : list) {
+        if (!item.isInt() || item.asInt() < 0 || item.asInt() >= CPU_SETSIZE || !cpus.insert(item.asInt()).second)
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid CPU index");
+    }
+    return {cpus.begin(), cpus.end()};
+}
+// Binds the child before exec; a core list the kernel rejects fails the operation.
+void bind_cpus(ChildOptions& options, const std::vector<int>& cpus) {
+    if (cpus.empty()) return;
+    options.before_exec = [cpus](pid_t pid) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        for (const auto cpu : cpus) CPU_SET(cpu, &set);
+        if (sched_setaffinity(pid, sizeof(set), &set) != 0)
+            throw ServiceError(ErrorCode::invalid_argument, errno_message("apply qemu-img CPU affinity", errno));
+    };
+}
 // Exit code plus the tool's last diagnostic line.
 std::string tool_failure(const std::string& action, const ChildOutput& output) {
     auto message = "qemu-img " + action + " failed with " + std::to_string(output.exit_code);
@@ -220,6 +245,7 @@ private:
     std::string id_ = random_id(false), action_, disk_id_, target_format_, compress_ = "none";
     int64_t size_ = 0;
     bool shrink_ = false, preallocate_ = false;
+    std::vector<int> cpus_;
     // create/clone write a new registered image instead of replacing one.
     bool fresh_ = false;
     // convert into another file: the image moves to folder_/name_ with its row and slots.
@@ -264,6 +290,7 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone"
             && action_ != "commit" && action_ != "delete" && action_ != "reset")
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
+    cpus_ = parse_cpus(request);
     if (action_ == "commit" || action_ == "delete") {
         admit_tree(request, revision.asString());
         return;
@@ -591,6 +618,7 @@ TaskCompletion DiskOperationService::Operation::resize(TaskControl& control) {
     options.argv.push_back("json:" + wire::stringify(graph(0, io.get())));
     options.argv.push_back(std::to_string(size_));
     options.preserve_fds = {io.get()};
+    bind_cpus(options, cpus_);
     const auto output = Child(options).communicate({}, std::chrono::minutes(30), 1u << 20);
     lease_->verify();
     if (output.exit_code != 0 || output.timed_out || output.truncated)
@@ -664,6 +692,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         options.argv = command(output.get());
         options.preserve_fds = {output.get()};
         for (const auto& member : chain_) options.preserve_fds.push_back(lease_->read_fd(member.path));
+        bind_cpus(options, cpus_);
         const auto stopping = owner_.stopping_;
         ToolProgress progress(control, action_);
         const auto converted = Child(options).communicate({}, std::chrono::hours(24), 1u << 20,
@@ -775,6 +804,7 @@ TaskCompletion DiskOperationService::Operation::merge(TaskControl& control) {
         options.argv = {tool(), "commit", "-p", "-d", "json:" + wire::stringify(node)};
         options.preserve_fds = {top.get(), base.get()};
         for (size_t i = 2; i < chain_.size(); ++i) options.preserve_fds.push_back(lease_->read_fd(chain_[i].path));
+        bind_cpus(options, cpus_);
         ToolProgress progress(control, "commit");
         const auto result = Child(options).communicate({}, std::chrono::hours(24), 1u << 20, {}, std::ref(progress));
         if (result.exit_code != 0 || result.timed_out || result.truncated)

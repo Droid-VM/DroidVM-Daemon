@@ -23,6 +23,7 @@
 #include <map>
 #include <random>
 #include <sys/stat.h>
+#include <sched.h>
 #include <unistd.h>
 #include <chrono>
 #include <thread>
@@ -1142,6 +1143,7 @@ struct DiskOps {
             // info: plain raw. convert: write a marker into the descriptor target.
             put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
                 "echo \"$@\" >> " + dir.at("tool.log") + "\n"
+                "grep Cpus_allowed_list /proc/$$/status >> " + dir.at("tool.log") + "\n"
                 "case \"$1\" in\n"
                 "info) real=$(readlink \"$3\"); if [ -e \"$real.backing\" ]; then printf '{\"format\":\"qcow2\",\"virtual-size\":4096,\"backing-filename\":\"%s\"}' \"$(cat \"$real.backing\")\"; else printf '%s' '{\"format\":\"raw\",\"virtual-size\":4096}'; fi ;;\n"
                 "commit|rebase) [ -e " + dir.at("fail") + " ] && exit 3; exit 0 ;;\n"
@@ -1416,6 +1418,21 @@ void disk_operation_create() {
         "clone writes a new registered copy and leaves the source");
     check(task.progress.unit == "basis_points" && task.progress.completed == 10000 && task.progress.total == 10000u,
         "clone reports qemu-img progress");
+    // The settings' core list binds the tool exactly like taskset did.
+    put(ops.dir.at("tool.log"), "");
+    auto bound = ops.request(a, "clone"); bound["folder"] = ops.dir.path; bound["name"] = "bound.img";
+    bound["cpus"] = Json::Value(Json::arrayValue); bound["cpus"].append(0);
+    task = ops.run(bound);
+    const auto affinity_log = bytes_of(ops.dir.at("tool.log"));
+    check(task.state == TaskState::succeeded && affinity_log.find("Cpus_allowed_list:\t0\n") != std::string::npos,
+        "clone binds qemu-img to the requested cores");
+    auto unbound = ops.request(a, "clone"); unbound["folder"] = ops.dir.path; unbound["name"] = "bad.img";
+    unbound["cpus"] = Json::Value(Json::arrayValue); unbound["cpus"].append(-1);
+    check(start_error(ops, unbound) == ErrorCode::invalid_argument, "invalid CPU index rejected at admission");
+    unbound["cpus"][0] = CPU_SETSIZE - 1;
+    task = ops.run(unbound);
+    check(task.state == TaskState::failed && task.error == ErrorCode::invalid_argument && !exists(ops.dir.at("bad.img"))
+        && temporaries(ops.dir.path) == 0, "unavailable cores fail the operation without leaving files");
     // FUSE shared storage has no hard links; installing there must still never replace.
     const std::string shared = "/storage/emulated/0/.droidvm-contract-" + random_id(false);
     if (access("/storage/emulated/0", W_OK) == 0) {
