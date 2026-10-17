@@ -441,6 +441,33 @@ void joint_import(const std::string& fault) {
         put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
             "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
             "[ \"$(cat \"$3\")\" = payload ] || exit 22\n"
+            "printf '%s' '{\"format\":\"raw\"}'\n");
+        check(chmod(dir.at("usr/bin/qemu-img").c_str(), 0700) == 0, "enable export inspection tool");
+        Json::Value export_request;
+        export_request["vm_id"] = vm_view->document["vms"][0]["id"];
+        export_request["dest_path"] = dir.at("export.vmpkg");
+        export_request["compression"] = "NONE";
+        {
+            auto writer = configuration.disk_files()->acquire({{image, true}});
+            bool conflict = false;
+            try { packages.vm_export(caller, export_request); }
+            catch (const ServiceError& error) { conflict = error.code() == ErrorCode::conflict; }
+            check(conflict && !exists(dir.at("export.vmpkg")), "export refuses leased writer before destination access");
+        }
+        const auto exported = packages.vm_export(caller, export_request);
+        const TaskRef exported_ref{exported["epoch"].asString(), exported["task_id"].asString()};
+        auto export_task = tasks.get(caller, exported_ref);
+        const auto export_deadline = TaskService::Clock::now() + 5s;
+        while (!task_terminal(export_task.state) && TaskService::Clock::now() < export_deadline) {
+            std::this_thread::sleep_for(1ms); export_task = tasks.get(caller, exported_ref);
+        }
+        check(export_task.state == TaskState::succeeded, "coordinated export completes from retained inputs");
+        const auto exported_entries = read_path(dir.at("export.vmpkg"));
+        check(exported_entries.size() == 2 && exported_entries[1].data == "payload", "export preserves leased image bytes");
+        { auto writer = configuration.disk_files()->acquire({{image, true}}); writer->verify(); }
+        put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
+            "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
+            "[ \"$(cat \"$3\")\" = payload ] || exit 22\n"
             "printf inspected > '" + dir.at("inspected") + "'\n"
             "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":\"" + image + "\"}'\n");
         check(chmod(dir.at("usr/bin/qemu-img").c_str(), 0700) == 0, "enable isolated image tool");

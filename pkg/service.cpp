@@ -114,7 +114,7 @@ public:
     ExportTask(const PkgContext& context, std::shared_ptr<std::atomic<bool>> stopping, const Json::Value& request);
     const std::string& id() const { return id_; }
     TaskCompletion run(TaskControl& control);
-    void cancelled(const TaskRef& ref) { id_ = ref.id; Json::Value data; data["message"] = "task cancelled"; emit(data, "error"); }
+    void cancelled(const TaskRef& ref) { sources_.clear(); id_ = ref.id; Json::Value data; data["message"] = "task cancelled"; emit(data, "error"); }
 private:
     PkgContext context_;
     TaskControl* control_ = nullptr;
@@ -126,6 +126,8 @@ private:
     Manifest manifest_;
     int total_ = 0, final_volumes_ = 0;
     const VolumeSplitSink* split_ = nullptr;
+    std::map<std::string, std::shared_ptr<config::DiskFileLeases::Lease>> sources_;
+    std::shared_ptr<config::DiskFileLeases::Lease> retain_source(const std::string& path);
     void collect_disks(const Json::Value& vm, const std::set<int>& wanted);
     void collect_boots();
     void collect_networks(const Json::Value& source);
@@ -163,6 +165,15 @@ ExportTask::ExportTask(const PkgContext& context, std::shared_ptr<std::atomic<bo
     manifest_.manifest_version = manifest_.resolve_version();
     total_ = static_cast<int>(manifest_.disks.size() + manifest_.boots.size());
 }
+std::shared_ptr<config::DiskFileLeases::Lease> ExportTask::retain_source(const std::string& path) {
+    const auto pool = context_.configuration ? context_.configuration->disk_files() : nullptr;
+    if (!pool) return {};
+    auto found = sources_.find(path);
+    if (found != sources_.end()) return found->second;
+    auto lease = pool->acquire({{path, false}});
+    sources_.emplace(path, lease);
+    return lease;
+}
 void ExportTask::collect_disks(const Json::Value& vm, const std::set<int>& wanted) {
     std::vector<DiskRef> tops;
     const auto& disks = config::member(vm, "disks");
@@ -177,7 +188,10 @@ void ExportTask::collect_disks(const Json::Value& vm, const std::set<int>& wante
         tops.push_back(std::move(ref));
     }
     const Images images(path_join(data_root(context_), "usr/bin/qemu-img"), [stopping = stopping_] { return stopping->load(); });
-    for (const auto& member : plan_disks(tops, [&](const std::string& path) { return images.backing_of(path); }))
+    for (const auto& member : plan_disks(tops, [&](const std::string& path) {
+        const auto lease = retain_source(path);
+        return lease ? images.backing_of(*lease, path) : images.backing_of(path);
+    }))
         manifest_.disks.push_back(disk_entry(member));
 }
 void ExportTask::collect_boots() {
@@ -195,6 +209,7 @@ void ExportTask::collect_boots() {
         file.archive_path = file.name;
         file.size = file_length(path);
         if (!seen.insert(file.archive_path).second) return;
+        retain_source(path);
         manifest_.boots.push_back(std::move(file));
     };
     // BootConfig.of creates the objects it reads, in the exported config too.
@@ -232,11 +247,16 @@ void ExportTask::collect_networks(const Json::Value& source) {
     }
 }
 TaskCompletion ExportTask::run(TaskControl& control) {
+    struct Release {
+        decltype(sources_)& sources;
+        ~Release() { sources.clear(); }
+    } release{sources_};
     control_ = &control;
     id_ = control.ref().id;
     Json::Value data;
     data["total"] = total_;
     try {
+        for (const auto& [path, lease] : sources_) lease->verify();
         // Existing exports overwrite the selected file and numbered volumes.
         // Cancellation must win before that irreversible operation starts.
         if (!control.enter_commit()) {
@@ -286,8 +306,16 @@ void ExportTask::pack(TarWriter& tar) {
     }
 }
 void ExportTask::write_file(TarWriter& tar, const std::string& item, const std::string& path, int done, int total) {
-    const auto read_path = optimized(path, optimize_);
-    const auto size = file_length(read_path);
+    const auto retained = sources_.find(path);
+    const auto read_path = retained == sources_.end() ? optimized(path, optimize_) : path;
+    Fd input;
+    int64_t size;
+    if (retained != sources_.end()) {
+        input = retained->second->open_file(path);
+        struct stat info{};
+        if (fstat(input.get(), &info) != 0) throw Error(errno_message("stat export input", errno));
+        size = info.st_size;
+    } else size = file_length(read_path);
     Json::Value data;
     data["done"] = done;
     data["total"] = total;
@@ -296,7 +324,7 @@ void ExportTask::write_file(TarWriter& tar, const std::string& item, const std::
     data["bytes_total"] = Json::Int64(size);
     emit(data, "pack");
     tar.entry(item, size, [&](Sink& out) {
-        FileSource in(read_path);
+        FileSource in(input.get() >= 0 ? FileSource(std::move(input)) : FileSource(read_path));
         std::string buffer(buffer_size, '\0');
         int64_t written = 0;
         auto last = Clock::now();

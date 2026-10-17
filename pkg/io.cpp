@@ -112,6 +112,11 @@ FileSource::FileSource(const std::string& path) : fd_(open(path.c_str(), O_RDONL
     struct stat info{};
     if (fstat(fd_.get(), &info) == 0 && S_ISDIR(info.st_mode)) throw Error(path + ": " + errno_message("open", EISDIR));
 }
+FileSource::FileSource(Fd fd) : fd_(std::move(fd)), buffer_(buffer_size, '\0') {
+    struct stat info{};
+    if (fstat(fd_.get(), &info) != 0) throw Error(errno_message("stat retained input", errno));
+    if (!S_ISREG(info.st_mode)) throw Error("retained package input is not a regular file");
+}
 size_t FileSource::read(char* data, size_t size) {
     if (begin_ == end_) {
         // Large reads bypass the buffer.

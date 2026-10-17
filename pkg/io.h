@@ -94,6 +94,7 @@ public:
 class FileSource final : public Source {
 public:
     explicit FileSource(const std::string& path); // FileInputStream
+    explicit FileSource(Fd fd); // Own an already admitted file, without reopening its path.
     size_t read(char* data, size_t size) override;
 private:
     Fd fd_;
