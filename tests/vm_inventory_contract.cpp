@@ -7,6 +7,7 @@
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
 #include "transport/dispatcher.h"
+#include "vm/qemu_command.h"
 #include <atomic>
 #include <dirent.h>
 #include <future>
@@ -17,6 +18,37 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void qemu_disk_readonly_arguments() {
+    Json::Value config;
+    config["name"] = "readonly-contract";
+    config["id"] = random_id(true);
+    config["screens"]["gpu-0"]["enabled"] = false;
+    config["screens"]["simplefb"]["enabled"] = false;
+    vm::HostFacts host;
+    host.optimize_sdcard = false;
+    vm::QemuRun run;
+    run.file_length = [](const std::string&) { return 64LL * 1024 * 1024; };
+    for (const auto* bus : {"pflash", "pmem", "virtio", "scsi", "cdrom"}) {
+        for (const bool readonly : {false, true}) {
+            Json::Value disk;
+            disk["path"] = "/isolated/readonly-contract.img";
+            disk["bus"] = bus;
+            disk["readonly"] = readonly;
+            config["disks"] = Json::Value(Json::arrayValue);
+            config["disks"].append(disk);
+            const auto launch = vm::qemu_command(config, run, {}, host);
+            size_t matches = 0;
+            for (const auto& arg : launch.argv) {
+                if (arg.find("/isolated/readonly-contract.img") == std::string::npos) continue;
+                ++matches;
+                check((arg.find(",readonly=on") != std::string::npos) ==
+                    (readonly || std::string_view(bus) == "cdrom"),
+                    "QEMU disk access agrees with read-only lease for every bus");
+            }
+            check(matches == 1, "disk is attached exactly once");
+        }
+    }
+}
 struct Fixture {
     std::string path = "/data/local/tmp/droidvm-vm-inventory-" + random_id(false);
     std::atomic<int> starts{0};
@@ -1411,7 +1443,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"replace_delete_stale_references", replacement_and_failure},
+    return run({{"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},
+        {"replace_delete_stale_references", replacement_and_failure},
         {"configuration_gate_domains_recovery", configuration_gate_domains_and_recovery},
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
         {"coordinated_network_delete", coordinated_network_delete},

@@ -55,7 +55,7 @@ struct Builder {
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
             if (bus == "PFLASH") {
-                add({"-drive", "file=" + path + ",if=pflash,format=raw"});
+                add({"-drive", "file=" + path + ",if=pflash,format=raw" + (readonly ? ",readonly=on" : "")});
             } else if (bus == "CDROM") {
                 scsi_controller();
                 const auto id = "cd" + decimal(drives++);
@@ -70,7 +70,8 @@ struct Builder {
                 const auto id = "pmem" + decimal(pmem++);
                 int64_t size = run.file_length ? run.file_length(path) : 0;
                 if (size <= 0) size = 64LL * 1024 * 1024;
-                add({"-object", "memory-backend-file,id=" + id + ",mem-path=" + path + ",share=on,size=" + decimal(size)});
+                add({"-object", "memory-backend-file,id=" + id + ",mem-path=" + path + ",share=on,size=" + decimal(size)
+                    + (readonly ? ",readonly=on" : "")});
                 add({"-device", "virtio-pmem-pci,memdev=" + id + "," + pci});
             } else {
                 const auto io = "io" + decimal(io_threads++), id = "dr" + decimal(drives++);
