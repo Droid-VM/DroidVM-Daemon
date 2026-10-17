@@ -6,6 +6,7 @@
 #include "services/network_config.h"
 #include "services/vm.h"
 #include "services/vm_config.h"
+#include "services/configuration.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include "vm/boot_plan.h"
@@ -347,6 +348,7 @@ private:
     std::string vm_dir_, vm_name_;
     bool registered_ = false;
     VmConfigService::Snapshot config_snapshot_;
+    DiskConfigService::Snapshot disk_snapshot_;
     int total_ = 0, volume_total_ = 0;
     Manifest manifest_;
     Json::Value vm_;
@@ -360,6 +362,7 @@ private:
     void relink();
     void remap_disks();
     void remap_boots();
+    Json::Value registered_disks() const;
     Json::Value import_networks();
     void resolve_leases();
     void resolve_lease(Json::Value& nic, Family family);
@@ -392,6 +395,7 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         // Capture before name/lease planning. Concurrent configuration changes
         // must reject this import rather than silently rebasing its decisions.
         if (context_.vm_config) config_snapshot_ = context_.vm_config->snapshot(internal);
+        if (context_.configuration) disk_snapshot_ = context_.configuration->disks()->snapshot(internal);
         unpack();
         // Network creation and VM registration are observable shared state.
         // Finish cancellable extraction/cleanup before entering this commit.
@@ -410,7 +414,12 @@ TaskCompletion ImportTask::run(TaskControl& control) {
                 // unless the service explicitly proves the commit was rejected.
                 registered_ = true;
                 failure_code = ErrorCode::internal;
-                context_.vm_config->apply(internal, config_snapshot_->revision, operations);
+                if (context_.configuration) {
+                    auto vms = config_snapshot_->document;
+                    vms["vms"].append(vm_);
+                    context_.configuration->replace_vm_disks(internal, config_snapshot_->revision,
+                        disk_snapshot_->revision, std::move(vms), registered_disks());
+                } else context_.vm_config->apply(internal, config_snapshot_->revision, operations);
             } else id = context_.vms->create(internal, vm_);
         }
         catch (const ServiceError& error) {
@@ -613,6 +622,29 @@ void ImportTask::remap_boots() {
     if (by_kind.contains("kernel")) child(boot, "linux")["kernel"] = by_kind["kernel"];
     if (by_kind.contains("initrd")) child(boot, "linux")["initrd"] = by_kind["initrd"];
 }
+Json::Value ImportTask::registered_disks() const {
+    auto document = disk_snapshot_->document;
+    std::map<std::string, std::string> ids;
+    for (const auto index : disks_) {
+        const auto& disk = manifest_.disks[index];
+        if (!disk.target || !ids.emplace(disk.archive_path, random_uuid()).second)
+            throw ServiceError(ErrorCode::invalid_argument, "Missing or repeated imported disk");
+    }
+    for (const auto index : disks_) {
+        const auto& disk = manifest_.disks[index];
+        Json::Value row;
+        row["id"] = ids.at(disk.archive_path);
+        row["name"] = basename(*disk.target);
+        row["folder"] = dirname(*disk.target);
+        if (!disk.backing_archive.empty()) {
+            const auto parent = ids.find(disk.backing_archive);
+            if (parent == ids.end()) throw ServiceError(ErrorCode::invalid_argument, "Imported backing disk is missing");
+            row["parent"] = parent->second;
+        }
+        document["disks"].append(std::move(row));
+    }
+    return document;
+}
 Json::Value ImportTask::import_networks() {
     std::map<std::string, std::string> refs;
     Json::Value created(Json::arrayValue);
@@ -738,6 +770,14 @@ void ImportTask::emit(Json::Value data, const char* phase) const {
 
 PkgService::PkgService(PkgContext context) : context_(std::move(context)) {
     if (!context_.tasks) throw std::invalid_argument("Package task service is required");
+    if (context_.configuration) {
+        if (!context_.configuration->disks() || context_.vms != &context_.configuration->inventory()
+                || context_.networks != &context_.configuration->networks()
+                || context_.tasks != &context_.configuration->events()
+                || (context_.vm_config && context_.vm_config != &context_.configuration->vms()))
+            throw std::invalid_argument("Package services must share the joint configuration owner");
+        context_.vm_config = &context_.configuration->vms();
+    }
 }
 PkgService::~PkgService() { shutdown(); }
 TaskRef PkgService::launch(const CallContext& caller, const char* kind, TaskService::Work body, TaskService::Discarded discarded) {

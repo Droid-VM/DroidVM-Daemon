@@ -7,6 +7,7 @@
 #include "services/legacy_events.h"
 #include "services/vm.h"
 #include "services/network_config.h"
+#include "services/configuration.h"
 #include "store/network_config.h"
 #include "common/identity.h"
 #include "common/wire.h"
@@ -358,6 +359,80 @@ std::vector<Entry> read_path(const std::string& path) {
     FileSource in(path);
     return read_package(in);
 }
+void joint_import(const std::string& fault) {
+    using namespace std::chrono_literals;
+    Temporary dir;
+    const CallContext caller{"package-owner", true, true, true};
+    Fd directory(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto gate = std::make_shared<ConfigurationGate>();
+    vm::RuntimeContext runtime;
+    runtime.cache_dir = dir.path; runtime.owner = getuid(); runtime.configuration_gate = gate;
+    runtime.shutting_down = [] { return true; };
+    VmService vms(runtime);
+    TaskService tasks({}, [] { return TaskService::Clock::now(); }, {}, gate);
+    bool armed = false, injected = false;
+    ConfigurationService configuration(directory.get(), getuid(), gate, vms, tasks,
+        [&](const char* stage, size_t) {
+            if (armed && !injected && fault == stage) {
+                injected = true;
+                throw std::runtime_error("joint import injection");
+            }
+        }, true);
+    auto before = configuration.disks()->snapshot(caller);
+    auto disk_document = before->document;
+    disk_document["extension"] = Json::Int64(9007199254740993LL);
+    configuration.disks()->replace(caller, before->revision, disk_document);
+    auto manifest = fixture_manifest();
+    manifest.vm["name"] = "joint-import";
+    manifest.vm["networks"] = Json::Value(Json::arrayValue);
+    manifest.disks.clear(); manifest.boots.clear(); manifest.networks.clear();
+    manifest.compression = Compression::none;
+    DiskEntry disk;
+    disk.name = disk.archive_path = "disk.img"; disk.format = "RAW"; disk.size = 7;
+    disk.attached = true;
+    manifest.disks.push_back(disk);
+    PackageSpec spec;
+    spec.dest = dir.at("source.vmpkg"); spec.compression = Compression::none;
+    spec.app_version_code = manifest.app_version_code;
+    write_package(spec, manifest_text(manifest), [](TarWriter& tar) { tar.entry("disk.img", "payload"); });
+    LegacyEvents events;
+    PkgContext context;
+    context.vms = &vms; context.networks = &configuration.networks(); context.tasks = &tasks;
+    context.events = &events; context.data_dir = dir.path; context.configuration = &configuration;
+    PkgService packages(context);
+    Json::Value request;
+    request["src_path"] = spec.dest; request["target_dir"] = dir.at("output");
+    armed = true;
+    const auto response = packages.vm_import(caller, request);
+    const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+    const auto deadline = TaskService::Clock::now() + 5s;
+    auto task = tasks.get(caller, ref);
+    while (!task_terminal(task.state) && TaskService::Clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms); task = tasks.get(caller, ref);
+    }
+    check(task_terminal(task.state), "joint import bounded completion");
+    const bool installed = fault != "before_decision";
+    if (fault.empty()) check(task.state == TaskState::succeeded, "joint import succeeds");
+    else {
+        check(task.state == TaskState::failed && task.error ==
+            (installed ? ErrorCode::commit_uncertain : ErrorCode::io_error), "joint import retains failure semantics");
+        configuration.recover(caller);
+    }
+    const auto vm_view = configuration.vms().snapshot(caller);
+    const auto disk_view = configuration.disks()->snapshot(caller);
+    check(vm_view->document["vms"].size() == (installed ? 1u : 0u) &&
+          disk_view->document["disks"].size() == (installed ? 1u : 0u), "both import registries agree");
+    check(disk_view->document["extension"] == disk_document["extension"], "disk root extension retained");
+    check(exists(dir.at("output/joint-import/disk.img")) == installed, "only rejected joint import deletes extracted image");
+    if (installed) {
+        const auto& row = disk_view->document["disks"][0];
+        check(vm_view->document["vms"][0]["disks"][0]["path"] == path_join(row["folder"].asString(), row["name"].asString()),
+              "persisted VM references registered imported image");
+        check(bytes_of(dir.at("output/joint-import/disk.img")) == "payload", "joint import preserves image bytes");
+    }
+    tasks.shutdown();
+}
+
 void persistent_import(const std::string& fault) {
     using namespace std::chrono_literals;
     Temporary dir;
@@ -686,6 +761,10 @@ int main() {
         {"service authorization", service_access},
         {"service queue capacity and cancellation", service_queue_capacity},
         {"persistent import and repeated name", [] { persistent_import(""); }},
+        {"joint import registers VM and disk", [] { joint_import(""); }},
+        {"joint import rejects before decision", [] { joint_import("before_decision"); }},
+        {"joint import retains decided files", [] { joint_import("participant_synced"); }},
+        {"joint import recovers removed decision", [] { joint_import("decision_removed"); }},
         {"import rejects stale planning revision", [] { persistent_import("conflict"); }},
         {"import cleans pre-install failure", [] { persistent_import("before_install"); }},
         {"import retains uncertain commit files", [] { persistent_import("installed"); }},
