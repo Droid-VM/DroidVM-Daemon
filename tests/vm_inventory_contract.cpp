@@ -1583,6 +1583,34 @@ void persistent_inventory_commit() {
     VmConfigService restart(directory.get(), getuid(), {}, [&](const Json::Value& value) { return reopened.prepare_config(value); });
     check(reopened.list(admin).size() == 1 && reopened.exists(admin, other), "startup loads committed inventory through participant");
 }
+void persistent_temporary_vm() {
+    Fixture fixture;
+    Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    VmService inventory(fixture.context);
+    VmConfigService store(directory.get(), getuid(), {}, [&](const Json::Value& document) { return inventory.prepare_config(document); });
+    auto initial = store.snapshot(admin);
+    auto document = initial->document;
+    document["vms"].append(config("persistent"));
+    auto saved = store.replace(admin, initial->revision, document);
+    auto agent = config("agent"); agent["temporary"] = true;
+    const auto id = inventory.create(admin, agent);
+    auto runtime = inventory.runtime(admin, id);
+    check(inventory.exists(admin, id) && store.snapshot(admin)->document == saved->document, "owner admits a temporary VM without persisting it");
+    error(ErrorCode::conflict, [&] { inventory.modify(admin, inventory.get(admin, id)); });
+    auto clash = config("persistent"); clash["temporary"] = true;
+    error(ErrorCode::invalid_argument, [&] { inventory.create(admin, clash); });
+    auto changed = saved->document; changed["vms"][0]["name"] = "renamed";
+    saved = store.replace(admin, saved->revision, changed);
+    check(inventory.runtime(admin, id) == runtime, "configuration update keeps the temporary runtime");
+    auto taken = saved->document; taken["vms"].append(config("agent"));
+    error(ErrorCode::conflict, [&] { store.replace(admin, saved->revision, taken); });
+    check(!runtime->start() && fixture.starts == 1, "temporary VM reaches runtime admission under the owner");
+    check(inventory.remove(admin, id) && !inventory.exists(admin, id), "temporary VM is deleted under the owner");
+    error(ErrorCode::conflict, [&] { inventory.remove(admin, saved->document["vms"][0]["id"].asString()); });
+    VmService reopened(fixture.context);
+    VmConfigService restart(directory.get(), getuid(), {}, [&](const Json::Value& value) { return reopened.prepare_config(value); });
+    check(reopened.list(admin).size() == 1, "temporary VM is not reloaded");
+}
 void persistent_busy_and_unchanged() {
     Fixture fixture;
     Fd directory(open(fixture.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -1774,6 +1802,7 @@ int main() {
         {"lease_abort_move_lifetime", lease_abort_and_lifetime},
         {"sixteen_modify_start_races", modify_races}, {"sixteen_delete_start_races", remove_races},
         {"persistent_inventory_commit", persistent_inventory_commit},
+        {"persistent_temporary_vm", persistent_temporary_vm},
         {"configured_start_binding", configured_start_binding},
         {"configured_start_adapter", configured_start_adapter},
         {"persistent_busy_and_unchanged", persistent_busy_and_unchanged},

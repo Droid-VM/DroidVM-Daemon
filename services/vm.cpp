@@ -131,6 +131,13 @@ public:
         // Unchanged VMs keep their runtime unless their disk family changed.
         leases_.reserve(owner.entries_.size());
         for (const auto& entry : owner.entries_) {
+            if (entry.temporary) {
+                if (definitions.contains(entry.id))
+                    throw ServiceError(ErrorCode::conflict, "VM " + entry.id + " is a temporary VM");
+                if (names.contains(config::member(entry.definition, "name").asString()))
+                    throw ServiceError(ErrorCode::conflict, "VM name is used by a temporary VM");
+                continue;
+            }
             const auto found = definitions.find(entry.id);
             if (found != definitions.end() && *found->second == entry.definition && !disk_affected.contains(entry.id)) continue;
             auto lease = entry.vm->try_edit();
@@ -144,6 +151,7 @@ public:
             if (previous && previous->definition == row && !disk_affected.contains(id)) entries_.push_back(*previous);
             else entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, row, owner.context_), row});
         }
+        for (const auto& entry : owner.entries_) if (entry.temporary) entries_.push_back(entry);
     }
     void commit() noexcept override {
         if (committed_) return;
@@ -222,11 +230,15 @@ std::string VmService::create(const CallContext& caller, Json::Value value) {
     access(caller);
     auto config = config::migrate_vm(std::move(value));
     const auto id = config::uuid(config); // invalid_argument: legacy internal error
+    const bool temporary = config::member(config, "temporary").isBool() && config["temporary"].asBool();
     std::lock_guard lock(mutex_);
-    require_legacy_writer();
+    // A temporary VM never enters the persistent configuration, so the owner
+    // admits it; it disappears with the daemon.
+    if (!temporary) require_legacy_writer();
     for (const auto& entry : entries_) if (entry.id == id) throw ServiceError(ErrorCode::conflict, "VM " + id + " already exists");
     config["id"] = id;
     add(id, std::move(config));
+    entries_.back().temporary = temporary && config_managed_;
     return id;
 }
 std::string VmService::modify(const CallContext& caller, Json::Value value) {
@@ -256,8 +268,8 @@ bool VmService::remove(const CallContext& caller, const std::string& id) {
     std::shared_ptr<vm::VmRuntime> target;
     {
         std::lock_guard lock(mutex_);
-        require_legacy_writer();
         const auto* entry = find(id);
+        if (!entry || !entry->temporary) require_legacy_writer();
         if (!entry) return false;
         target = entry->vm;
     }

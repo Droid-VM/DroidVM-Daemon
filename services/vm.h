@@ -69,7 +69,9 @@ public:
     const std::string& load_error() const { return load_error_; }
 private:
     friend class ConfigurationService;
-    struct Entry { std::string id; std::shared_ptr<vm::VmRuntime> vm; Json::Value definition; };
+    // temporary: an Agent VM ("temporary": true) kept in memory only, outside
+    // the persistent configuration; it survives configuration updates.
+    struct Entry { std::string id; std::shared_ptr<vm::VmRuntime> vm; Json::Value definition; bool temporary = false; };
     class ConfigUpdate;
     vm::RuntimeContext context_;
     mutable std::mutex mutex_;
