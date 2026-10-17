@@ -1143,7 +1143,8 @@ struct DiskOps {
             put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
                 "echo \"$@\" >> " + dir.at("tool.log") + "\n"
                 "case \"$1\" in\n"
-                "info) printf '%s' '{\"format\":\"raw\"}' ;;\n"
+                "info) real=$(readlink \"$3\"); if [ -e \"$real.backing\" ]; then printf '{\"format\":\"qcow2\",\"backing-filename\":\"%s\"}' \"$(cat \"$real.backing\")\"; else printf '%s' '{\"format\":\"raw\"}'; fi ;;\n"
+                "commit|rebase) [ -e " + dir.at("fail") + " ] && exit 3; exit 0 ;;\n"
                 "convert) [ -e " + dir.at("slow") + " ] && sleep 30; [ -e " + dir.at("fail") + " ] && exit 3\n"
                 "  eval \"out=\\${$#}\"; printf converted > \"$out\" ;;\n"
                 "create) [ -e " + dir.at("fail") + " ] && exit 3; eval \"out=\\${$(($# - 1))}\"; printf created > \"$out\" ;;\n"
@@ -1184,8 +1185,32 @@ struct DiskOps {
         row["id"] = random_id(true); row["name"] = name; row["folder"] = dir.path;
         if (parent) row["parent"] = *parent;
         document["disks"].append(row);
-        configuration->disks()->replace(caller, before->revision, document);
+        // Joint commit: families referenced by VMs reject registry-only edits.
+        const auto vms = configuration->vms().snapshot(caller);
+        configuration->replace_vm_disks(caller, vms->revision, before->revision, vms->document, document);
         return row["id"].asString();
+    }
+    // One VM per entry: {name, [[path, readonly]...]}.
+    void set_vms(const std::vector<std::pair<std::string, std::vector<std::pair<std::string, bool>>>>& entries) {
+        const auto vms = configuration->vms().snapshot(caller);
+        const auto disks = configuration->disks()->snapshot(caller);
+        auto document = vms->document;
+        document["vms"] = Json::Value(Json::arrayValue);
+        for (const auto& [name, slots] : entries) {
+            Json::Value vm;
+            vm["id"] = random_id(true); vm["name"] = name;
+            vm["disks"] = Json::Value(Json::arrayValue);
+            for (const auto& [path, readonly] : slots) {
+                Json::Value slot; slot["path"] = path; slot["readonly"] = readonly; slot["bus"] = "virtio";
+                vm["disks"].append(slot);
+            }
+            document["vms"].append(vm);
+        }
+        configuration->replace_vm_disks(caller, vms->revision, disks->revision, document, disks->document);
+    }
+    Json::Value slots(const std::string& name) {
+        for (const auto& vm : configuration->vms().snapshot(caller)->document["vms"]) if (vm["name"] == name) return vm["disks"];
+        return Json::Value();
     }
     Json::Value row(const std::string& id) {
         for (const auto& row : configuration->disks()->snapshot(caller)->document["disks"]) if (row["id"] == id) return row;
@@ -1414,6 +1439,95 @@ void disk_operation_create() {
     check(task.state == TaskState::failed && !exists(ops.dir.at("failed.img")) && temporaries(ops.dir.path) == 0
         && ops.operations->pending() == 0, "tool failure leaves nothing behind");
 }
+void disk_slot_reattachment() {
+    const auto b = random_id(true), o = random_id(true), c = random_id(true), x = random_id(true);
+    auto row = [](const std::string& id, const std::string& name, const std::string& parent = {}) {
+        Json::Value value; value["id"] = id; value["name"] = name; value["folder"] = "/d";
+        if (!parent.empty()) value["parent"] = parent;
+        return value;
+    };
+    Json::Value before; before["disks"].append(row(b, "b")); before["disks"].append(row(o, "o", b));
+    before["disks"].append(row(c, "c", o)); before["disks"].append(row(x, "x"));
+    auto slot = [](const std::string& path, bool readonly) {
+        Json::Value value; value["path"] = path; value["readonly"] = readonly; value["bus"] = "virtio"; return value;
+    };
+    Json::Value vms;
+    for (const auto& [name, path] : std::vector<std::pair<std::string, std::string>>{{"v1", "/d/o"}, {"v2", "/d/c"}, {"v3", "/d/x"}}) {
+        Json::Value vm; vm["name"] = name; vm["disks"].append(slot(path, false)); vms["vms"].append(vm);
+    }
+    Json::Value merged; merged["disks"].append(row(b, "b")); merged["disks"].append(row(c, "c", b)); merged["disks"].append(row(x, "x"));
+    auto after = config::reattach_disk_slots(vms, before, merged);
+    check(after["vms"][0]["disks"][0] == slot("/d/b", true) && after["vms"][1]["disks"][0] == slot("/d/c", false)
+        && after["vms"][2]["disks"][0] == slot("/d/x", false), "merge moves overlay slot to its base read-only");
+    Json::Value pruned; pruned["disks"].append(row(b, "b")); pruned["disks"].append(row(x, "x"));
+    after = config::reattach_disk_slots(vms, before, pruned);
+    check(after["vms"][0]["disks"][0] == slot("/d/b", true) && after["vms"][1]["disks"][0] == slot("/d/b", true),
+        "subtree delete climbs to the surviving base and shares it read-only");
+    Json::Value lone; lone["disks"].append(row(b, "b")); lone["disks"].append(row(o, "o", b)); lone["disks"].append(row(c, "c", o));
+    after = config::reattach_disk_slots(vms, before, lone);
+    check(after["vms"][2]["disks"].size() == 0 && after["vms"][0]["disks"][0] == slot("/d/o", false),
+        "slot without surviving ancestor is removed; unrelated families stay");
+}
+void disk_operation_tree() {
+    DiskOps ops;
+    put(ops.dir.at("b.img"), "base"); put(ops.dir.at("o.qcow2"), "overlay"); put(ops.dir.at("c.qcow2"), "child");
+    put(ops.dir.at("o.qcow2.backing"), ops.dir.at("b.img")); put(ops.dir.at("c.qcow2.backing"), ops.dir.at("o.qcow2"));
+    const auto b = ops.add("b.img"), o = ops.add("o.qcow2", b), c = ops.add("c.qcow2", o);
+    ops.set_vms({{"merge", {{ops.dir.at("o.qcow2"), true}}}, {"leaf", {{ops.dir.at("c.qcow2"), true}}}});
+    {
+        auto reader = ops.configuration->disk_files()->acquire({{ops.dir.at("c.qcow2"), false}});
+        check(start_error(ops, ops.request(o, "commit")) == ErrorCode::conflict, "running overlay child blocks merge");
+    }
+    check(start_error(ops, ops.request(b, "commit")) == ErrorCode::conflict, "standalone disk cannot merge");
+    auto task = ops.run(ops.request(o, "commit"));
+    const auto log = bytes_of(ops.dir.at("tool.log"));
+    check(task.state == TaskState::succeeded && !exists(ops.dir.at("o.qcow2")) && ops.row(o).isNull()
+        && ops.row(c)["parent"] == b && ops.slots("merge")[0]["path"] == ops.dir.at("b.img")
+        && ops.slots("merge")[0]["readonly"] == true && ops.slots("leaf")[0]["path"] == ops.dir.at("c.qcow2"),
+        "merge relinks children, moves slots and removes the overlay");
+    check(log.find("commit -d json:") != std::string::npos
+        && log.find("rebase -u -b " + ops.dir.at("b.img") + " -F raw /proc/self/fd/") != std::string::npos, "merge commands");
+    put(ops.dir.at("c.qcow2.backing"), ops.dir.at("b.img"));
+    // Two overlays on one parent: merging either would change the other's view.
+    put(ops.dir.at("d.qcow2"), "sibling"); put(ops.dir.at("d.qcow2.backing"), ops.dir.at("b.img"));
+    const auto d = ops.add("d.qcow2", b);
+    check(start_error(ops, ops.request(c, "commit")) == ErrorCode::conflict, "parent with siblings cannot take a merge");
+    // Crash after children were relinked: recovery completes registry and unlink.
+    auto del = ops.request(d, "delete"); del["delete_files"] = true;
+    task = ops.run(del);
+    check(task.state == TaskState::succeeded && !exists(ops.dir.at("d.qcow2")) && ops.row(d).isNull(), "delete removes leaf and file");
+    put(ops.dir.at("e.qcow2"), "grandchild"); put(ops.dir.at("e.qcow2.backing"), ops.dir.at("c.qcow2"));
+    const auto e = ops.add("e.qcow2", c);
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "rebased") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(c, "commit"));
+    check(task.state == TaskState::failed && ops.operations->pending() == 1 && ops.row(c).isObject(), "merge crash after relink keeps record");
+    ops.fault = {};
+    ops.restart();
+    check(ops.operations->pending() == 0 && ops.row(c).isNull() && ops.row(e)["parent"] == b && !exists(ops.dir.at("c.qcow2"))
+        && ops.slots("leaf")[0]["path"] == ops.dir.at("b.img") && ops.slots("leaf")[0]["readonly"] == true,
+        "recovery finishes an interrupted merge");
+    put(ops.dir.at("e.qcow2.backing"), ops.dir.at("b.img"));
+    // Crash while the parent is being written: nothing relinked, overlay kept.
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "committed") throw std::runtime_error("crash"); };
+    task = ops.run(ops.request(e, "commit"));
+    ops.fault = {};
+    ops.restart();
+    check(ops.operations->pending() == 0 && ops.row(e)["parent"] == b && exists(ops.dir.at("e.qcow2")), "interrupted copy keeps overlay");
+    // Registry-only delete keeps files; subtree delete with files after a crash.
+    task = ops.run(ops.request(e, "delete"));
+    check(task.state == TaskState::succeeded && ops.row(e).isNull() && exists(ops.dir.at("e.qcow2")), "registry-only delete keeps file");
+    put(ops.dir.at("f.qcow2"), "f"); put(ops.dir.at("f.qcow2.backing"), ops.dir.at("b.img"));
+    const auto f = ops.add("f.qcow2", b);
+    del = ops.request(b, "delete"); del["delete_files"] = true;
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "registered") throw std::runtime_error("crash"); };
+    task = ops.run(del);
+    check(task.state == TaskState::failed && ops.row(b).isNull() && ops.row(f).isNull() && exists(ops.dir.at("f.qcow2")),
+        "delete crash after registry keeps files journaled");
+    ops.fault = {};
+    ops.restart();
+    check(ops.operations->pending() == 0 && !exists(ops.dir.at("b.img")) && !exists(ops.dir.at("f.qcow2"))
+        && ops.slots("leaf").size() == 0 && ops.slots("merge").size() == 0, "recovery deletes the subtree files and slots");
+}
 Json::Value real_info(const std::string& tool, const std::string& path) {
     ChildOptions options;
     options.argv = {tool, "info", "--output=json", path};
@@ -1472,6 +1586,28 @@ void real_disk_operations(const std::string& tool) {
         "replay completes flatten registry update");
     check(rename(ops.dir.at("base.raw").c_str(), ops.dir.at("base.moved").c_str()) == 0, "move former base");
     check(real_head(tool, ops.dir.at("ov.qcow2"), ops.dir.at("view2.raw")) == "BASEDATA", "flattened image is standalone");
+    // Merge a real overlay holding its own bytes, then delete the family with files.
+    std::string upper(1u << 20, '\0'), lower(1u << 20, '\0');
+    upper.replace(0, 8, "OVERDATA"); lower.replace(0, 8, "BASE2DAT");
+    put(ops.dir.at("upper.raw"), upper); put(ops.dir.at("base2.raw"), lower);
+    ChildOptions diff;
+    diff.argv = {tool, "convert", "-O", "qcow2", "-B", ops.dir.at("base2.raw"), "-F", "raw", ops.dir.at("upper.raw"), ops.dir.at("ov2.qcow2")};
+    check(Child(diff).communicate({}, std::chrono::seconds(30)).exit_code == 0, "create real differencing overlay");
+    ChildOptions grand;
+    grand.argv = {tool, "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", ops.dir.at("ov2.qcow2"), ops.dir.at("child2.qcow2")};
+    check(Child(grand).communicate({}, std::chrono::seconds(10)).exit_code == 0, "create real grandchild");
+    const auto base2 = ops.add("base2.raw"), ov2 = ops.add("ov2.qcow2", base2), child2 = ops.add("child2.qcow2", ov2);
+    task = ops.run(ops.request(ov2, "commit"));
+    info = real_info(tool, ops.dir.at("child2.qcow2"));
+    check(task.state == TaskState::succeeded && bytes_of(ops.dir.at("base2.raw")).substr(0, 8) == "OVERDATA"
+        && info["backing-filename"] == ops.dir.at("base2.raw") && info["backing-filename-format"] == "raw"
+        && real_head(tool, ops.dir.at("child2.qcow2"), ops.dir.at("view5.raw")) == "OVERDATA"
+        && !exists(ops.dir.at("ov2.qcow2")) && ops.row(ov2).isNull() && ops.row(child2)["parent"] == base2,
+        "real merge writes the overlay into its base and relinks the child");
+    auto remove = ops.request(base2, "delete"); remove["delete_files"] = true;
+    task = ops.run(remove);
+    check(task.state == TaskState::succeeded && !exists(ops.dir.at("base2.raw")) && !exists(ops.dir.at("child2.qcow2"))
+        && ops.row(base2).isNull() && ops.row(child2).isNull() && ops.operations->pending() == 0, "real subtree delete");
 }
 }
 
@@ -1505,7 +1641,8 @@ int main(int argc, char** argv) {
         {"leased image external data rejected", [] { leased_image_inspection("external-data"); }},
         {"leased image replacement", [] { leased_image_inspection("replacement"); }},
         {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal},
-        {"disk operation create and clone", disk_operation_create}};
+        {"disk operation create and clone", disk_operation_create}, {"disk slot reattachment", disk_slot_reattachment},
+        {"disk operation merge and delete", disk_operation_tree}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
         tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};

@@ -245,7 +245,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                 if (command == "disk_operation_recover") throw ServiceError(ErrorCode::invalid_argument, "Unexpected disk operation field");
                 if (key != "disk_revision" && key != "disk_id" && key != "action" && key != "size" && key != "shrink"
                         && key != "format" && key != "compress" && key != "preallocate" && key != "folder" && key != "name"
-                        && key != "backing_id")
+                        && key != "backing_id" && key != "delete_files")
                     throw ServiceError(ErrorCode::invalid_argument, "Unexpected disk operation field");
                 body[key] = request[key];
             }
@@ -814,7 +814,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 result["commands"].append("disk_operation_recover");
                 result["disk_operations"] = "revisioned-tasks-v1";
                 result["disk_operation_actions"] = Json::Value(Json::arrayValue);
-                for (const auto* action : {"resize", "convert", "flatten", "create", "clone"}) result["disk_operation_actions"].append(action);
+                for (const auto* action : {"resize", "convert", "flatten", "create", "clone", "commit", "delete"}) result["disk_operation_actions"].append(action);
                 result["service_api_minor"] = 25;
             }
         }

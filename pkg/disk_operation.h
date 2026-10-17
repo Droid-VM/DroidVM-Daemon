@@ -61,5 +61,7 @@ private:
     void replay();
     bool replay_one(const Json::Value& record);
     bool replay_new(int directory, const Json::Value& record);
+    bool replay_merge(const Json::Value& record);
+    bool replay_delete(const Json::Value& record);
 };
 }

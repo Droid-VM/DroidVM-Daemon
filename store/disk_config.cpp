@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "disk_config.h"
 #include "network_config.h"
+#include <algorithm>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -214,5 +216,59 @@ std::set<std::string> affected_disk_paths(const Json::Value& before, const Json:
         for (const auto& related : adjacent[id]) if (changed.insert(related).second) queue.push_back(related);
     }
     return paths;
+}
+Json::Value reattach_disk_slots(const Json::Value& vms, const Json::Value& before, const Json::Value& after) {
+    const auto old = inspect(before), next = inspect(after);
+    std::map<std::string, std::string> old_ids, new_ids, new_paths;
+    for (const auto& [id, row] : old.rows) old_ids.emplace(disk_path(row), id);
+    for (const auto& [id, row] : next.rows) { new_paths.emplace(id, disk_path(row)); new_ids.emplace(disk_path(row), id); }
+    std::set<std::string> bases;
+    for (const auto& [id, parent] : next.parents) bases.insert(parent);
+    const auto family = affected_disk_paths(before, after);
+    struct Move { Json::ArrayIndex vm, slot; std::optional<std::string> target; };
+    std::vector<Move> moves;
+    std::map<std::string, size_t> holders;
+    Json::Value result = vms;
+    auto& rows = result["vms"];
+    for (Json::ArrayIndex v = 0; rows.isArray() && v < rows.size(); ++v) {
+        const auto& slots = member(rows[v], "disks");
+        if (!slots.isArray()) continue;
+        for (Json::ArrayIndex s = 0; s < slots.size(); ++s) {
+            const auto& value = member(slots[s], "path");
+            if (!value.isString() || value.asString().empty()) continue;
+            const auto& path = value.asString();
+            const auto node = old_ids.find(path);
+            if (!family.contains(path) || node == old_ids.end()) {
+                if (const auto kept = new_ids.find(path); kept != new_ids.end()) ++holders[kept->second];
+                continue;
+            }
+            // Removed rows climb the OLD chain to the nearest survivor (merge: the
+            // base; subtree delete: the parent) or lose the slot.
+            std::optional<std::string> target;
+            std::set<std::string> seen;
+            for (auto id = std::optional<std::string>(node->second); id && seen.insert(*id).second;) {
+                if (next.rows.contains(*id)) { target = *id; break; }
+                const auto parent = old.parents.find(*id);
+                id = parent == old.parents.end() ? std::nullopt : std::optional<std::string>(parent->second);
+            }
+            if (target) ++holders[*target];
+            moves.push_back({v, s, target});
+        }
+    }
+    // Highest slot first so removals never shift a slot still to be visited.
+    std::stable_sort(moves.begin(), moves.end(), [](const Move& a, const Move& b) { return a.vm == b.vm ? a.slot > b.slot : a.vm < b.vm; });
+    for (const auto& move : moves) {
+        auto& slots = rows[move.vm]["disks"];
+        if (!move.target) {
+            Json::Value removed;
+            slots.removeIndex(move.slot, &removed);
+            continue;
+        }
+        auto& slot = slots[move.slot];
+        slot["path"] = new_paths.at(*move.target);
+        // Forcing only ever adds read-only; it never removes it.
+        if (bases.contains(*move.target) || holders[*move.target] >= 2) slot["readonly"] = true;
+    }
+    return result;
 }
 }

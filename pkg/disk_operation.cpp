@@ -9,6 +9,7 @@
 #include "store/disk_config.h"
 #include "store/network_config.h"
 #include "build_metadata.h"
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <map>
@@ -74,6 +75,67 @@ std::optional<Identity> record_identity(const Json::Value& record) {
     if (!record["device"].isUInt64() || !record["inode"].isUInt64()) return std::nullopt;
     return Identity{static_cast<dev_t>(record["device"].asUInt64()), static_cast<ino_t>(record["inode"].asUInt64())};
 }
+Identity identity_of(int fd) {
+    struct stat info{};
+    if (fstat(fd, &info) != 0) throw ServiceError(ErrorCode::io_error, errno_message("inspect leased disk", errno));
+    return {info.st_dev, info.st_ino};
+}
+void put_identity(Json::Value& target, const Identity& identity) {
+    target["device"] = Json::UInt64(identity.device); target["inode"] = Json::UInt64(identity.inode);
+}
+// Unlinks only the journaled inode; another file at the name is left alone.
+bool unlink_exact(const std::string& path, const std::optional<Identity>& expected) {
+    if (!expected) return false;
+    const auto directory = open_directory(dirname(path));
+    struct stat current{};
+    if (fstatat(directory.get(), file_name(path).c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return true;
+        throw ServiceError(ErrorCode::io_error, errno_message("inspect disk image", errno));
+    }
+    if (!S_ISREG(current.st_mode) || current.st_dev != expected->device || current.st_ino != expected->inode) return false;
+    if (unlinkat(directory.get(), file_name(path).c_str(), 0) != 0 && errno != ENOENT)
+        throw ServiceError(ErrorCode::io_error, errno_message("remove disk image", errno));
+    sync_or_throw(directory.get(), "sync disk directory");
+    return true;
+}
+// Header-only relink (-u never opens the old backing); the image is reached
+// through its retained descriptor, the stored backing name stays durable.
+void rebase_header(const std::string& tool, int fd, const std::string& backing, const std::string& format) {
+    ChildOptions options;
+    options.argv = {tool, "rebase", "-u", "-b", backing, "-F", format, descriptor(fd)};
+    options.preserve_fds = {fd};
+    const auto result = Child(options).communicate({}, std::chrono::minutes(2), 1u << 20);
+    if (result.exit_code != 0 || result.timed_out || result.truncated)
+        throw ServiceError(ErrorCode::io_error, "qemu-img rebase failed with " + std::to_string(result.exit_code));
+    sync_or_throw(fd, "sync rebased disk");
+}
+std::set<std::string> registered_ids(const Json::Value& disks) {
+    std::set<std::string> ids;
+    for (const auto& row : disks["disks"]) try { ids.insert(row_id(row["id"])); } catch (const ServiceError&) {}
+    return ids;
+}
+// Registry and slot rewrite shared by the live operation and its recovery.
+Json::Value merged_disks(Json::Value disks, const std::string& overlay, const std::string& parent) {
+    Json::Value rows(Json::arrayValue);
+    for (auto& row : disks["disks"]) {
+        try {
+            if (row_id(row["id"]) == overlay) continue;
+            if (parent_id(row) == overlay) row["parent"] = parent;
+        } catch (const ServiceError&) {}
+        rows.append(row);
+    }
+    disks["disks"] = std::move(rows);
+    return disks;
+}
+Json::Value removed_disks(Json::Value disks, const std::set<std::string>& ids) {
+    Json::Value rows(Json::arrayValue);
+    for (const auto& row : disks["disks"]) {
+        try { if (ids.contains(row_id(row["id"]))) continue; } catch (const ServiceError&) {}
+        rows.append(row);
+    }
+    disks["disks"] = std::move(rows);
+    return disks;
+}
 }
 
 class DiskOperationService::Operation {
@@ -99,7 +161,13 @@ private:
     // In place: operated image first. create: the backing chain. clone: the
     // source chain. Ancestors always follow their child.
     std::vector<Member> chain_;
+    // commit: overlays of the merged image. delete: the removed subtree, leaves last.
+    std::vector<Member> related_;
+    bool delete_files_ = false;
     std::string target() const { return fresh_ ? path_join(folder_, name_) : chain_.front().path; }
+    TaskCompletion merge(TaskControl& control);
+    TaskCompletion remove(TaskControl& control);
+    void admit_tree(const Json::Value& request, const std::string& revision);
     void load_chain(const std::map<std::string, Json::Value>& rows, const std::set<std::string>& valid, const std::string& start);
     std::vector<std::string> command(int output) const;
     void register_new();
@@ -122,8 +190,13 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     if (!revision.isString() || revision.asString().empty() || revision.asString().size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Disk revision is required");
     action_ = request["action"].isString() ? request["action"].asString() : "";
-    if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone")
+    if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone"
+            && action_ != "commit" && action_ != "delete")
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
+    if (action_ == "commit" || action_ == "delete") {
+        admit_tree(request, revision.asString());
+        return;
+    }
     fresh_ = action_ == "create" || action_ == "clone";
     if (fresh_) {
         const auto& folder = request["folder"];
@@ -254,6 +327,98 @@ void DiskOperationService::Operation::load_chain(const std::map<std::string, Jso
         id = parent_id(found->second);
     }
 }
+void DiskOperationService::Operation::admit_tree(const Json::Value& request, const std::string& revision) {
+    disk_id_ = row_id(request["disk_id"]);
+    if (action_ == "delete") {
+        if (request.isMember("delete_files") && !request["delete_files"].isBool())
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid delete_files option");
+        delete_files_ = request["delete_files"].isBool() && request["delete_files"].asBool();
+    }
+    auto* configuration = owner_.context_.configuration;
+    const auto snapshot = configuration->disks()->snapshot(internal);
+    if (snapshot->revision != revision)
+        throw ServiceError(ErrorCode::conflict, "Disk configuration changed; reload before starting the operation");
+    const auto valid = config::valid_disk_paths(snapshot->document);
+    std::map<std::string, Json::Value> rows;
+    std::map<std::string, std::vector<std::string>> children;
+    for (const auto& row : snapshot->document["disks"]) {
+        try {
+            const auto id = row_id(row["id"]);
+            rows.emplace(id, row);
+            if (const auto parent = parent_id(row)) children[*parent].push_back(id);
+        } catch (const ServiceError&) {}
+    }
+    load_chain(rows, valid, disk_id_);
+    std::set<std::string> exclusive{disk_id_}, shared;
+    std::vector<config::DiskFileLeases::Request> files;
+    if (action_ == "commit") {
+        if (chain_.size() < 2) throw ServiceError(ErrorCode::conflict, "Disk is not an overlay");
+        if (children[chain_[1].id] != std::vector<std::string>{disk_id_})
+            throw ServiceError(ErrorCode::conflict, "The parent disk has other overlays; their content would change");
+        exclusive.insert(chain_[1].id);
+        for (const auto& id : children[disk_id_]) {
+            const auto path = config::disk_path(rows.at(id));
+            if (!valid.contains(path)) throw ServiceError(ErrorCode::conflict, "Disk registry entry is invalid; repair it first");
+            related_.push_back({id, path, {}, chain_.front().path});
+            exclusive.insert(id);
+        }
+        for (size_t i = 2; i < chain_.size(); ++i) shared.insert(chain_[i].id);
+        for (size_t i = 0; i < chain_.size(); ++i) files.push_back({chain_[i].path, i < 2});
+        for (const auto& child : related_) files.push_back({child.path, true});
+    } else {
+        // Breadth first from the deleted disk; removal runs leaves first.
+        related_.push_back(chain_.front());
+        for (size_t i = 0; i < related_.size(); ++i) {
+            if (related_.size() > 4096) throw ServiceError(ErrorCode::conflict, "Disk subtree is too large");
+            for (const auto& id : children[related_[i].id]) {
+                if (!exclusive.insert(id).second) throw ServiceError(ErrorCode::conflict, "Disk parent chain is invalid");
+                related_.push_back({id, config::disk_path(rows.at(id)), {}, related_[i].path});
+            }
+        }
+        chain_.resize(1);
+        if (delete_files_) {
+            // Files that are already gone need no lease; Java's rm -f ignored them too.
+            struct stat info{};
+            for (const auto& member : related_)
+                if (lstat(member.path.c_str(), &info) == 0) files.push_back({member.path, true});
+                else if (errno != ENOENT) throw ServiceError(ErrorCode::io_error, errno_message("inspect disk image", errno));
+        }
+    }
+    {
+        std::lock_guard lock(owner_.journal_mutex_);
+        for (const auto& record : owner_.records_)
+            if (exclusive.contains(record["disk_id"].asString()))
+                throw ServiceError(ErrorCode::unavailable, "An interrupted operation on this disk must be recovered first");
+    }
+    reservation_ = configuration->reserve_disks(revision, exclusive, shared);
+    if (!files.empty()) lease_ = configuration->disk_files()->acquire(files);
+    if (action_ == "delete") {
+        if (!lease_) return;
+        // A surviving entry aliasing a deleted inode would lose its image.
+        std::set<std::pair<dev_t, ino_t>> doomed;
+        for (const auto& file : files) {
+            const auto identity = identity_of(lease_->read_fd(file.path));
+            doomed.insert({identity.device, identity.inode});
+        }
+        struct stat info{};
+        for (const auto& [id, row] : rows)
+            if (!exclusive.contains(id) && stat(config::disk_path(row).c_str(), &info) == 0 && doomed.contains({info.st_dev, info.st_ino}))
+                throw ServiceError(ErrorCode::conflict, "Another disk entry still uses an image selected for deletion");
+        return;
+    }
+    const auto stopping = owner_.stopping_;
+    const Images images(tool(), [stopping] { return stopping->load(); }, std::chrono::seconds(10));
+    auto inspect = [&](Member& member) {
+        try { member.format = images.validate_backing(*lease_, member.path, member.parent).format; }
+        catch (const ServiceError&) { throw; }
+        catch (const std::exception& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
+        if (member.format != "qcow2" && member.format != "raw")
+            throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 and raw images are supported");
+    };
+    for (auto& member : chain_) inspect(member);
+    for (auto& child : related_) inspect(child);
+    if (chain_.front().format != "qcow2") throw ServiceError(ErrorCode::conflict, "Registered overlay is not a qcow2 image");
+}
 std::vector<std::string> DiskOperationService::Operation::command(int output) const {
     std::string settings;
     if (preallocate_) settings = "preallocation=falloc";
@@ -293,6 +458,8 @@ TaskCompletion DiskOperationService::Operation::run(TaskControl& control) {
     try {
         if (owner_.stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
         if (lease_) lease_->verify();
+        if (action_ == "commit") return merge(control);
+        if (action_ == "delete") return remove(control);
         return action_ == "resize" ? resize(control) : rewrite(control);
     } catch (const Abandoned& error) {
         return TaskCompletion::failure(ErrorCode::internal, error.what());
@@ -435,6 +602,114 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     owner_.drop_record(id_);
     return TaskCompletion::success(result());
 }
+// qemu-img commit writes the overlay's clusters into its parent in place. The
+// overlay keeps them (-d), so its view stays exact if this is interrupted;
+// once the copy completes the journal only ever moves forward.
+TaskCompletion DiskOperationService::Operation::merge(TaskControl& control) {
+    if (!control.enter_commit()) return TaskCompletion::cancelled();
+    const auto& overlay = chain_[0];
+    const auto& parent = chain_[1];
+    Json::Value record;
+    record["id"] = id_; record["action"] = action_; record["disk_id"] = disk_id_; record["path"] = overlay.path;
+    record["parent_id"] = parent.id; record["parent_path"] = parent.path; record["parent_format"] = parent.format;
+    put_identity(record, identity_of(lease_->read_fd(overlay.path)));
+    auto& children = record["children"] = Json::Value(Json::arrayValue);
+    for (const auto& child : related_) {
+        Json::Value item; item["id"] = child.id; item["path"] = child.path;
+        children.append(std::move(item));
+    }
+    record["phase"] = "committing";
+    owner_.put_record(record);
+    try {
+        control.progress({"commit", "", 0, {}});
+        const auto top = lease_->open_file(overlay.path, true), base = lease_->open_file(parent.path, true);
+        auto node = graph(0);
+        node["file"]["filename"] = descriptor(top.get());
+        node["backing"]["file"]["filename"] = descriptor(base.get());
+        ChildOptions options;
+        options.argv = {tool(), "commit", "-d", "json:" + wire::stringify(node)};
+        options.preserve_fds = {top.get(), base.get()};
+        for (size_t i = 2; i < chain_.size(); ++i) options.preserve_fds.push_back(lease_->read_fd(chain_[i].path));
+        const auto result = Child(options).communicate({}, std::chrono::hours(24), 1u << 20);
+        if (result.exit_code != 0 || result.timed_out || result.truncated)
+            throw ServiceError(ErrorCode::io_error, "qemu-img commit failed with " + std::to_string(result.exit_code));
+        sync_or_throw(base.get(), "sync merged parent disk");
+        lease_->verify();
+        fault("committed");
+    } catch (const Abandoned&) {
+        throw;
+    } catch (...) {
+        // Registry and children are untouched; the overlay still shows its full view.
+        owner_.drop_record(id_);
+        throw;
+    }
+    record["phase"] = "rebasing";
+    owner_.put_record(record);
+    control.progress({"relink", "", 0, {}});
+    for (const auto& child : related_) {
+        const auto io = lease_->open_file(child.path, true);
+        rebase_header(tool(), io.get(), parent.path, parent.format);
+    }
+    fault("rebased");
+    record["phase"] = "registering";
+    owner_.put_record(record);
+    auto& configuration = *owner_.context_.configuration;
+    const auto vms = configuration.vms().snapshot(internal);
+    const auto disks = configuration.disks()->snapshot(internal);
+    auto merged = merged_disks(disks->document, disk_id_, parent.id);
+    configuration.replace_vm_disks(internal, vms->revision, disks->revision,
+        config::reattach_disk_slots(vms->document, disks->document, merged), std::move(merged), reservation_);
+    fault("registered");
+    record["phase"] = "unlinking";
+    owner_.put_record(record);
+    if (!unlink_exact(overlay.path, record_identity(record)))
+        owner_.context_.log("WARN", "DiskOperation: merged overlay " + overlay.path + " changed; left in place");
+    owner_.drop_record(id_);
+    return TaskCompletion::success(result());
+}
+// Registry first (slots move to the nearest surviving base or are removed),
+// then the image files, leaves first, each only if still the admitted inode.
+TaskCompletion DiskOperationService::Operation::remove(TaskControl& control) {
+    if (!control.enter_commit()) return TaskCompletion::cancelled();
+    Json::Value record;
+    record["id"] = id_; record["action"] = action_; record["disk_id"] = disk_id_; record["path"] = chain_.front().path;
+    record["delete_files"] = delete_files_;
+    auto& members = record["subtree"] = Json::Value(Json::arrayValue);
+    std::set<std::string> ids;
+    for (const auto& member : related_) {
+        Json::Value item; item["id"] = member.id; item["path"] = member.path;
+        struct stat info{};
+        if (lease_ && lstat(member.path.c_str(), &info) == 0) put_identity(item, identity_of(lease_->read_fd(member.path)));
+        members.append(std::move(item));
+        ids.insert(member.id);
+    }
+    record["phase"] = "registering";
+    owner_.put_record(record);
+    auto& configuration = *owner_.context_.configuration;
+    const auto vms = configuration.vms().snapshot(internal);
+    const auto disks = configuration.disks()->snapshot(internal);
+    auto removed = removed_disks(disks->document, ids);
+    try {
+        configuration.replace_vm_disks(internal, vms->revision, disks->revision,
+            config::reattach_disk_slots(vms->document, disks->document, removed), std::move(removed), reservation_);
+    } catch (const ServiceError& error) {
+        if (error.code() == ErrorCode::commit_uncertain || error.code() == ErrorCode::internal) throw;
+        owner_.drop_record(id_); // Definitely rejected: nothing changed.
+        throw;
+    }
+    fault("registered");
+    if (delete_files_) {
+        record["phase"] = "unlinking";
+        owner_.put_record(record);
+        for (auto index = members.size(); index-- > 0;) {
+            const auto& member = members[index];
+            if (record_identity(member) && !unlink_exact(member["path"].asString(), record_identity(member)))
+                owner_.context_.log("WARN", "DiskOperation: deleted disk file " + member["path"].asString() + " changed; left in place");
+        }
+    }
+    owner_.drop_record(id_);
+    return TaskCompletion::success(result());
+}
 void DiskOperationService::Operation::register_new() {
     auto& configuration = *owner_.context_.configuration;
     const auto vms = configuration.vms().snapshot(internal);
@@ -524,7 +799,80 @@ void DiskOperationService::drop_record(const std::string& id) {
     }
     records_ = std::move(next);
 }
+bool DiskOperationService::replay_merge(const Json::Value& record) {
+    const auto phase = record["phase"].asString();
+    if (phase == "committing") {
+        // Nothing was relinked: the overlay still shows its complete view.
+        context_.log("WARN", "DiskOperation: merge of " + record["path"].asString() + " was interrupted; overlay kept");
+        return true;
+    }
+    auto& configuration = *context_.configuration;
+    const auto overlay = record["disk_id"].asString(), parent = record["parent_id"].asString();
+    const auto parent_path = record["parent_path"].asString(), parent_format = record["parent_format"].asString();
+    if (overlay.empty() || parent.empty() || parent_path.empty() || (parent_format != "qcow2" && parent_format != "raw"))
+        throw std::runtime_error("Malformed disk merge record");
+    std::set<std::string> exclusive{overlay, parent};
+    for (const auto& child : record["children"]) exclusive.insert(child["id"].asString());
+    if (phase == "rebasing") {
+        std::vector<config::DiskFileLeases::Request> files;
+        for (const auto& child : record["children"]) files.push_back({child["path"].asString(), true});
+        if (!files.empty()) {
+            const auto lease = configuration.disk_files()->acquire(files);
+            const auto tool = path_join(data_root(context_), "usr/bin/qemu-img");
+            for (const auto& file : files) {
+                const auto io = lease->open_file(file.path, true);
+                rebase_header(tool, io.get(), parent_path, parent_format);
+            }
+        }
+    }
+    if (phase == "rebasing" || phase == "registering") {
+        const auto disks = configuration.disks()->snapshot(internal);
+        if (registered_ids(disks->document).contains(overlay)) {
+            const auto reservation = configuration.reserve_disks(disks->revision, exclusive, {});
+            const auto vms = configuration.vms().snapshot(internal);
+            auto merged = merged_disks(disks->document, overlay, parent);
+            configuration.replace_vm_disks(internal, vms->revision, disks->revision,
+                config::reattach_disk_slots(vms->document, disks->document, merged), std::move(merged), reservation);
+        }
+    }
+    for (const auto& row : configuration.disks()->snapshot(internal)->document["disks"])
+        if (config::disk_path(row) == record["path"].asString()) return true;
+    if (!unlink_exact(record["path"].asString(), record_identity(record)))
+        context_.log("WARN", "DiskOperation: merged overlay " + record["path"].asString() + " changed; left in place");
+    return true;
+}
+bool DiskOperationService::replay_delete(const Json::Value& record) {
+    auto& configuration = *context_.configuration;
+    std::set<std::string> ids;
+    for (const auto& member : record["subtree"]) ids.insert(member["id"].asString());
+    if (ids.empty()) throw std::runtime_error("Malformed disk delete record");
+    if (record["phase"].asString() == "registering") {
+        const auto disks = configuration.disks()->snapshot(internal);
+        const auto present = registered_ids(disks->document);
+        if (std::any_of(ids.begin(), ids.end(), [&](const std::string& id) { return present.contains(id); })) {
+            const auto reservation = configuration.reserve_disks(disks->revision, ids, {});
+            const auto vms = configuration.vms().snapshot(internal);
+            auto removed = removed_disks(disks->document, ids);
+            configuration.replace_vm_disks(internal, vms->revision, disks->revision,
+                config::reattach_disk_slots(vms->document, disks->document, removed), std::move(removed), reservation);
+        }
+    }
+    if (!record["delete_files"].asBool()) return true;
+    std::set<std::string> registered;
+    for (const auto& row : configuration.disks()->snapshot(internal)->document["disks"]) registered.insert(config::disk_path(row));
+    const auto& members = record["subtree"];
+    for (auto index = members.size(); index-- > 0;) {
+        const auto& member = members[index];
+        const auto path = member["path"].asString();
+        if (!record_identity(member) || registered.contains(path)) continue;
+        if (!unlink_exact(path, record_identity(member)))
+            context_.log("WARN", "DiskOperation: deleted disk file " + path + " changed; left in place");
+    }
+    return true;
+}
 bool DiskOperationService::replay_one(const Json::Value& record) {
+    if (record["action"].asString() == "commit") return replay_merge(record);
+    if (record["action"].asString() == "delete") return replay_delete(record);
     const auto directory = open_directory(record["directory"].asString());
     const auto temporary = record["temporary"].asString();
     if (temporary.empty() || temporary.find('/') != std::string::npos) throw std::runtime_error("Malformed disk operation record");
