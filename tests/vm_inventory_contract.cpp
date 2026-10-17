@@ -13,12 +13,58 @@
 #include <dirent.h>
 #include <future>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void crosvm_disk_capability_process() {
+    const auto directory = std::filesystem::temp_directory_path() / ("crosvm-probe-" + random_id(true));
+    std::filesystem::create_directory(directory);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto executable = (directory / "crosvm").string();
+    const std::string valid = R"({"schema":"droidvm-disk-capabilities-v1","backing_chain":"explicit-paths-v1","max_backing_depth":10,"proc_fd":true,"raw":true,"qcow2":true,"block":true,"scsi":true})";
+    auto script = [&](const std::string& body) {
+        std::ofstream output(executable, std::ios::trunc);
+        output << "#!/system/bin/sh\n[ \"$1\" = disk-capabilities ] || exit 91\n" << body << '\n';
+        output.close();
+        check(output.good() && chmod(executable.c_str(), 0700) == 0, "create isolated capability backend");
+    };
+    auto probe = [&](std::function<bool()> cancelled = [] { return false; }) {
+        vm::require_crosvm_disk_capabilities(executable, directory.string(), cancelled);
+    };
+    auto rejected = [&](bool cancel = false) {
+        try { probe([=] { return cancel; }); }
+        catch (const std::runtime_error& error) {
+            check(std::string(error.what()).find(cancel ? "cancelled" : "upgrade the backend") != std::string::npos,
+                "probe preserves unsupported/cancelled distinction");
+            return;
+        }
+        throw std::runtime_error("invalid backend passed capability probe");
+    };
+    script("echo '" + valid + "'\necho diagnostic >&2");
+    probe(); // Real Child pipes must keep stderr out of the JSON document.
+    script("echo unknown-command >&2\nexit 2"); rejected();
+    script("echo not-json"); rejected();
+    script("echo '{}'"); rejected();
+    script("echo '" + valid + "'\nexit 2"); rejected();
+    script("echo '" + valid + "'\nhead -c 8192 /dev/zero >&2"); rejected();
+    script("sleep 10");
+    auto started = std::chrono::steady_clock::now();
+    rejected();
+    check(std::chrono::steady_clock::now() - started < 4s, "probe timeout bounds backend wait");
+    started = std::chrono::steady_clock::now();
+    rejected(true);
+    check(std::chrono::steady_clock::now() - started < 1s, "probe cancellation interrupts backend wait");
+    if (const char* backend = std::getenv("DROIDVM_TEST_CROSVM"))
+        vm::require_crosvm_disk_capabilities(backend, directory.string(), [] { return false; });
+}
 void crosvm_disk_capabilities() {
     Json::Value caps;
     caps["schema"] = "droidvm-disk-capabilities-v1";
@@ -1680,7 +1726,10 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
+    if (std::getenv("DROIDVM_TEST_CROSVM"))
+        return run({{"crosvm_disk_capability_process", crosvm_disk_capability_process}});
     return run({{"crosvm_disk_capabilities", crosvm_disk_capabilities},
+        {"crosvm_disk_capability_process", crosvm_disk_capability_process},
         {"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
         {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
         {"qemu_retained_disk_graph", qemu_retained_disk_graph},

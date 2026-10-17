@@ -23,6 +23,9 @@
 
 namespace droidvm { class LegacyEvents; }
 namespace droidvm::vm {
+// Probe without inheriting disk descriptors; throws on unsupported or cancelled.
+void require_crosvm_disk_capabilities(const std::string& executable, const std::string& library_dir,
+    const std::function<bool()>& cancelled);
 enum class State { stopped, starting, running, suspended, stopping, rebooting };
 const char* state_name(State state); // VMState.name()
 struct RuntimeContext {

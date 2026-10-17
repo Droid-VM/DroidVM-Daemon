@@ -137,6 +137,20 @@ std::vector<std::string> merged_environment(const std::vector<std::pair<std::str
 }
 }
 const char* state_name(State state) { return state_names[static_cast<size_t>(state)]; }
+void require_crosvm_disk_capabilities(const std::string& executable, const std::string& library_dir,
+                                    const std::function<bool()>& cancelled) {
+    ChildOptions probe;
+    probe.argv = {executable, "disk-capabilities"};
+    probe.environment = merged_environment({{"LD_LIBRARY_PATH", library_dir}, {"LD_PRELOAD", ""}});
+    const auto capabilities = Child(probe).communicate({}, 2s, 4096, cancelled);
+    if (capabilities.cancelled) throw std::runtime_error("crosvm disk capability check cancelled");
+    bool supported = false;
+    if (capabilities.exit_code == 0 && !capabilities.timed_out && !capabilities.truncated) {
+        try { supported = crosvm_retained_chain_supported(config::parse_json(capabilities.output)); }
+        catch (const std::exception&) {}
+    }
+    if (!supported) throw std::runtime_error("Installed crosvm lacks the required explicit backing-chain capability; upgrade the backend");
+}
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
     : id_(std::move(id)), context_(context), config_(std::move(config)) { create_streams(); }
 VmRuntime::~VmRuntime() = default;
@@ -520,18 +534,8 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
             }
         }
         if (!run.disk_backing_fds->empty()) {
-            ChildOptions probe;
-            probe.argv = {context_.data_dir + "/usr/bin/crosvm", "disk-capabilities"};
-            probe.environment = merged_environment({{"LD_LIBRARY_PATH", context_.data_dir + "/usr/lib"}, {"LD_PRELOAD", ""}});
-            const auto capabilities = Child(probe).communicate({}, 2s, 4096,
+            require_crosvm_disk_capabilities(context_.data_dir + "/usr/bin/crosvm", context_.data_dir + "/usr/lib",
                 [this] { return stopped_by_user_ || context_.shutting_down(); });
-            if (capabilities.cancelled) throw std::runtime_error("crosvm disk capability check cancelled");
-            bool supported = false;
-            if (capabilities.exit_code == 0 && !capabilities.timed_out && !capabilities.truncated) {
-                try { supported = crosvm_retained_chain_supported(config::parse_json(capabilities.output)); }
-                catch (const std::exception&) {}
-            }
-            if (!supported) throw std::runtime_error("Installed crosvm lacks the required explicit backing-chain capability; upgrade the backend");
         }
         lease->verify();
     }
