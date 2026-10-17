@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "format.h"
-#include "store/disk_file_leases.h"
+#include "store/disk_config.h"
 #include <json/json.h>
 #include <functional>
 #include <chrono>
@@ -24,7 +24,7 @@ public:
     // /proc/self/fd; failed/malformed inspection never means "no backing".
     // The returned parent still needs its own lease before it is inspected/read.
     std::optional<std::string> backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
-    void validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
+    config::DiskImageInfo validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
         const std::optional<std::string>& expected) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
@@ -35,6 +35,7 @@ private:
     std::function<bool()> cancelled_;
     std::chrono::milliseconds inspection_timeout_;
     Json::Value info(const std::string& path, std::vector<int> fds = {}) const; // throws std::runtime_error
+    config::DiskImageInfo inspect_leased(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
 };
 
 // DiskChainPlan: every file the selected disks need, child before parent,

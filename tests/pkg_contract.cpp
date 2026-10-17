@@ -960,6 +960,7 @@ void leased_image_inspection(const std::string& mode) {
             "[ \"$(cat \"$3\")\" = original ] || exit 24\n";
     }
     if (mode == "failure") script += "exit 25\n";
+    else if (mode == "external-data") script += "printf '%s' '{\"format\":\"qcow2\",\"format-specific\":{\"data\":{\"data-file\":\"unleased.raw\"}}}'\n";
     else if (mode == "malformed") script += "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":5}'\n";
     else script += "printf '%s' '{\"format\":\"qcow2\",\"backing-filename\":\"base.raw\","
         "\"full-backing-filename\":\"/proc/self/fd/base.raw\"}'\n";
@@ -972,7 +973,8 @@ void leased_image_inspection(const std::string& mode) {
     if (mode.empty()) {
         check(!failed && parent == dir.at("base.raw"), "relative backing uses original image directory, not descriptor directory");
         Images images(dir.at("image-helper"));
-        images.validate_backing(*lease, dir.at("overlay"), dir.at("base.raw"));
+        const auto inspected = images.validate_backing(*lease, dir.at("overlay"), dir.at("base.raw"));
+        check(inspected.format == "qcow2" && inspected.parent == dir.at("base.raw"), "inspection retains actual format and registered parent");
         fails_any([&] { images.validate_backing(*lease, dir.at("overlay"), std::nullopt); }, "unregistered actual backing rejected");
         fails_any([&] { images.validate_backing(*lease, dir.at("overlay"), dir.at("other.raw")); }, "different registered parent inode rejected");
         put(dir.at("image-helper"), "#!/system/bin/sh\nprintf '%s' '{\"format\":\"raw\"}'\n");
@@ -1108,6 +1110,7 @@ int main(int argc, char** argv) {
         {"leased image relative backing", [] { leased_image_inspection(""); }},
         {"leased image inspection failure", [] { leased_image_inspection("failure"); }},
         {"leased image malformed metadata", [] { leased_image_inspection("malformed"); }},
+        {"leased image external data rejected", [] { leased_image_inspection("external-data"); }},
         {"leased image replacement", [] { leased_image_inspection("replacement"); }}};
     if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];

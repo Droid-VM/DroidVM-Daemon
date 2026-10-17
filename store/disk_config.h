@@ -8,6 +8,10 @@
 #include "disk_file_leases.h"
 
 namespace droidvm::config {
+struct DiskImageInfo {
+    std::string format;
+    std::optional<std::string> parent;
+};
 // Java DiskConfig.getFullPath lexical semantics; not canonical/inode identity.
 std::string disk_path(const Json::Value& row);
 // New references may target only unique, well-formed paths with resolved,

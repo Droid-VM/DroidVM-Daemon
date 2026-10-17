@@ -45,6 +45,8 @@ QemuDiskGraph qemu_disk_graph(const std::map<std::string, QemuDiskImage>& images
             node["driver"] = image.format;
             node["node-name"] = result.nodes.at(*it);
             node["read-only"] = image.readonly;
+            if (image.cache_no_flush) node["cache"]["no-flush"] = true;
+            if (image.discard_unmap) node["discard"] = "unmap";
             node["file"]["driver"] = "file";
             node["file"]["filename"] = "/dev/fdset/" + std::to_string(set);
             node["file"]["read-only"] = image.readonly;

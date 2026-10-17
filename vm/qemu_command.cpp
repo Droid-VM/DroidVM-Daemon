@@ -41,6 +41,7 @@ struct Builder {
 
     void disks() {
         if (!present(item, "disks")) return;
+        if (run.disk_graph) args.insert(args.end(), run.disk_graph->argv.begin(), run.disk_graph->argv.end());
         int boot_index = 1, pmem = 0;
         bool scsi = false;
         const auto scsi_controller = [&] {
@@ -51,23 +52,36 @@ struct Builder {
         for (const auto* disk : items(item["disks"])) {
             auto path = string(*disk, "path", "");
             if (path.empty()) continue;
-            if (!run.preserve_disk_paths) path = optimized_path(std::move(path), host);
+            if (!run.preserve_disk_paths && !run.disk_graph) path = optimized_path(std::move(path), host);
             const auto file_path = path;
             path = qemu_option_value(path);
             const bool readonly = boolean(*disk, "readonly", false);
             const auto bus = java_enum(*disk, "bus", "VIRTIO", disk_buses);
+            std::optional<std::string> retained_node;
+            if (run.disk_graph) {
+                if (bus == "PFLASH" || bus == "PMEM") {
+                    const auto found = run.direct_disk_fds.find(file_path);
+                    if (found == run.direct_disk_fds.end() || found->second < 3)
+                        throw std::invalid_argument("Missing retained raw disk descriptor");
+                    path = "/proc/self/fd/" + std::to_string(found->second);
+                } else {
+                    const auto found = run.disk_graph->nodes.find(file_path);
+                    if (found == run.disk_graph->nodes.end()) throw std::invalid_argument("Missing retained disk graph node");
+                    retained_node = found->second;
+                }
+            }
             if (bus == "PFLASH") {
                 add({"-drive", "file=" + path + ",if=pflash,format=raw" + (readonly ? ",readonly=on" : "")});
             } else if (bus == "CDROM") {
                 scsi_controller();
                 const auto id = "cd" + decimal(drives++);
-                add({"-drive", "file=" + path + ",if=none,id=" + id + ",media=cdrom,readonly=on"});
-                add({"-device", "scsi-cd,drive=" + id + ",bus=scsi0.0"});
+                if (!retained_node) add({"-drive", "file=" + path + ",if=none,id=" + id + ",media=cdrom,readonly=on"});
+                add({"-device", "scsi-cd,drive=" + retained_node.value_or(id) + ",bus=scsi0.0"});
             } else if (bus == "SCSI") {
                 scsi_controller();
                 const auto id = "scsi" + decimal(drives++);
-                add({"-drive", "file=" + path + ",if=none,id=" + id + (readonly ? ",readonly=on" : "")});
-                add({"-device", "scsi-hd,drive=" + id + ",bus=scsi0.0,bootindex=" + decimal(boot_index++)});
+                if (!retained_node) add({"-drive", "file=" + path + ",if=none,id=" + id + (readonly ? ",readonly=on" : "")});
+                add({"-device", "scsi-hd,drive=" + retained_node.value_or(id) + ",bus=scsi0.0,bootindex=" + decimal(boot_index++)});
             } else if (bus == "PMEM") {
                 const auto id = "pmem" + decimal(pmem++);
                 int64_t size = run.file_length ? run.file_length(file_path) : 0;
@@ -81,8 +95,8 @@ struct Builder {
                 auto drive = "file=" + path + ",if=none,id=" + id;
                 drive += agent ? ",cache=writeback,aio=threads,discard=unmap" : ",cache=unsafe,aio=threads,discard=unmap";
                 if (readonly) drive += ",readonly=on";
-                add({"-drive", drive});
-                add({"-device", "virtio-blk-pci,drive=" + id + ",iothread=" + io + "," + pci + ",bootindex=" + decimal(boot_index++)});
+                if (!retained_node) add({"-drive", drive});
+                add({"-device", "virtio-blk-pci,drive=" + retained_node.value_or(id) + ",iothread=" + io + "," + pci + ",bootindex=" + decimal(boot_index++)});
             }
         }
     }
@@ -251,6 +265,10 @@ QemuLaunch qemu_command(const Json::Value& config, const QemuRun& run, const Boo
     Builder builder{config, run, boot, host, launch.agent, {}, 0, 0};
     builder.command(launch);
     launch.argv = std::move(builder.args);
+    if (run.disk_graph) {
+        launch.preserve_fds = run.disk_graph->preserve_fds;
+        for (const auto& [path, fd] : run.direct_disk_fds) launch.preserve_fds.push_back(fd);
+    }
     process_environment(config, host, launch.env);
     return launch;
 }

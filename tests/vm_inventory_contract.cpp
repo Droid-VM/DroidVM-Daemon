@@ -19,9 +19,48 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void qemu_retained_disk_attachment() {
+    Json::Value config;
+    config["id"] = random_id(true); config["name"] = "retained-slots";
+    config["screens"]["gpu-0"]["enabled"] = false; config["screens"]["simplefb"]["enabled"] = false;
+    config["disks"] = Json::Value(Json::arrayValue);
+    for (const auto* bus : {"virtio", "scsi", "cdrom", "pflash", "pmem"}) {
+        Json::Value slot; slot["bus"] = bus; slot["path"] = std::string("/registered/") + bus;
+        slot["readonly"] = true; config["disks"].append(slot);
+    }
+    vm::QemuRun run; run.preserve_disk_paths = true;
+    run.disk_graph = vm::qemu_disk_graph({
+        {"/registered/virtio", {3, "qcow2", "/registered/base", true}},
+        {"/registered/base", {4, "raw", {}, true}},
+        {"/registered/scsi", {5, "raw", {}, true}},
+        {"/registered/cdrom", {6, "raw", {}, true}}});
+    run.direct_disk_fds = {{"/registered/pflash", 7}, {"/registered/pmem", 8}};
+    run.file_length = [](const std::string& path) {
+        check(path == "/registered/pmem", "raw memory size resolves through retained path mapping");
+        return 64LL * 1024 * 1024;
+    };
+    const auto launch = vm::qemu_command(config, run, {}, {});
+    bool flash = false, pmem = false;
+    size_t block_devices = 0;
+    for (const auto& arg : launch.argv) {
+        check(arg.find("/registered/") == std::string::npos, "QEMU receives no registered file path to reopen");
+        flash = flash || arg == "file=/proc/self/fd/7,if=pflash,format=raw,readonly=on";
+        pmem = pmem || arg.find("mem-path=/proc/self/fd/8,") != std::string::npos;
+        if (arg.find("drive=dvm-disk-") != std::string::npos) ++block_devices;
+    }
+    check(flash && pmem && block_devices == 3 && launch.preserve_fds.size() == 6,
+        "all five buses attach retained files and return complete inheritance list");
+    auto reject = [&](const vm::QemuRun& invalid) {
+        bool refused = false;
+        try { vm::qemu_command(config, invalid, {}, {}); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "managed attachment never falls back to registered paths");
+    };
+    auto missing = run; missing.direct_disk_fds.erase("/registered/pmem"); reject(missing);
+    missing = run; missing.disk_graph->nodes.erase("/registered/virtio"); reject(missing);
+}
 void qemu_retained_disk_graph() {
     std::map<std::string, vm::QemuDiskImage> images{
-        {"/a-leaf", {5, "qcow2", "/m-mid", false}},
+        {"/a-leaf", {5, "qcow2", "/m-mid", false, true, true}},
         {"/m-mid", {4, "qcow2", "/z-base", true}},
         {"/z-base", {3, "raw", {}, true}},
         {"/root", {6, "qcow2", {}, true}}};
@@ -40,6 +79,8 @@ void qemu_retained_disk_graph() {
         nodes.at(graph.nodes.at("/root"))["backing"].isNull(), "qcow2 root disables implicit backing lookup");
     check(nodes.at(graph.nodes.at("/a-leaf"))["read-only"] == false &&
         nodes.at(graph.nodes.at("/m-mid"))["read-only"] == true, "leaf and parent retain admitted access modes");
+    check(nodes.at(graph.nodes.at("/a-leaf"))["cache"]["no-flush"] == true &&
+        nodes.at(graph.nodes.at("/a-leaf"))["discard"] == "unmap", "virtio cache and discard options survive explicit graph construction");
     auto reject = [&](auto invalid) {
         bool failed = false;
         try { vm::qemu_disk_graph(invalid); } catch (const std::invalid_argument&) { failed = true; }
@@ -1558,7 +1599,8 @@ void revisioned_batch_adapter() {
 }
 }
 int main() {
-    return run({{"qemu_retained_disk_graph", qemu_retained_disk_graph},
+    return run({{"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
+        {"qemu_retained_disk_graph", qemu_retained_disk_graph},
         {"leased_disk_paths_reach_backends", leased_disk_paths_reach_backends},
         {"disk_option_path_encoding", disk_option_path_encoding},
         {"qemu_disk_readonly_arguments", qemu_disk_readonly_arguments},

@@ -29,6 +29,8 @@ struct QemuDiskImage {
     std::string format; // Actual inspected format, not filename extension.
     std::optional<std::string> parent; // Key of another entry, never a header path.
     bool readonly = true;
+    bool cache_no_flush = false;
+    bool discard_unmap = false;
 };
 struct QemuDiskGraph {
     std::vector<std::string> argv;
@@ -48,9 +50,12 @@ struct QemuRun {
     std::function<int64_t(const std::string&)> file_length;
     // Managed disks must use the same paths admitted by the file lease.
     bool preserve_disk_paths = false;
+    std::optional<QemuDiskGraph> disk_graph; // Present means every slot must resolve to retained IO.
+    std::map<std::string, int> direct_disk_fds; // PFLASH/PMEM raw files, separate from block FD sets.
 };
 struct QemuLaunch {
     std::vector<std::string> argv;
+    std::vector<int> preserve_fds;
     // NativeProcess.Builder.environment calls in order; later keys win when merged.
     std::vector<std::pair<std::string, std::string>> env;
     std::optional<std::string> strace_dir; // getStraceFolder(): caller recreates the directory

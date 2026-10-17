@@ -83,12 +83,14 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
             const CallContext internal{"vm-image-validation", true, true, true};
             const auto parents = config::disk_start_parents(vm, service->snapshot(internal)->document);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            vm::RuntimeContext::DiskImages images;
             for (const auto& [path, parent] : parents) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
                 if (cancelled() || remaining.count() <= 0) throw std::runtime_error("Disk image validation cancelled or timed out");
-                pkg::Images(tool, cancelled, remaining).validate_backing(lease, path, parent);
+                images.emplace(path, pkg::Images(tool, cancelled, remaining).validate_backing(lease, path, parent));
             }
             lease.verify();
+            return images;
         };
     }
     networks_->coordinated_removal_ = true;

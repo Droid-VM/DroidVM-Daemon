@@ -365,7 +365,8 @@ void VmRuntime::run() {
             std::shared_ptr<config::DiskFileLeases::Lease> lease;
             { std::lock_guard lock(state_mutex_); lease = disk_lease_; }
             if (!lease) throw std::runtime_error("Disk lease is missing before image validation");
-            (*context_.validate_disks)(config(), *lease, [this] { return stopped_by_user_ || context_.shutting_down(); });
+            auto images = (*context_.validate_disks)(config(), *lease, [this] { return stopped_by_user_ || context_.shutting_down(); });
+            { std::lock_guard lock(state_mutex_); disk_images_ = std::move(images); }
         } catch (const std::exception& error) {
             stdio(std::string("disk image validation failed: ") + error.what() + "\n");
             finish_stopped(-1);
@@ -556,6 +557,58 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
     auto run = qemu_sockets(config, host);
     { std::lock_guard lock(state_mutex_); run.preserve_disk_paths = static_cast<bool>(disk_lease_); }
     run.file_length = [](const std::string& path) -> int64_t { struct stat info{}; return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode) ? info.st_size : 0; };
+    std::vector<Fd> disk_io; // Own through exec; QEMU then owns its inherited copies.
+    if (run.preserve_disk_paths) {
+        std::shared_ptr<config::DiskFileLeases::Lease> lease;
+        RuntimeContext::DiskImages images;
+        { std::lock_guard lock(state_mutex_); lease = disk_lease_; images = disk_images_; }
+        std::map<std::string, bool> access;
+        std::set<std::string> virtio_paths;
+        std::set<std::string> block_paths;
+        const auto& slots = config::member(config, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) {
+            auto path = config::string(slot, "path");
+            if (path.empty()) continue;
+            const auto bus = config::java_enum(slot, "bus", "VIRTIO", {"VIRTIO", "SCSI", "CDROM", "PFLASH", "PMEM"});
+            const bool write = !config::boolean(slot, "readonly") && bus != "CDROM";
+            access[path] = access[path] || write;
+            if (bus == "VIRTIO") virtio_paths.insert(path);
+            if (bus == "PFLASH" || bus == "PMEM") {
+                const auto& image = images.at(path);
+                if (image.format != "raw" || image.parent) throw std::runtime_error("PFLASH and PMEM require a raw image without backing");
+                if (!run.direct_disk_fds.contains(path)) {
+                    auto fd = lease->open_file(path, write);
+                    run.direct_disk_fds.emplace(path, fd.get());
+                    disk_io.push_back(std::move(fd));
+                }
+                continue;
+            }
+            while (block_paths.insert(path).second) {
+                const auto& image = images.at(path);
+                if (!image.parent) break;
+                path = *image.parent;
+            }
+        }
+        std::map<std::string, QemuDiskImage> graph;
+        for (const auto& path : block_paths) {
+            const auto& image = images.at(path);
+            const bool write = access[path];
+            auto fd = lease->open_file(path, write);
+            const bool virtio = virtio_paths.contains(path);
+            graph.emplace(path, QemuDiskImage{fd.get(), image.format, image.parent, !write,
+                virtio && !config::boolean(config, "agent_mode"), virtio});
+            disk_io.push_back(std::move(fd));
+        }
+        run.disk_graph = qemu_disk_graph(graph);
+        run.file_length = [&run](const std::string& path) -> int64_t {
+            const auto found = run.direct_disk_fds.find(path);
+            struct stat info{};
+            if (found == run.direct_disk_fds.end() || fstat(found->second, &info) != 0 || !S_ISREG(info.st_mode))
+                throw std::runtime_error("Cannot measure retained raw disk");
+            return info.st_size;
+        };
+        lease->verify();
+    }
     QemuLaunch command;
     try { command = qemu_command(config, run, plan, host); }
     catch (const std::exception& error) { failure = error.what(); return false; }
@@ -567,7 +620,7 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
         qemu_ = true;
         control_socket_ = run.qmp_socket_path;
     }
-    if (!spawn(command.argv, command.env, command.strace_dir, "qemu", failure)) return false;
+    if (!spawn(command.argv, command.env, command.strace_dir, "qemu", failure, command.preserve_fds)) return false;
     // agent0 is declared before the blocking UART chardev: connect it first so
     // no hvc0 boot output races ahead of the reader.
     auto connect_stream = [&](const char* stream, const std::string& path) {
@@ -597,7 +650,8 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
     return true;
 }
 bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<std::pair<std::string, std::string>>& env,
-                      const std::optional<std::string>& strace_dir, const char* label, std::string& failure) {
+                      const std::optional<std::string>& strace_dir, const char* label, std::string& failure,
+                      const std::vector<int>& preserve_fds) {
     std::shared_ptr<config::DiskFileLeases::Lease> lease;
     { std::lock_guard lock(state_mutex_); lease = disk_lease_; }
     if (lease) lease->verify();
@@ -613,6 +667,7 @@ bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<st
     write_quiet("/proc/sys/vm/drop_caches", "3");
     write_quiet("/proc/sys/vm/compact_memory", "1");
     ChildOptions options;
+    options.preserve_fds = preserve_fds;
     options.argv = argv;
     options.environment = merged_environment(env);
     options.limits = {{RLIMIT_NOFILE, 65536, 65536}, {RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY}};
@@ -706,7 +761,7 @@ void VmRuntime::finish_stopped(int code) {
 }
 void VmRuntime::release_disks() {
     std::shared_ptr<config::DiskFileLeases::Lease> released;
-    { std::lock_guard state(state_mutex_); released.swap(disk_lease_); }
+    { std::lock_guard state(state_mutex_); released.swap(disk_lease_); disk_images_.clear(); }
 }
 void VmRuntime::kill_process() {
     std::lock_guard lock(state_mutex_);

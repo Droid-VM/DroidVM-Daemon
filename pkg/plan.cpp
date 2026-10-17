@@ -35,16 +35,24 @@ std::optional<std::string> Images::backing_of(const std::string& path) const {
     return backing;
 }
 std::optional<std::string> Images::backing_of(const config::DiskFileLeases::Lease& lease, const std::string& path) const {
+    return inspect_leased(lease, path).parent;
+}
+config::DiskImageInfo Images::inspect_leased(const config::DiskFileLeases::Lease& lease, const std::string& path) const {
     const int fd = lease.read_fd(path);
     const auto details = info("/proc/self/fd/" + std::to_string(fd), {fd});
     lease.verify();
     if (!details["format"].isString() || details["format"].asString().empty())
         throw Error("Cannot determine leased image format");
+    const auto& specific = config::member(details, "format-specific");
+    const auto& data = config::member(specific, "data");
+    if (!config::member(data, "data-file").isNull())
+        throw Error("External image data file is not covered by the disk lease");
+    config::DiskImageInfo result{details["format"].asString(), {}};
     const auto& value = details["backing-filename"];
     if (value.isNull()) {
         if (!details["full-backing-filename"].isNull())
             throw Error("Leased image is missing its original backing filename");
-        return std::nullopt;
+        return result;
     }
     if (!value.isString()) throw Error("Invalid leased image backing filename");
     auto backing = value.asString();
@@ -56,19 +64,23 @@ std::optional<std::string> Images::backing_of(const config::DiskFileLeases::Leas
     backing = canonical_path(backing);
     if (!is_file(backing)) throw Error("missing backing image: " + backing);
     lease.verify();
-    return backing;
+    result.parent = backing;
+    return result;
 }
-void Images::validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
+config::DiskImageInfo Images::validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
         const std::optional<std::string>& expected) const {
-    const auto actual = backing_of(lease, path);
+    auto inspected = inspect_leased(lease, path);
+    const auto& actual = inspected.parent;
     if (actual.has_value() != expected.has_value())
         throw Error("Image backing chain disagrees with disk registry");
-    if (!expected) return;
+    if (!expected) return inspected;
     struct stat held{}, current{};
     if (fstat(lease.read_fd(*expected), &held) != 0 || stat(actual->c_str(), &current) != 0
             || !S_ISREG(current.st_mode) || held.st_dev != current.st_dev || held.st_ino != current.st_ino)
         throw Error("Image backing file is not the registered leased parent");
     lease.verify();
+    inspected.parent = expected; // Canonical registry key, even when the header uses an inode alias.
+    return inspected;
 }
 void Images::rebase(const std::string& overlay, const std::string& backing) const {
     std::string format;
