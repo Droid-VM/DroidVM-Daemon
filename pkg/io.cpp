@@ -27,6 +27,11 @@ const char* errno_name(int error) {
     }
 }
 std::string read_failed(int error) { return errno_message("read", error); }
+void sync_fd(int fd) {
+    int result;
+    do { result = fsync(fd); } while (result != 0 && errno == EINTR);
+    if (result != 0) throw Error(errno_message("sync imported file or directory", errno));
+}
 }
 std::string errno_message(const char* operation, int error) {
     return std::string(operation) + " failed: " + errno_name(error) + " (" + std::strerror(error) + ")";
@@ -503,11 +508,18 @@ int64_t file_length(const std::string& path) {
     struct stat info{};
     return stat(path.c_str(), &info) == 0 ? static_cast<int64_t>(info.st_size) : 0;
 }
-bool make_dirs(const std::string& path) {
+bool make_dirs(const std::string& path, bool durable) {
     if (exists(path)) return false;
     const auto parent = dirname(normalize(path));
-    if (!parent.empty() && !exists(parent)) make_dirs(parent);
-    return mkdir(path.c_str(), 0777) == 0;
+    if (!parent.empty() && !exists(parent)) make_dirs(parent, durable);
+    if (mkdir(path.c_str(), 0777) != 0) return false;
+    if (durable) {
+        Fd child(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        Fd ancestor(open((parent.empty() ? "." : parent).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (child.get() < 0 || ancestor.get() < 0) throw Error(errno_message("open created directory for sync", errno));
+        sync_fd(child.get()); sync_fd(ancestor.get());
+    }
+    return true;
 }
 namespace {
 void delete_at(int parent, const std::string& name, int expected = -1) {
@@ -605,5 +617,33 @@ void CreatedDirectory::remove() {
     verify();
     delete_at(parent_.get(), name_, directory_.get());
     removed_ = true;
+}
+void CreatedDirectory::sync() const {
+    verify();
+    sync_fd(directory_.get()); sync_fd(parent_.get());
+    verify();
+}
+RetainedFile::RetainedFile(int file, int directory, const std::string& directory_path, const std::string& name)
+    : file_(fcntl(file, F_DUPFD_CLOEXEC, 0)), directory_(fcntl(directory, F_DUPFD_CLOEXEC, 0)),
+      directory_path_(directory_path), name_(name) {
+    if (file_.get() < 0 || directory_.get() < 0) throw Error(errno_message("retain imported file", errno));
+    if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\0') != std::string::npos)
+        throw Error("Invalid retained filename");
+    verify();
+}
+void RetainedFile::verify() const {
+    struct stat parent{}, current_parent{}, file{}, current{};
+    if (fstat(directory_.get(), &parent) != 0 || stat(directory_path_.c_str(), &current_parent) != 0
+            || fstat(file_.get(), &file) != 0 || fstatat(directory_.get(), name_.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0)
+        throw Error(errno_message("verify imported file", errno));
+    if (parent.st_dev != current_parent.st_dev || parent.st_ino != current_parent.st_ino
+            || file.st_dev != current.st_dev || file.st_ino != current.st_ino
+            || !S_ISREG(current.st_mode) || file.st_nlink != 1)
+        throw Error("Imported file or its parent was replaced or aliased");
+}
+void RetainedFile::sync() const {
+    verify();
+    sync_fd(file_.get()); sync_fd(directory_.get());
+    verify();
 }
 }

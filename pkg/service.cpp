@@ -350,6 +350,7 @@ private:
     std::vector<NetworkPlanEntry> plan_;
     std::string vm_dir_, vm_name_;
     std::unique_ptr<CreatedDirectory> owned_directory_;
+    std::vector<std::unique_ptr<RetainedFile>> retained_files_;
     bool registered_ = false;
     VmConfigService::Snapshot config_snapshot_;
     DiskConfigService::Snapshot disk_snapshot_;
@@ -402,11 +403,17 @@ TaskCompletion ImportTask::run(TaskControl& control) {
         if (context_.configuration) disk_snapshot_ = context_.configuration->disks()->snapshot(internal);
         unpack();
         owned_directory_->verify();
+        // Header relinking has completed. Persist the actual retained inodes and
+        // all new directory entries before publishing configuration references.
+        for (const auto& file : retained_files_) { check_cancel(); file->sync(); }
+        owned_directory_->sync();
         // Network creation and VM registration are observable shared state.
         // Finish cancellable extraction/cleanup before entering this commit.
         if (!control.enter_commit()) throw Error("task cancelled");
         auto networks = import_networks();
         resolve_leases();
+        owned_directory_->verify();
+        for (const auto& file : retained_files_) file->verify();
         std::string id;
         try {
             if (context_.vm_config) {
@@ -479,7 +486,7 @@ TaskCompletion ImportTask::run(TaskControl& control) {
     }
 }
 void ImportTask::unpack() {
-    if (!exists(target_) && !make_dirs(target_)) throw Error("Cannot create target dir: " + target_);
+    if (!exists(target_) && !make_dirs(target_, true)) throw Error("Cannot create target dir: " + target_);
     // Any picked path maps to its metadata master.
     const auto master = master_of(source_);
     int volumes;
@@ -571,6 +578,7 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
             directory = boot_directory.get();
         }
         FileSink sink(directory, file_name(out));
+        retained_files_.push_back(std::make_unique<RetainedFile>(sink.fd(), directory, dirname(out), file_name(out)));
         std::string buffer(buffer_size, '\0');
         int64_t remaining = size, written = 0;
         auto last = Clock::now();
@@ -597,6 +605,7 @@ void ImportTask::copy(Source& in, const std::string& out, int64_t size, int done
 }
 void ImportTask::relink() {
     owned_directory_->verify();
+    for (const auto& file : retained_files_) file->verify();
     // The packed headers still name the exporting phone's paths.
     std::map<std::string, size_t> by_archive;
     for (const auto index : disks_) by_archive[manifest_.disks[index].archive_path] = index;
@@ -768,6 +777,7 @@ bool ImportTask::discard() {
     if (vm_dir_.empty() || registered_) return true;
     try {
         if (!owned_directory_) throw Error("Import directory identity is unavailable");
+        for (const auto& file : retained_files_) file->verify();
         owned_directory_->remove(); vm_dir_.clear(); return true;
     } catch (const std::exception& error) {
         context_.log("WARN", "VMImportTask: Failed to clean up " + vm_dir_ + ": " + error.what());

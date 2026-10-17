@@ -114,6 +114,7 @@ public:
     // RandomAccessFile.seek(offset) + write; flushes buffered data first.
     void write_at(uint64_t offset, std::string_view data);
     void close();
+    int fd() const { return fd_.get(); } // Borrowed; flush before syncing through a retained handle.
 private:
     Fd fd_;
     std::string pending_;
@@ -151,7 +152,7 @@ std::string file_name(const std::string& path);
 bool is_file(const std::string& path);
 bool exists(const std::string& path);
 int64_t file_length(const std::string& path); // File.length(): 0 when unknown
-bool make_dirs(const std::string& path); // File.mkdirs()
+bool make_dirs(const std::string& path, bool durable = false); // File.mkdirs(); optional directory fsync.
 void delete_tree(const std::string& path);
 // Retains the parent and new directory identities for an import's whole lifetime.
 // Destruction closes handles only; removal is explicit and rejects replacement.
@@ -161,10 +162,22 @@ public:
     const std::string& path() const { return path_; }
     int fd() const { return directory_.get(); }
     void verify() const;
+    void sync() const;
     void remove();
 private:
     std::string parent_path_, name_, path_;
     Fd parent_, directory_;
     bool removed_ = false;
+};
+// Pins the extracted inode and its parent across stream close/header rewriting.
+// Identity checks detect replacement; they do not lock out external writers.
+class RetainedFile {
+public:
+    RetainedFile(int file, int directory, const std::string& directory_path, const std::string& name);
+    void verify() const;
+    void sync() const;
+private:
+    Fd file_, directory_;
+    std::string directory_path_, name_;
 };
 }

@@ -838,6 +838,52 @@ void replaced_import_parent() {
     check(rename(dir.at("old-parent").c_str(), dir.at("parent").c_str()) == 0, "restore original parent");
     owned.remove();
 }
+void retained_import_files() {
+    Temporary dir;
+    CreatedDirectory owned(dir.path, "import");
+    std::unique_ptr<RetainedFile> retained;
+    {
+        FileSink out(owned.fd(), "disk");
+        retained = std::make_unique<RetainedFile>(out.fd(), owned.fd(), owned.path(), "disk");
+        out.append("image"); out.close();
+    }
+    // qemu-img rebase edits the same inode after extraction closes its stream.
+    {
+        Fd file(open((owned.path() + "/disk").c_str(), O_WRONLY | O_CLOEXEC));
+        check(file.get() >= 0 && pwrite(file.get(), "header", 6, 0) == 6, "simulate in-place header update");
+    }
+    retained->sync(); owned.sync();
+    check(bytes_of(owned.path() + "/disk") == "header", "retained handle survives stream close and syncs header changes");
+    check(rename((owned.path() + "/disk").c_str(), (owned.path() + "/original").c_str()) == 0, "move extracted image");
+    put(owned.path() + "/disk", "replacement");
+    bool rejected = false;
+    try { retained->sync(); } catch (const Error&) { rejected = true; }
+    check(rejected && bytes_of(owned.path() + "/original") == "header" &&
+          bytes_of(owned.path() + "/disk") == "replacement", "file replacement refuses sync without modifying either inode");
+    check(unlink((owned.path() + "/disk").c_str()) == 0 &&
+          rename((owned.path() + "/original").c_str(), (owned.path() + "/disk").c_str()) == 0, "restore imported image");
+    check(link((owned.path() + "/disk").c_str(), dir.at("alias").c_str()) == 0, "add external hardlink");
+    rejected = false;
+    try { retained->verify(); } catch (const Error&) { rejected = true; }
+    check(rejected, "unexpected hardlink rejects file ownership confirmation");
+    check(unlink(dir.at("alias").c_str()) == 0, "remove external hardlink");
+    retained->sync(); owned.remove();
+}
+void import_sync_failure() {
+    Temporary dir;
+    check(make_dirs(dir.at("new/parent"), true), "durable recursive directory creation");
+    CreatedDirectory owned(dir.at("new/parent"), "import");
+    { FileSink out(owned.fd(), "disk"); out.append("image"); out.close(); }
+    // A real descriptor that can be identified but cannot be fsynced: propagation
+    // must reject durability rather than treating stat success as a durable file.
+    Fd path(openat(owned.fd(), "disk", O_PATH | O_CLOEXEC));
+    check(path.get() >= 0, "open path-only descriptor");
+    RetainedFile file(path.get(), owned.fd(), owned.path(), "disk");
+    bool rejected = false;
+    try { file.sync(); } catch (const Error&) { rejected = true; }
+    check(rejected && bytes_of(owned.path() + "/disk") == "image", "fsync failure propagates without altering file");
+    owned.remove();
+}
 }
 
 int main() {
@@ -860,7 +906,8 @@ int main() {
         {"network import plan", network_plan}, {"lease offsets", lease_offsets}, {"org.json behaviour", json_contract},
         {"file helpers", file_helpers}, {"exclusive imported files", exclusive_import_files},
         {"cleanup boundaries", cleanup_boundaries}, {"owned import directory", owned_import_directory},
-        {"replaced import parent", replaced_import_parent}};
+        {"replaced import parent", replaced_import_parent}, {"retained import files", retained_import_files},
+        {"import sync failure", import_sync_failure}};
     Json::Value report;
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
     try {
