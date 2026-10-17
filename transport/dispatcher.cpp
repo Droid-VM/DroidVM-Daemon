@@ -266,7 +266,12 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             const auto id = string_field(request, "vm_id");
             if (revision.empty() || id.empty()) throw ServiceError(ErrorCode::invalid_argument, "Missing revision or VM ID");
             if (snapshot->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
-            if (snapshot->durability_uncertain) throw ServiceError(ErrorCode::commit_uncertain, "VM configuration durability is uncertain");
+            if (snapshot->durability_uncertain) {
+                // Every reopened file starts unconfirmed (a crash could precede the directory
+                // fsync). Sync the exact observed document again before it launches anything.
+                snapshot = vm_config_->replace(caller, revision, snapshot->document);
+                if (snapshot->durability_uncertain) throw ServiceError(ErrorCode::commit_uncertain, "VM configuration durability is uncertain");
+            }
             // A boot key is an image-provided ID/title, not a UUID/revision.
             if (request.isMember("boot_entry") && (!request["boot_entry"].isString() || request["boot_entry"].asString().size() > (64u << 10)))
                 throw ServiceError(ErrorCode::invalid_argument, "Invalid boot entry");
@@ -286,6 +291,7 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
                     throw ServiceError(ErrorCode::conflict, "VM start was not admitted; reload state before retrying");
                 Json::Value result;
                 result["success"] = true; result["vm_id"] = id; result["revision"] = revision;
+                if (snapshot->revision != revision) result["durable_revision"] = snapshot->revision;
                 return result;
             }
             throw ServiceError(ErrorCode::not_found, "VM not found");
