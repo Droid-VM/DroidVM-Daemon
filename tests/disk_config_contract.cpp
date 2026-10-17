@@ -4,6 +4,7 @@
 #include "common/identity.h"
 #include "services/disk_config.h"
 #include "store/vm_ownership.h"
+#include "store/disk_config.h"
 #include "transport/dispatcher.h"
 #include <atomic>
 #include <dirent.h>
@@ -46,6 +47,59 @@ Json::Value document() {
     root["disks"] = Json::Value(Json::arrayValue); root["disks"].append(first); root["disks"].append(second);
     root["future_root"] = "保留 🌏";
     return root;
+}
+void structure_transition_validation() {
+    Json::Value empty; empty["disks"] = Json::Value(Json::arrayValue);
+    const auto valid = document();
+    config::validate_disk_transition(empty, valid);
+    check(config::valid_disk_paths(valid).size() == 2, "valid forest admits both paths");
+    auto reject = [&](Json::Value next) {
+        bool refused = false;
+        try { config::validate_disk_transition(valid, next); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "invalid new registry structure rejected");
+    };
+    auto next = valid; next["disks"][0]["parent"] = random_id(true); reject(next);
+    next = valid; next["disks"][0]["parent"] = next["disks"][0]["id"]; reject(next);
+    next = valid; next["disks"][0]["parent"] = next["disks"][1]["id"]; reject(next);
+    next = valid; next["disks"][1]["folder"] = "/first/"; reject(next);
+    for (const auto& folder : {"relative", "/images/../elsewhere", "/images/./sub"}) {
+        next = valid; next["disks"][0]["folder"] = folder; reject(next);
+    }
+    next = valid; next["disks"][0]["name"] = "../image"; reject(next);
+    next = valid; next["disks"][0]["folder"] = std::string("/a\0b", 4); reject(next);
+    next = valid; next["disks"].removeIndex(0, nullptr); reject(next);
+}
+void historical_structure_repair() {
+    auto historical = document(); historical["disks"][0]["parent"] = "broken";
+    auto next = historical; next["root_extension"] = "unrelated";
+    config::validate_disk_transition(historical, next);
+    check(config::valid_disk_paths(historical).empty(), "broken ancestor excludes descendant from new VM references");
+    auto reject = [&](Json::Value changed) {
+        bool refused = false;
+        try { config::validate_disk_transition(historical, changed); } catch (const std::invalid_argument&) { refused = true; }
+        check(refused, "historical invalid rows cannot be edited or extended without repair");
+    };
+    next = historical; next["disks"][0]["future"]["integer"] = 1; reject(next);
+    next = historical; auto child = next["disks"][1]; child["id"] = random_id(true); child["folder"] = "/third";
+    next["disks"].append(child); reject(next);
+    next = historical; next["disks"][0].removeMember("parent");
+    config::validate_disk_transition(historical, next);
+    check(config::valid_disk_paths(next).size() == 2, "repair re-enables the complete chain");
+    auto cycle = document(); cycle["disks"][0]["parent"] = cycle["disks"][1]["id"];
+    config::validate_disk_transition(cycle, cycle);
+    check(config::valid_disk_paths(cycle).empty(), "historical cycle stays readable but cannot accept new references");
+}
+void long_structure_chain() {
+    Json::Value empty, chain; empty["disks"] = Json::Value(Json::arrayValue); chain = empty;
+    for (int i = 0; i < 4096; ++i) {
+        Json::Value row; row["id"] = random_id(true); row["folder"] = "/images"; row["name"] = std::to_string(i);
+        if (i) row["parent"] = chain["disks"][i - 1]["id"];
+        chain["disks"].append(row);
+    }
+    config::validate_disk_transition(empty, chain);
+    check(config::valid_disk_paths(chain).size() == 4096, "long chain uses no recursion");
+    chain["disks"][0]["parent"] = chain["disks"][4095]["id"];
+    check(config::valid_disk_paths(chain).empty(), "long cycle resolves as invalid without recursion");
 }
 void roundtrip_restart_and_ownership() {
     Temporary temp;
@@ -346,6 +400,9 @@ void disk_upload_conflicts_and_failures() {
 }
 int main() {
     return run({{"disk_registry_roundtrip_restart_ownership", roundtrip_restart_and_ownership},
+        {"disk_structure_transition_validation", structure_transition_validation},
+        {"disk_historical_structure_repair", historical_structure_repair},
+        {"disk_structure_long_chain_cycle", long_structure_chain},
         {"disk_registry_validation_participants_gate", validation_and_admission},
         {"disk_registry_commit_failure_backup_recovery", commit_failure_and_recovery},
         {"disk_registry_twelve_writers_and_drain", concurrent_writers_and_drain},

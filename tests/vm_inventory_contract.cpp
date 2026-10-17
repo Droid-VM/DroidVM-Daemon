@@ -162,6 +162,26 @@ void coordinated_historical_disk_references() {
     edited = base->document; edited["vms"][0]["disks"].clear();
     c.service.vms().replace(admin, base->revision, edited);
 }
+void coordinated_disk_structure() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
+    auto base = disks.snapshot(admin); auto document = base->document;
+    auto root = registered_disk(), child = registered_disk();
+    child["name"] = "child.qcow2"; child["parent"] = root["id"];
+    document["disks"].append(root); document["disks"].append(child);
+    auto invalid = document; invalid["disks"][0]["parent"] = child["id"];
+    error(ErrorCode::conflict, [&] { disks.replace(admin, base->revision, invalid); });
+    auto saved = disks.replace(admin, base->revision, document);
+    auto vm = c.service.vms().snapshot(admin); auto wanted = vm->document; auto row = config("overlay VM");
+    Json::Value slot; slot["path"] = "/images/child.qcow2";
+    row["disks"] = Json::Value(Json::arrayValue); row["disks"].append(slot); wanted["vms"].append(row);
+    c.service.vms().replace(admin, vm->revision, wanted);
+    invalid = document; invalid["disks"][0]["name"] = "renamed-base.qcow2";
+    error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, invalid); });
+    invalid = document; auto next = registered_disk(); next["parent"] = child["id"]; next["name"] = "next.qcow2";
+    invalid["disks"].append(next);
+    error(ErrorCode::conflict, [&] { disks.replace(admin, saved->revision, invalid); });
+    check(disks.snapshot(admin)->revision == saved->revision, "ancestor and descendant edits of referenced disk rejected before IO");
+}
 void coordinated_disk_reference_races() {
     for (int attempt = 0; attempt < 16; ++attempt) {
         Fixture fixture; Coordinated c(fixture, {}, true); auto& disks = *c.service.disks();
@@ -1127,6 +1147,7 @@ int main() {
         {"configuration_gate_drains_nested", configuration_gate_drains_nested_admissions},
         {"coordinated_network_delete", coordinated_network_delete},
         {"coordinated_disk_references", coordinated_disk_references},
+        {"coordinated_disk_structure", coordinated_disk_structure},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},

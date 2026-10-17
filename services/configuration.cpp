@@ -5,6 +5,7 @@
 #include "tasks.h"
 #include "common/identity.h"
 #include "store/network_config.h"
+#include "store/disk_config.h"
 #include "store/vm_ownership.h"
 #include <map>
 #include <set>
@@ -19,17 +20,6 @@ bool references(const Json::Value& nic, const std::string& id) {
     if (!nic.isObject() || !nic["network_id"].isString()) return false;
     Json::Value target; target["id"] = nic["network_id"];
     try { return config::uuid(target) == id; } catch (const std::invalid_argument&) { return false; }
-}
-// Match the Java registry's lexical path join. This is not inode identity and
-// does not authorize file mutations; canonical paths and headers need leases.
-std::string disk_path(const Json::Value& row) {
-    const auto& folder = config::member(row, "folder");
-    const auto& name = config::member(row, "name");
-    std::string base = folder.isString() ? folder.asString() : "";
-    std::string child = name.isString() ? name.asString() : "";
-    if (!base.empty() && base.back() == '/') base.pop_back();
-    if (!child.empty() && child.front() == '/') child.erase(0, 1);
-    return base + "/" + child;
 }
 }
 ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shared_ptr<ConfigurationGate> gate,
@@ -74,8 +64,7 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
 }
 void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after) const {
     const auto registry = disks_->state();
-    std::set<std::string> paths;
-    for (const auto& row : registry->document["disks"]) paths.insert(disk_path(row));
+    const auto paths = config::valid_disk_paths(registry->document);
     auto unresolved = [&](const Json::Value& slot) {
         const auto& path = config::member(slot, "path");
         if (path.isNull() || (path.isString() && path.asString().empty())) return false;
@@ -100,6 +89,8 @@ void ConfigurationService::validate_vm_disks(const Json::Value& before, const Js
     }
 }
 void ConfigurationService::validate_disk_change(const Json::Value& before, const Json::Value& after) const {
+    try { config::validate_disk_transition(before, after); }
+    catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
     // Disk writes hold the exclusive gate, so no VM writer/start can pass this
     // check concurrently. Registry-only uploads cannot detach referenced images
     // or alter a referenced row's metadata; those require a coordinated operation.
@@ -115,10 +106,50 @@ void ConfigurationService::validate_disk_change(const Json::Value& before, const
     std::map<std::string, Json::Value> old_rows, new_rows;
     for (const auto& row : before["disks"]) old_rows.emplace(config::uuid(row), row);
     for (const auto& row : after["disks"]) new_rows.emplace(config::uuid(row), row);
+    auto protected_relatives = [&](const auto& rows) {
+        std::map<std::string, std::vector<std::string>> children;
+        std::map<std::string, std::string> parents;
+        std::vector<std::string> queue;
+        std::set<std::string> visited, descendants;
+        for (const auto& [id, row] : rows) {
+            if (referenced.contains(config::disk_path(row))) { queue.push_back(id); visited.insert(id); }
+            Json::Value parent; parent["id"] = config::member(row, "parent");
+            try {
+                const auto target = config::uuid(parent);
+                children[target].push_back(id); parents.emplace(id, target);
+            }
+            catch (const std::invalid_argument&) {}
+        }
+        std::set<std::string> ancestors_seen;
+        for (const auto& seed : queue) {
+            auto id = seed;
+            while (ancestors_seen.insert(id).second) {
+                const auto parent = parents.find(id);
+                if (parent == parents.end()) break;
+                id = parent->second; descendants.insert(id);
+            }
+        }
+        for (size_t i = 0; i < queue.size(); ++i) {
+            const auto found = children.find(queue[i]);
+            if (found == children.end()) continue;
+            for (const auto& child : found->second) {
+                descendants.insert(child);
+                if (visited.insert(child).second) queue.push_back(child);
+            }
+        }
+        return descendants;
+    };
+    const auto old_protected = protected_relatives(old_rows), new_protected = protected_relatives(new_rows);
     for (const auto& [id, row] : old_rows) {
         const auto next = new_rows.find(id);
-        if (referenced.contains(disk_path(row)) && (next == new_rows.end() || next->second != row))
+        if ((referenced.contains(config::disk_path(row)) || old_protected.contains(id))
+                && (next == new_rows.end() || next->second != row))
             throw ServiceError(ErrorCode::conflict, "Referenced disk requires a coordinated update");
+    }
+    for (const auto& [id, row] : new_rows) {
+        const auto old = old_rows.find(id);
+        if (new_protected.contains(id) && (old == old_rows.end() || old->second != row))
+            throw ServiceError(ErrorCode::conflict, "Changing ancestry or descendants of a referenced disk requires a coordinated update");
     }
 }
 void ConfigurationService::validate_vm_networks(const Json::Value& before, const Json::Value& after) const {

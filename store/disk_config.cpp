@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "disk_config.h"
+#include "network_config.h"
+#include <map>
+#include <stdexcept>
+#include <vector>
+
+namespace droidvm::config {
+std::string disk_path(const Json::Value& row) {
+    auto base = string(row, "folder");
+    auto child = string(row, "name");
+    if (!base.empty() && base.back() == '/') base.pop_back();
+    if (!child.empty() && child.front() == '/') child.erase(0, 1);
+    return base + "/" + child;
+}
+namespace {
+struct Registry {
+    std::map<std::string, Json::Value> rows;
+    std::map<std::string, std::string> parents;
+    std::map<std::string, std::set<std::string>> issues;
+};
+bool path_valid(const Json::Value& row) {
+    const auto& folder = member(row, "folder");
+    const auto& name = member(row, "name");
+    if (!folder.isString() || !name.isString()) return false;
+    const auto base = folder.asString(), child = name.asString();
+    if (base.empty() || base.front() != '/' || base.find('\0') != std::string::npos
+            || child.empty() || child == "." || child == ".."
+            || child.find('/') != std::string::npos || child.find('\0') != std::string::npos) return false;
+    for (size_t offset = 0; offset < base.size();) {
+        auto end = base.find('/', offset);
+        if (end == std::string::npos) end = base.size();
+        const auto segment = base.substr(offset, end - offset);
+        if (segment == "." || segment == "..") return false;
+        offset = end + 1;
+    }
+    return true;
+}
+Registry inspect(const Json::Value& document) {
+    if (!document.isObject() || !member(document, "disks").isArray())
+        throw std::invalid_argument("A disk registry is required");
+    Registry result;
+    std::map<std::string, std::vector<std::string>> paths;
+    for (const auto& row : document["disks"]) {
+        const auto id = uuid(row);
+        if (!result.rows.emplace(id, row).second) throw std::invalid_argument("Duplicate disk identity");
+        if (!path_valid(row)) result.issues[id].insert("path");
+        paths[disk_path(row)].push_back(id);
+    }
+    for (const auto& [path, ids] : paths) if (ids.size() > 1)
+        for (const auto& id : ids) result.issues[id].insert("duplicate-path:" + path);
+    for (const auto& [id, row] : result.rows) {
+        const auto& parent = member(row, "parent");
+        if (parent.isNull() || (parent.isString() && parent.asString().empty())) continue;
+        Json::Value identity; identity["id"] = parent;
+        try {
+            const auto target = uuid(identity);
+            if (!result.rows.contains(target)) result.issues[id].insert("missing-parent:" + target);
+            else result.parents.emplace(id, target);
+        } catch (const std::invalid_argument&) { result.issues[id].insert("parent-format"); }
+    }
+    // Iterative graph traversal: bounded stack and linear edge visits even for
+    // adversarial long chains. Mark ancestors before validating their children.
+    std::map<std::string, int> colors;
+    for (const auto& [start, row] : result.rows) {
+        if (colors[start] == 2) continue;
+        std::vector<std::string> chain;
+        auto current = start;
+        while (colors[current] == 0) {
+            colors[current] = 1; chain.push_back(current);
+            const auto parent = result.parents.find(current);
+            if (parent == result.parents.end()) break;
+            current = parent->second;
+        }
+        if (!chain.empty() && result.parents.contains(chain.back()) && colors[current] == 1) {
+            bool cycle = false;
+            for (const auto& id : chain) {
+                cycle = cycle || id == current;
+                if (cycle) result.issues[id].insert("parent-cycle");
+            }
+        }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const auto parent = result.parents.find(*it);
+            if (parent != result.parents.end() && !result.issues[parent->second].empty())
+                result.issues[*it].insert("parent-unresolved");
+            colors[*it] = 2;
+        }
+    }
+    return result;
+}
+}
+std::set<std::string> valid_disk_paths(const Json::Value& document) {
+    auto registry = inspect(document);
+    std::set<std::string> paths;
+    for (const auto& [id, row] : registry.rows)
+        if (registry.issues[id].empty()) paths.insert(disk_path(row));
+    return paths;
+}
+void validate_disk_transition(const Json::Value& before, const Json::Value& after) {
+    auto old = inspect(before), next = inspect(after);
+    for (const auto& [id, row] : next.rows) {
+        const auto& issues = next.issues[id];
+        if (issues.empty()) continue;
+        const auto prior = old.rows.find(id);
+        if (prior == old.rows.end() || prior->second != row)
+            throw std::invalid_argument("Repair disk path and parent chain before changing this entry");
+        for (const auto& issue : issues) if (!old.issues[id].contains(issue))
+            throw std::invalid_argument("Disk update introduces a broken or ambiguous parent chain");
+    }
+}
+}
