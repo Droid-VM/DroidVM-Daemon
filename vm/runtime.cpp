@@ -6,6 +6,7 @@
 #include "vm/crosvm_command.h"
 #include "vm/qemu_command.h"
 #include "vm/host_facts.h"
+#include "vm/command_common.h"
 #include "runtime/helper_identity.h"
 #include "services/legacy_events.h"
 #include "store/network_config.h"
@@ -139,6 +140,11 @@ std::vector<std::string> merged_environment(const std::vector<std::pair<std::str
 const char* state_name(State state) { return state_names[static_cast<size_t>(state)]; }
 void require_crosvm_disk_capabilities(const std::string& executable, const std::string& library_dir,
                                     const std::function<bool()>& cancelled) {
+    if (!crosvm_disk_capabilities_supported(executable, library_dir, cancelled))
+        throw std::runtime_error("Installed crosvm lacks the required explicit backing-chain capability; upgrade the backend");
+}
+bool crosvm_disk_capabilities_supported(const std::string& executable, const std::string& library_dir,
+                                        const std::function<bool()>& cancelled) {
     ChildOptions probe;
     probe.argv = {executable, "disk-capabilities"};
     probe.environment = merged_environment({{"LD_LIBRARY_PATH", library_dir}, {"LD_PRELOAD", ""}});
@@ -149,7 +155,7 @@ void require_crosvm_disk_capabilities(const std::string& executable, const std::
         try { supported = crosvm_retained_chain_supported(config::parse_json(capabilities.output)); }
         catch (const std::exception&) {}
     }
-    if (!supported) throw std::runtime_error("Installed crosvm lacks the required explicit backing-chain capability; upgrade the backend");
+    return supported;
 }
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
     : id_(std::move(id)), context_(context), config_(std::move(config)) { create_streams(); }
@@ -534,8 +540,20 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
             }
         }
         if (!run.disk_backing_fds->empty()) {
-            require_crosvm_disk_capabilities(context_.data_dir + "/usr/bin/crosvm", context_.data_dir + "/usr/lib",
-                [this] { return stopped_by_user_ || context_.shutting_down(); });
+            // An empty data_dir means the app's own /data/data directory, as for the command.
+            HostFacts host; host.data_dir = context_.data_dir;
+            const auto data = command::data_dir(host);
+            if (!crosvm_disk_capabilities_supported(data + "/usr/bin/crosvm", data + "/usr/lib",
+                    [this] { return stopped_by_user_ || context_.shutting_down(); })) {
+                // Released crosvm builds cannot take retained backing chains. Launch exactly as
+                // the Java daemon did (paths, optimized sdcard paths, backing from headers);
+                // the leases stay held so native disk operations cannot touch these files.
+                if (context_.warn) context_.warn("crosvm lacks explicit backing chains; launching disks by path as before");
+                run.preserve_disk_paths = false;
+                run.disk_fds.reset();
+                run.disk_backing_fds.reset();
+                disk_io.clear();
+            }
         }
         lease->verify();
     }
