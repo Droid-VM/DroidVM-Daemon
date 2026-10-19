@@ -2,6 +2,9 @@
 #pragma once
 #include "services/system.h"
 #include "services/tasks.h"
+#include "services/hugepage.h"
+#include "services/host_preferences.h"
+#include "services/usb_acm.h"
 #include "services/network_config.h"
 #include "services/network_host.h"
 #include "services/network.h"
@@ -36,17 +39,28 @@ public:
         if (networks_) vm_uploads_ = std::make_unique<ConfigUploads>(nullptr, networks_);
     }
     LegacyEvents* legacy_events() const { return events_; }
-    bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr || (vms_ && !vms_swept_); }
+    bool has_maintenance() const { return runtime_ != nullptr || host_ipv4_ != nullptr || (vms_ && !vms_swept_) || bool(web_maintenance_); }
     void maintenance() {
         if (runtime_) runtime_->schedule_reconcile(tasks_);
         if (host_ipv4_) host_ipv4_->schedule(tasks_);
+        if (web_maintenance_) web_maintenance_();
         // Server.run: VMs come up behind the socket, after the network auto-up.
         if (vms_ && !vms_swept_ && (!runtime_ || runtime_->autostart_settled())) { vms_swept_ = true; vms_->auto_up_async(); }
     }
     // NativeDisplayBinder.attach, where the platform Binder services exist.
     void set_display_attach(std::function<void(const std::string& nonce, const Json::Value& profile)> attach) { display_attach_ = std::move(attach); }
     void set_usb(usb::UsbService* service) { usb_ = service; }
+    // Local IPC only. The HTTP adapter never calls this dispatcher.
+    void set_web(std::function<Json::Value(const CallContext&, const std::string&, const Json::Value&)> execute,
+                 std::function<void()> maintenance, std::function<void()> stop) {
+        web_execute_ = std::move(execute); web_maintenance_ = std::move(maintenance); web_stop_ = std::move(stop);
+    }
+    void stop_web() { if (web_stop_) web_stop_(); }
     void set_packages(pkg::PkgService* service) { packages_ = service; }
+    void set_hugepages(HugepageService* service) { hugepages_ = service; }
+    void set_host_preferences(HostPreferencesService* service) { host_preferences_ = service; }
+    void set_disk_defaults(HostPreferencesService* service) { disk_defaults_ = service; }
+    void set_usb_acm(UsbAcmService* service) { usb_acm_ = service; }
     void set_disk_config(DiskConfigService* service) {
         if (!service || service->events() != &tasks_ || (disk_config_ && disk_config_ != service))
             throw std::invalid_argument("Disk registry adapter participants do not match");
@@ -92,6 +106,9 @@ public:
     bool background(const std::string& command) const;
     Json::Value execute_background(const CallContext& caller, const std::string& command, const Json::Value& request);
     TaskService& workers() { return tasks_; }
+    // Startup composition only. Shares the existing principal-scoped staging
+    // service with other adapters; it does not expose IPC dispatch to browsers.
+    ConfigUploads* config_uploads() { return vm_uploads_.get(); }
     Json::Value execute(ClientSession& session, const std::string& command, const Json::Value& request);
     std::optional<Json::Value> events(ClientSession& session);
     void disconnected(ClientSession& session) noexcept;
@@ -106,8 +123,15 @@ private:
     LegacyEvents* events_;
     input::KeyboardGrab* keyboard_;
     std::function<void(const std::string&, const Json::Value&)> display_attach_;
+    std::function<Json::Value(const CallContext&, const std::string&, const Json::Value&)> web_execute_;
+    std::function<void()> web_maintenance_;
+    std::function<void()> web_stop_;
     usb::UsbService* usb_ = nullptr;
     pkg::PkgService* packages_ = nullptr;
+    HugepageService* hugepages_ = nullptr;
+    HostPreferencesService* host_preferences_ = nullptr;
+    HostPreferencesService* disk_defaults_ = nullptr;
+    UsbAcmService* usb_acm_ = nullptr;
     VmConfigService* vm_config_ = nullptr;
     DiskConfigService* disk_config_ = nullptr;
     ConfigurationService* configuration_ = nullptr;

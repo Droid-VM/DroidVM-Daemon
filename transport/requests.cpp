@@ -22,6 +22,7 @@ RequestQueue::RequestQueue(RequestDispatcher& dispatcher)
     done_.reserve(max_pending);
 }
 RequestQueue::~RequestQueue() {
+    dispatcher_.stop_web(); // Stop admission before joining shared workers.
     // Callbacks refer to this queue and to services owned by main. Joining here
     // keeps both alive until all callbacks/discards have released their captures.
     dispatcher_.workers().shutdown();

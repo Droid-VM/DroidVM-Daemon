@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "dispatcher.h"
+#include "services/vm_lifecycle.h"
 #include "common/wire.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
@@ -14,6 +15,16 @@
 
 namespace droidvm {
 namespace {
+constexpr std::array web_commands{"web_status", "web_configure", "web_reload", "web_pair", "web_revoke"};
+constexpr std::array hugepage_commands{"hugepage_snapshot", "hugepage_operation_start", "hugepage_operation_status"};
+constexpr std::array host_preferences_commands{"host_preferences_snapshot", "host_preferences_operation_start", "host_preferences_operation_status"};
+constexpr std::array disk_defaults_commands{"disk_defaults_snapshot", "disk_defaults_operation_start", "disk_defaults_operation_status"};
+bool disk_defaults_command(const std::string& command) { return std::find(disk_defaults_commands.begin(), disk_defaults_commands.end(), command) != disk_defaults_commands.end(); }
+constexpr std::array usb_acm_commands{"usb_acm_snapshot", "usb_acm_operation_start", "usb_acm_operation_status"};
+bool usb_acm_command(const std::string& command) { return std::find(usb_acm_commands.begin(), usb_acm_commands.end(), command) != usb_acm_commands.end(); }
+bool host_preferences_command(const std::string& command) { return std::find(host_preferences_commands.begin(), host_preferences_commands.end(), command) != host_preferences_commands.end(); }
+bool hugepage_command(const std::string& command) { return std::find(hugepage_commands.begin(), hugepage_commands.end(), command) != hugepage_commands.end(); }
+bool web_command(const std::string& command) { return std::find(web_commands.begin(), web_commands.end(), command) != web_commands.end(); }
 constexpr std::array commands{"task_get", "task_cancel", "task_snapshot", "task_snapshot_page",
                               "task_snapshot_release", "task_subscribe", "task_unsubscribe",
                               "network_config_snapshot", "network_config_document", "resource_snapshot_page", "resource_snapshot_release",
@@ -176,6 +187,11 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 }
 }
 bool RequestDispatcher::background(const std::string& command) const {
+    if (disk_defaults_ && disk_defaults_command(command)) return true;
+    if (usb_acm_ && usb_acm_command(command)) return true;
+    if (host_preferences_ && host_preferences_command(command)) return true;
+    if (hugepages_ && hugepage_command(command)) return true;
+    if (web_execute_ && web_command(command)) return true;
     if (disk_config_ && disk_upload_command(command)) return true;
     if (configuration_ && configuration_command(command)) return true;
     if (disk_operations_ && disk_operation_command(command)) return true;
@@ -186,6 +202,90 @@ bool RequestDispatcher::background(const std::string& command) const {
         (networks_ && std::find(network_commands.begin(), network_commands.end(), command) != network_commands.end());
 }
 Json::Value RequestDispatcher::execute_background(const CallContext& caller, const std::string& command, const Json::Value& request) {
+    if (usb_acm_ && usb_acm_command(command)) {
+        try {
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Invalid USB ACM request");
+            Json::Value body(Json::objectValue);
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command == "usb_acm_snapshot" || (command == "usb_acm_operation_status" && key != "requestId") ||
+                    (command == "usb_acm_operation_start" && key != "requestId" && key != "expected" && key != "operation"))
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected USB ACM request field");
+                body[key] = request[key];
+            }
+            Json::Value result;
+            if (command == "usb_acm_snapshot") result["snapshot"] = usb_acm_->snapshot(caller);
+            else {
+                const auto task = command == "usb_acm_operation_start" ? usb_acm_->start(caller, body) : usb_acm_->status(caller, string_field(body, "requestId"));
+                result["epoch"] = task.ref.epoch; result["task_id"] = task.ref.id; result["task"] = task_summary(task);
+                if (task_terminal(task.state) && task.result.isObject()) result["task"]["result"] = task.result;
+            }
+            result["success"] = true; return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "USB ACM operation outcome unknown")); }
+    }
+    const bool disk_defaults = disk_defaults_ && disk_defaults_command(command);
+    auto* preferences = disk_defaults ? disk_defaults_ : host_preferences_ && host_preferences_command(command) ? host_preferences_ : nullptr;
+    if (preferences) {
+        const auto& group = disk_defaults ? disk_defaults_commands : host_preferences_commands;
+        try {
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Invalid host preference request");
+            Json::Value body(Json::objectValue);
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command == group[0] ||
+                    (command == group[2] && key != "requestId") ||
+                    (command == group[1] && key != "requestId" && key != "expected" && key != "changes"))
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected host preference request field");
+                body[key] = request[key];
+            }
+            Json::Value result(Json::objectValue);
+            if (command == group[0]) result["snapshot"] = preferences->snapshot(caller);
+            else {
+                const auto task = command == group[1] ? preferences->start(caller, body)
+                    : preferences->status(caller, string_field(body, "requestId"));
+                result["epoch"] = task.ref.epoch; result["task_id"] = task.ref.id;
+                result["task"] = task_summary(task);
+                if (task_terminal(task.state) && task.result.isObject()) result["task"]["result"] = task.result;
+            }
+            result["success"] = true; return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Host preference outcome unknown")); }
+    }
+    if (hugepages_ && hugepage_command(command)) {
+        try {
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Invalid hugepage request");
+            Json::Value body(Json::objectValue);
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command == "hugepage_snapshot" ||
+                    (command == "hugepage_operation_status" && key != "requestId") ||
+                    (command == "hugepage_operation_start" && key != "requestId" && key != "expected" && key != "operation"))
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected hugepage request field");
+                body[key] = request[key];
+            }
+            Json::Value result(Json::objectValue);
+            if (command == "hugepage_snapshot") result["snapshot"] = hugepages_->snapshot(caller);
+            else {
+                const auto task = command == "hugepage_operation_start" ? hugepages_->start(caller, body)
+                    : hugepages_->status(caller, string_field(body, "requestId"));
+                result["epoch"] = task.ref.epoch; result["task_id"] = task.ref.id;
+                result["task"] = task_summary(task);
+                // Native service owns the typed receipt, including partial failures.
+                if (task_terminal(task.state) && task.result.isObject()) result["task"]["result"] = task.result;
+            }
+            result["success"] = true; return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Hugepage operation outcome unknown")); }
+    }
+    if (web_execute_ && web_command(command)) {
+        try {
+            if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
+            if (!caller.administrator || caller.principal != "local-admin") throw ServiceError(ErrorCode::permission_denied, "Local administration required");
+            auto result = web_execute_(caller, command, request); result["success"] = true; return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "WebUI operation failed")); }
+    }
     if (configuration_ && configuration_command(command)) {
         try {
             if (!caller.authenticated) throw ServiceError(ErrorCode::unauthenticated, "Authentication required");
@@ -257,44 +357,25 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
     }
     if (vm_config_ && command == "vm_start_configured") {
         try {
-            auto snapshot = vm_config_->snapshot(caller);
             if (!vms_) throw ServiceError(ErrorCode::unavailable, "VM runtime unavailable");
             for (const auto& key : request.getMemberNames())
                 if (key != "type" && key != "command" && key != "request_id" && key != "revision" && key != "vm_id" && key != "overrides" && key != "boot_entry" && key != "clear_logs_before_start")
                     throw ServiceError(ErrorCode::invalid_argument, "Unexpected configured start field");
-            const auto revision = string_field(request, "revision");
-            const auto id = string_field(request, "vm_id");
-            if (revision.empty() || id.empty()) throw ServiceError(ErrorCode::invalid_argument, "Missing revision or VM ID");
-            if (snapshot->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
-            if (snapshot->durability_uncertain) {
-                // Every reopened file starts unconfirmed (a crash could precede the directory
-                // fsync). Sync the exact observed document again before it launches anything.
-                snapshot = vm_config_->replace(caller, revision, snapshot->document);
-                if (snapshot->durability_uncertain) throw ServiceError(ErrorCode::commit_uncertain, "VM configuration durability is uncertain");
-            }
             // A boot key is an image-provided ID/title, not a UUID/revision.
             if (request.isMember("boot_entry") && (!request["boot_entry"].isString() || request["boot_entry"].asString().size() > (64u << 10)))
                 throw ServiceError(ErrorCode::invalid_argument, "Invalid boot entry");
-            const auto boot = request.isMember("boot_entry") ? request["boot_entry"].asString() : std::string();
             if (request.isMember("clear_logs_before_start") && !request["clear_logs_before_start"].isBool())
                 throw ServiceError(ErrorCode::invalid_argument, "Invalid clear logs option");
-            const bool clear_logs = request.get("clear_logs_before_start", false).asBool();
-            for (const auto& row : snapshot->document["vms"]) if (row["id"] == id) {
-                if (request["overrides"].isObject() && request["overrides"].isMember("pseudo_unprotected")) {
-                    vm::HostFacts facts;
-                    facts.has_kvm = access("/dev/kvm", F_OK) == 0;
-                    facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
-                    if (config::java_enum(row, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "CROSVM" || !vm::resolves_to_gunyah(row, facts))
-                        throw ServiceError(ErrorCode::invalid_argument, "Protection override requires crosvm with Gunyah");
-                }
-                if (!vms_->start_configured(caller, id, row, request["overrides"], boot.empty() ? std::nullopt : std::optional(boot), clear_logs))
-                    throw ServiceError(ErrorCode::conflict, "VM start was not admitted; reload state before retrying");
-                Json::Value result;
-                result["success"] = true; result["vm_id"] = id; result["revision"] = revision;
-                if (snapshot->revision != revision) result["durable_revision"] = snapshot->revision;
-                return result;
-            }
-            throw ServiceError(ErrorCode::not_found, "VM not found");
+            ConfiguredVmStart input;
+            input.revision = string_field(request, "revision"); input.vm_id = string_field(request, "vm_id");
+            input.boot_entry = request.isMember("boot_entry") ? request["boot_entry"].asString() : std::string();
+            if (request.isMember("clear_logs_before_start")) input.clear_logs = request["clear_logs_before_start"].asBool();
+            input.overrides = request["overrides"];
+            const auto started = VmLifecycleService(*vm_config_, *vms_).start(caller, input);
+            Json::Value result;
+            result["success"] = true; result["vm_id"] = started.vm_id; result["revision"] = started.revision;
+            if (!started.durable_revision.empty()) result["durable_revision"] = started.durable_revision;
+            return result;
         } catch (const ServiceError& error) { return failure(error); }
         catch (...) { return failure(ServiceError(ErrorCode::internal, "VM start outcome is unknown; reload state before retrying")); }
     }
@@ -537,6 +618,9 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
         } else if (command == "set_app_config") {
             // A missing or non-object config is a plain exception: "internal error".
             vms_->set_app_config(caller, request.isMember("config") ? request["config"] : Json::Value());
+            if (host_preferences_) result["host_preferences"] = host_preferences_->snapshot(caller);
+            if (disk_defaults_) result["disk_defaults"] = disk_defaults_->snapshot(caller);
+            if (usb_acm_) result["usb_acm"] = usb_acm_->snapshot(caller);
         } else if (command == "vm_bootscan") {
             const auto image = legacy_id(request, "image");
             if (image.empty()) { result["message"] = "missing image"; return result; }
@@ -622,9 +706,12 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
             auto target = vms_->runtime(caller, id);
             bool done = false;
             if (command == "vm_start") {
-                if (legacy_flag(request, "clear_logs_before_start") && target->state() == VmState::stopped) target->clear_logs();
+                if (request.isMember("clear_logs_before_start") && !request["clear_logs_before_start"].isBool())
+                    throw ServiceError(ErrorCode::invalid_argument, "clear_logs_before_start must be boolean");
+                const bool clear_logs = vms_->clear_logs_before_start(request.isMember("clear_logs_before_start")
+                    ? std::optional(request["clear_logs_before_start"].asBool()) : std::nullopt);
                 const auto entry = legacy_id(request, "boot_entry");
-                done = target->start(entry.empty() ? std::nullopt : std::optional(entry));
+                done = target->start(entry.empty() ? std::nullopt : std::optional(entry), {}, clear_logs);
                 if (!done) { result["message"] = "failed to start VM"; return result; }
             } else if (command == "vm_control") {
                 const auto cmd = legacy_id(request, "cmd");
@@ -690,11 +777,36 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
     } catch (...) { result["message"] = "internal error"; return result; }
 }
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
+    if (disk_defaults_ && disk_defaults_command(command)) return execute_background(context(session), command, request);
+    if (usb_acm_ && usb_acm_command(command)) return execute_background(context(session), command, request);
+    if (host_preferences_ && host_preferences_command(command)) return execute_background(context(session), command, request);
+    if (hugepages_ && hugepage_command(command)) return execute_background(context(session), command, request);
+    if (web_execute_ && web_command(command)) return execute_background(context(session), command, request);
     if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
         && !(configuration_ && configuration_command(command)) && !(disk_operations_ && disk_operation_command(command))
         && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot" || disk_upload_command(command)))) {
         auto result = system_.execute(session.caller, command, request);
         if (command == "capabilities" && result["success"].asBool()) {
+            if (disk_defaults_) {
+                for (const auto* name : disk_defaults_commands) result["commands"].append(name);
+                result["disk_defaults"] = HostPreferencesService::disk_defaults_capability;
+            }
+            if (usb_acm_) {
+                for (const auto* name : usb_acm_commands) result["commands"].append(name);
+                result["usb_acm"] = UsbAcmService::capability;
+            }
+            if (host_preferences_) {
+                for (const auto* name : host_preferences_commands) result["commands"].append(name);
+                result["host_preferences"] = HostPreferencesService::capability;
+            }
+            if (hugepages_) {
+                for (const auto* name : hugepage_commands) result["commands"].append(name);
+                result["hugepages"] = "coordinated-hugepages-v1";
+            }
+            if (web_execute_) {
+                for (const auto* name : web_commands) result["commands"].append(name);
+                result["webui"] = "http-session-v1";
+            }
             result["service_api_minor"] = 1;
             for (const auto* name : commands) {
                 if (std::string_view(name) == "network_config_document" && (!networks_ || !networks_->has_events())) continue;

@@ -5,6 +5,11 @@
 #include "runtime/log.h"
 #include "runtime/cleanup.h"
 #include "services/system.h"
+#include "services/system_blit_probe.h"
+#include "services/hugepage.h"
+#include "services/host_preferences_store.h"
+#include "services/usb_acm_store.h"
+#include "services/hugepage_processes.h"
 #include "network/switch_runtime.h"
 #include "network/gvswitch.h"
 #include "network/links.h"
@@ -22,9 +27,25 @@
 #include "usb/service.h"
 #include "usb/watch.h"
 #include "pkg/service.h"
+#include "pkg/transfers.h"
 #include "pkg/disk_operation.h"
+#include "pkg/disk_inspection.h"
+#include "web/disk_operations.h"
+#include "web/agent_operations.h"
+#include "agent/rescue_sessions.h"
+#include "web/network_configuration.h"
+#include "web/network_deletion.h"
+#include "web/vm_terminal.h"
+#include "web/vm_display_source.h"
+#include "web/host_overview.h"
+#include "web/hugepages.h"
+#include "web/hugepage_processes.h"
+#include "web/network_details.h"
+#include "web/network_operations.h"
+#include "web/host_network.h"
 #include "services/configuration.h"
 #include "vm/host_facts.h"
+#include "vm/defaults.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
 #include "display_broker.h"
@@ -34,7 +55,33 @@
 #include "vm/hugepage.h"
 #include "vm/nic.h"
 #include "build_metadata.h"
+#ifdef DROIDVM_WEB_HTTP_TRANSPORT
+#include "web/service.h"
+#include "web/vm_read_model.h"
+#include "web/vm_operations.h"
+#include "web/host_preferences.h"
+#include "web/usb_acm.h"
+#include "web/vm_logs.h"
+#include "web/vm_configuration.h"
+#include "web/resource_catalog.h"
+#include "web/usb_operations.h"
+#include "web/usb_rules.h"
+#include "web/agent_rescue.h"
+#include "web/package_exports.h"
+#include "web/package_imports.h"
+#include "web/package_transfers.h"
+#include "common/sha256.h"
+#include "web/backup_config.h"
+#include "web/image_imports.h"
+#include "web/task_receipts.h"
+#include "web/image_uploads.h"
+#include "pkg/image_import.h"
+#include "services/configuration_backup.h"
+#include "store/disk_config.h"
+#include "services/vm_lifecycle.h"
+#endif
 #include <fstream>
+#include <sstream>
 #include <sys/stat.h>
 #include "store/network_config.h"
 #include "common/wire.h"
@@ -46,13 +93,189 @@
 #include <iostream>
 #include <stdexcept>
 #include <memory>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
-#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
 #include <atomic>
+#ifdef DROIDVM_NETWORK_DELAY_FIXTURE
 #include <thread>
 #endif
 
 namespace {
+// The old single-number record did not retain a manual baseline. Never infer
+// zero from it. Only restore a versioned target which still matches the kernel.
+std::optional<int64_t> restore_hugepage_baseline(droidvm::Instance& instance,
+        const droidvm::vm::HugepagePool& pool) {
+    auto current = pool.read("pool_want");
+    droidvm::Fd file(openat(instance.directory_fd(), "vm-pool-target",
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    if (file.get() < 0 || !current) return current;
+    struct stat info{};
+    if (fstat(file.get(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 || info.st_size > 256)
+        return current;
+    char bytes[257]{};
+    const auto size = read(file.get(), bytes, 256);
+    if (size < 0 || size != info.st_size) return current;
+    std::istringstream record(std::string(bytes, static_cast<size_t>(size)));
+    std::string version, extra;
+    int64_t target = -1, manual = -1;
+    if (!(record >> version >> target >> manual) || version != "v2" || target < 0 || manual < 0 ||
+            (record >> extra) || target != *current || target == manual) return current;
+    if (!pool.set_reserved(manual)) throw std::runtime_error("Cannot restore recorded hugepage baseline");
+    current = pool.read("pool_want");
+    if (!current) throw std::runtime_error("Hugepage baseline readback unavailable");
+    instance.publish("vm-pool-target", "v2 " + std::to_string(*current) + " " + std::to_string(*current) + "\n");
+    return current;
+}
+
+[[noreturn]] void incomplete_worker_shutdown() noexcept {
+    // A detached VM worker may still hold raw runtime dependencies. Do not
+    // unwind those objects beneath it after the bounded stop attempt fails.
+    std::fputs("droidvmd: incomplete worker shutdown; terminating without dependency teardown\n", stderr);
+    std::_Exit(EXIT_FAILURE);
+}
+void close_rescue_sessions(const std::shared_ptr<droidvm::agent::RescueSessions>& sessions,
+        std::unique_ptr<droidvm::VmService>& vms) {
+    if (!sessions) return;
+    sessions->shutdown();
+    if (sessions->empty()) return;
+    // A timed-out managed owner must not outlive its raw VM dependencies.
+    // Reuse the existing stop_all proof, then let the original custody object
+    // release its retained inode leases and registry reservation without reopen.
+    if (vms) vms->stop_all();
+    sessions->shutdown();
+    if (!sessions->empty()) incomplete_worker_shutdown();
+}
+// Declared after worker dependencies, before any work can be admitted. On an
+// exceptional setup/serve exit the later WebService first closes its listener,
+// then accepted tasks join while configuration and runtime services still live.
+class WorkerShutdown final {
+public:
+    WorkerShutdown(droidvm::TaskService& tasks,
+        std::unique_ptr<droidvm::pkg::PkgService>& packages,
+        std::unique_ptr<droidvm::pkg::DiskOperationService>& disks,
+        std::unique_ptr<droidvm::VmService>& vms, std::shared_ptr<droidvm::agent::RescueSessions> rescue,
+        std::shared_ptr<droidvm::pkg::TransferService>& transfers,
+        std::function<void()> close_ingress = {})
+        : tasks_(tasks), packages_(packages), disks_(disks), vms_(vms), rescue_(std::move(rescue)), transfers_(transfers), close_ingress_(std::move(close_ingress)) {}
+    ~WorkerShutdown() {
+        try { if (close_ingress_) close_ingress_(); } catch (...) { incomplete_worker_shutdown(); }
+        try { if (packages_) packages_->shutdown(); } catch (...) {}
+        try { if (disks_) disks_->shutdown(); } catch (...) {}
+        try { tasks_.shutdown(); } catch (...) { incomplete_worker_shutdown(); }
+        try { if (transfers_) transfers_->shutdown(); } catch (...) {}
+        try { close_rescue_sessions(rescue_, vms_); } catch (...) { incomplete_worker_shutdown(); }
+        try { if (vms_) vms_->stop_all(); } catch (...) { incomplete_worker_shutdown(); }
+    }
+private:
+    droidvm::TaskService& tasks_;
+    std::unique_ptr<droidvm::pkg::PkgService>& packages_;
+    std::unique_ptr<droidvm::pkg::DiskOperationService>& disks_;
+    std::unique_ptr<droidvm::VmService>& vms_;
+    std::shared_ptr<droidvm::agent::RescueSessions> rescue_;
+    std::shared_ptr<droidvm::pkg::TransferService>& transfers_;
+    std::function<void()> close_ingress_;
+};
+
+#ifdef DROIDVM_WEB_HTTP_TRANSPORT
+droidvm::web::ConfigurationBackupOperations bind_configuration_backup(droidvm::TaskService& tasks,
+        droidvm::ConfigUploads* uploads,
+        const std::shared_ptr<droidvm::ConfigurationBackup>& backups) {
+    return droidvm::web::backup_configuration(tasks, {
+        [uploads](const auto& caller, size_t bytes) { return uploads->begin_backup(caller, bytes); },
+        [uploads](const auto& caller, const auto& id, size_t offset, std::string_view bytes) {
+            return uploads->append_backup(caller, id, offset, bytes);
+        },
+        [uploads](const auto& caller, const auto& id) { return uploads->preview_backup(caller, id); },
+        [uploads](const auto& caller, const auto& id, const auto& token) { return uploads->commit_backup(caller, id, token); },
+        [uploads](const auto& caller, const auto& id) { uploads->abort_backup(caller, id); },
+        [backups](const auto& caller) {
+            const auto bytes = backups->export_file(caller);
+            auto stream = std::make_shared<droidvm::web::HttpStreamBody>();
+            stream->length = bytes->size();
+            stream->read = [bytes](uint64_t offset, size_t maximum) {
+                if (offset > bytes->size() || maximum > (256u << 10))
+                    throw droidvm::ServiceError(droidvm::ErrorCode::invalid_argument, "Invalid backup read");
+                return bytes->substr(static_cast<size_t>(offset), maximum);
+            };
+            return stream;
+        }
+    });
+}
+droidvm::web::PackageTransferOperations bind_package_transfers(droidvm::TaskService& tasks,
+        const std::shared_ptr<droidvm::pkg::TransferService>& transfers) {
+    if (!transfers) return {};
+    return droidvm::web::package_transfers(tasks, {
+        [transfers](const auto& caller, const auto& id, const std::vector<droidvm::web::PackageTransferFile>& files) {
+            std::vector<droidvm::pkg::TransferFile> native;
+            native.reserve(files.size());
+            for (const auto& file : files) native.push_back({file.name, file.size});
+            return transfers->begin(caller, id, native);
+        },
+        [transfers](const auto& caller, const auto& id) { return transfers->status(caller, id); },
+        [transfers](const auto& caller, const auto& id) { return transfers->finish(caller, id); },
+        [transfers](const auto& caller, const auto& id, size_t index, uint64_t offset, std::string_view bytes) {
+            return transfers->append(caller, id, index, offset, bytes);
+        },
+        [transfers](const auto& caller, const auto& id) { transfers->erase(caller, id); },
+        [transfers](const auto& caller, const auto& id, const auto& exported) { return transfers->prepare_download(caller, id, exported); },
+        [transfers](const auto& caller, const auto& id, size_t index) {
+            const auto reader = transfers->open_download(caller, id, index);
+            auto stream = std::make_shared<droidvm::web::HttpStreamBody>();
+            stream->length = reader->size();
+            stream->read = [reader](uint64_t offset, size_t maximum) { return reader->read(offset, maximum); };
+            return stream;
+        }
+    });
+}
+droidvm::web::ImageUploadOperations bind_image_uploads(droidvm::TaskService& tasks,
+        const std::shared_ptr<droidvm::pkg::TransferService>& transfers, droidvm::ConfigurationService& configuration,
+        const std::string& qemu_img) {
+    if (!transfers) return {};
+    return droidvm::web::image_uploads(tasks, {
+        [transfers](const auto& caller, const auto& id, const droidvm::web::PackageTransferFile& file) {
+            return transfers->begin_image(caller, id, {file.name, file.size});
+        },
+        [transfers](const auto& caller, const auto& id) { return transfers->status(caller, id, true); },
+        [transfers](const auto& caller, const auto& id) { return transfers->finish(caller, id, true); },
+        [transfers](const auto& caller, const auto& id, uint64_t offset, std::string_view bytes) {
+            return transfers->append(caller, id, 0, offset, bytes, true);
+        },
+        [transfers](const auto& caller, const auto& id) { transfers->erase(caller, id, true); },
+        [transfers, &configuration, qemu_img](const auto& caller, const auto& id, const auto& folder, const auto& name, auto& control) {
+            return transfers->install_image(caller, id, folder, name, qemu_img, control,
+                [&](const std::string& path, const std::function<void()>& publish) {
+                    configuration.with_unreferenced_disk_path(caller, path, publish);
+                });
+        }
+    });
+}
+// Driven by the existing IPC loop regardless of whether WebUI is enabled or a
+// browser session still exists. Only the pre-existing TaskService worker may
+// call expire: at most one queued/running sweep, with no extra thread or timer.
+struct RescueMaintenance {
+    RescueMaintenance(std::shared_ptr<droidvm::agent::RescueSessions> value,
+        std::shared_ptr<droidvm::pkg::TransferService> transfer_service)
+        : sessions(std::move(value)), transfers(std::move(transfer_service)) {}
+    std::shared_ptr<droidvm::agent::RescueSessions> sessions;
+    std::shared_ptr<droidvm::pkg::TransferService> transfers;
+    std::atomic<bool> pending{false};
+    std::chrono::steady_clock::time_point next{}; // IPC loop only
+};
+void schedule_rescue_maintenance(droidvm::TaskService& tasks, const std::shared_ptr<RescueMaintenance>& state) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < state->next || state->pending.exchange(true)) return;
+    state->next = now + std::chrono::seconds(5);
+    try {
+        tasks.post({"rescue-maintenance", true, true, false}, [state](bool discarded) {
+            try { if (!discarded) state->sessions->expire(); } catch (...) {}
+            try { if (!discarded && state->transfers) state->transfers->maintenance(); } catch (...) {}
+            state->pending = false;
+        });
+    } catch (...) { state->pending = false; }
+}
+#endif
+
 // The VM store as UsbPassthroughManager reads it: fresh state on every call.
 class UsbVmStore final : public droidvm::usb::UsbVms {
 public:
@@ -86,6 +309,7 @@ private:
         result.name = droidvm::config::string(result.config, "name");
         result.state = static_cast<droidvm::usb::VmState>(vm->state());
         result.control_socket = vm->crosvm_control_socket();
+        result.observed = vm->observation();
         return result;
     }
 };
@@ -93,6 +317,9 @@ private:
 
 int main(int argc, char** argv) {
     try {
+        // Internal self-exec helper: before locks, services or persistence.
+        if (argc == 2 && std::string_view(argv[1]) == "--probe-vulkan-blit")
+            return droidvm::SystemBlitProbe::child_main();
         std::string directory, data_directory, apk;
         bool force = false;
         bool configuration_owner = false;
@@ -228,10 +455,14 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::usb::UsbService> usb;
             std::unique_ptr<droidvm::usb::CrosvmCli> usb_control;
             std::unique_ptr<UsbVmStore> usb_vms;
+            std::unique_ptr<droidvm::HostPreferencesService> host_preferences;
+            std::unique_ptr<droidvm::HostPreferencesService> disk_defaults;
+            std::unique_ptr<droidvm::UsbAcmService> usb_acm;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
             droidvm::TaskLimits task_limits;
             task_limits.background_workers = 2;
+            task_limits.max_result_bytes = 256u << 10; // Bounded package previews; shared retained quota is unchanged.
             // One gate admits configuration readers/writers and VM starts in coordinated mode.
             const auto configuration_gate = configuration_owner ? std::make_shared<droidvm::ConfigurationGate>() : nullptr;
             droidvm::TaskService tasks(task_limits, [] { return droidvm::TaskService::Clock::now(); }, {}, configuration_gate); // joins before legacy events and domain services disappear
@@ -245,23 +476,38 @@ int main(int argc, char** argv) {
             droidvm::platform::AudioTable audio_table;
 #endif
             droidvm::vm::HugepagePool hugepages;
-            // The kernel keeps a reserve target after an owner dies; only a target this
-            // daemon recorded in its run directory is ours to drop on startup.
-            const auto pool_record = layout ? (std::filesystem::absolute(data_directory) / "run/vm-pool-target").string() : std::string();
-            if (layout) {
-                std::ifstream recorded(pool_record);
-                long long pages = 0;
-                if (recorded >> pages && pages > 0 && hugepages.resizable()) hugepages.set_reserved(0);
-                std::filesystem::remove(pool_record);
-            }
-            droidvm::vm::PoolReservations pool([&](int64_t pages) {
+            const auto initial_pool_baseline = layout ? restore_hugepage_baseline(*instance, hugepages) : hugepages.read("pool_want");
+            droidvm::vm::PoolReservations pool([&](int64_t pages, int64_t baseline) {
+                // Persist intent before touching sysfs. An interrupted or rounded
+                // write is recovered only after an exact kernel observation.
+                if (!layout) return false;
+                try {
+                    instance->publish("vm-pool-target", "v2 " + std::to_string(pages) + " " + std::to_string(baseline) + "\n");
+                } catch (...) { return false; }
                 const bool done = hugepages.set_reserved(pages);
-                if (pages > 0) std::ofstream(pool_record, std::ios::trunc) << pages;
-                else std::filesystem::remove(pool_record);
+                if (done) {
+                    const auto actual = hugepages.read("pool_want");
+                    if (!actual) return false;
+                    try {
+                        instance->publish("vm-pool-target", "v2 " + std::to_string(*actual) + " " + std::to_string(baseline) + "\n");
+                    } catch (...) { return false; }
+                }
                 return done;
             });
+            pool.initialize_manual(initial_pool_baseline);
+            std::unique_ptr<droidvm::HugepageService> hugepage_service;
+            std::unique_ptr<droidvm::HugepageProcessService> hugepage_process_service;
+            // Both exceptional-exit guards join tasks and close these owners
+            // before configuration, VM, pool or runtime dependencies disappear.
+            auto rescue_sessions = std::make_shared<droidvm::agent::RescueSessions>();
+            std::shared_ptr<droidvm::pkg::TransferService> package_transfers;
+            WorkerShutdown worker_shutdown(tasks, packages, disk_operations, vms, rescue_sessions, package_transfers);
             if (layout) {
                 files = layout->open_files();
+                host_preferences = std::make_unique<droidvm::HostPreferencesService>(tasks,
+                    droidvm::host_preferences_store(files.get(), layout->owner()));
+                disk_defaults = std::make_unique<droidvm::HostPreferencesService>(tasks,
+                    droidvm::host_preferences_store(files.get(), layout->owner(), droidvm::HostPreferenceDomain::disk_operations));
                 droidvm::vm::RuntimeContext context;
                 context.identities = &switch_runtime;
                 context.events = &legacy_events;
@@ -273,6 +519,19 @@ int main(int argc, char** argv) {
                 const auto legacy_data = std::string("/data/data/") + DROIDVM_PACKAGE_NAME;
                 const bool same = stat(data.c_str(), &mine) == 0 && stat(legacy_data.c_str(), &legacy) == 0 &&
                     mine.st_dev == legacy.st_dev && mine.st_ino == legacy.st_ino;
+                // The module is host-global: only the installed app's data owner
+                // exposes manual administration, as with the USB gadget owner.
+                if (same) {
+                    droidvm::HugepageOptions options;
+                    options.manual_changed = [&](int64_t baseline) {
+                        auto actual = hugepages.read("pool_want");
+                        if (!actual && !hugepages.has("pool_want")) actual = hugepages.read("pool_target");
+                        if (!actual && hugepages.has("pool_want"))
+                            throw std::runtime_error("Hugepage target readback unavailable");
+                        instance->publish("vm-pool-target", "v2 " + std::to_string(actual.value_or(baseline)) + " " + std::to_string(baseline) + "\n");
+                    };
+                    hugepage_service = std::make_unique<droidvm::HugepageService>(tasks, pool, std::move(options));
+                }
                 context.data_dir = same ? std::string() : data.string();
                 context.cache_dir = (data / "cache").string();
                 context.run_dir = (data / "run").string();
@@ -284,6 +543,8 @@ int main(int argc, char** argv) {
                     droidvm::vm::AcmOptions options;
                     options.log = [&](const char* level, const std::string& text) { if (log) log->write(level, "UsbAcmPool: " + text); };
                     acm = std::make_unique<droidvm::vm::AcmPool>(std::move(options));
+                    usb_acm = std::make_unique<droidvm::UsbAcmService>(tasks,
+                        droidvm::usb_acm_store(files.get(), layout->owner(), *acm));
                     context.acm = acm.get();
                 }
                 const droidvm::CallContext internal{"vm-runtime", true, true, true};
@@ -309,6 +570,7 @@ int main(int argc, char** argv) {
                 context.warn = [&](const std::string& text) { if (log) log->write("WARN", text); };
                 context.info = [&](const std::string& text) { if (log) log->write("INFO", text); };
                 context.state_changed = [&](const std::string& id, const std::string& name, droidvm::VmState state) {
+                    tasks.publish_vm_runtime(id);
                     // VMInstance.setState: USB first, then the keyboard; each guarded.
                     if (usb) try { usb->on_vm_state(id, static_cast<droidvm::usb::VmState>(state)); }
                         catch (const std::exception& error) { if (log) log->write("WARN", std::string("usb: state hook failed: ") + error.what()); }
@@ -319,7 +581,37 @@ int main(int argc, char** argv) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);
                 };
                 // The coordinator loads the inventory itself; it must attach to an empty service.
-                vms = configuration_owner ? std::make_unique<droidvm::VmService>(context) : std::make_unique<droidvm::VmService>(files.get(), context);
+                vms = configuration_owner ? std::make_unique<droidvm::VmService>(context, host_preferences.get(), usb_acm.get(), disk_defaults.get())
+                    : std::make_unique<droidvm::VmService>(files.get(), context, host_preferences.get(), usb_acm.get(), disk_defaults.get());
+                if (same) {
+                    droidvm::HugepageProcessOptions options;
+                    options.running_vms = [&, internal] {
+                        std::vector<droidvm::HugepageVmProcess> result;
+                        // VmService hides private managed/Agent runtimes. Never
+                        // enumerate all /proc or expose their private identities.
+                        for (const auto& row : vms->list(internal)) {
+                            const auto id = droidvm::config::uuid(row);
+                            std::shared_ptr<droidvm::vm::VmRuntime> runtime;
+                            try { runtime = vms->runtime(internal, id); }
+                            catch (const droidvm::ServiceError& error) {
+                                if (error.code() == droidvm::ErrorCode::not_found) continue;
+                                throw;
+                            }
+                            runtime->inspect_process([&](int64_t pid, const droidvm::vm::Observation& observed) {
+                                const auto process_id = static_cast<int>(pid); // Child owns a pid_t.
+                                const auto birth = droidvm::hugepage_process_start_ticks(process_id);
+                                result.push_back({id, droidvm::config::string(row, "name"), process_id,
+                                    birth.value_or(""), observed.instance, observed.revision});
+                            });
+                        }
+                        return result;
+                    };
+                    options.signal_vm = [&, internal](const droidvm::HugepageVmProcess& process, int number) {
+                        return vms->runtime(internal, process.id)->signal_process(process.pid,
+                            {process.runtime_instance, process.runtime_revision}, number);
+                    };
+                    hugepage_process_service = std::make_unique<droidvm::HugepageProcessService>(tasks, std::move(options));
+                }
                 droidvm::input::KeyboardGrab::Hooks keys;
                 keys.find = [&, internal](const std::string& id) -> std::optional<std::string> {
                     try { return vms->runtime(internal, id)->id(); }
@@ -405,6 +697,15 @@ int main(int argc, char** argv) {
                 package_context.configuration = configuration.get();
                 package_context.events = &legacy_events;
                 package_context.tasks = &tasks;
+#ifdef DROIDVM_WEB_HTTP_TRANSPORT
+                if (configuration) {
+                    package_transfers = std::make_shared<droidvm::pkg::TransferService>(layout->cache_fd(),
+                        (std::filesystem::absolute(data_directory) / "cache").string(), layout->owner(), configuration->disk_files());
+                    package_context.import_source_pin = [transfers = package_transfers](const auto& caller, const auto& source) {
+                        return transfers->pin_source(caller, source);
+                    };
+                }
+#endif
                 package_context.data_dir = context.data_dir;
                 package_context.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
                 packages = std::make_unique<droidvm::pkg::PkgService>(std::move(package_context));
@@ -414,9 +715,452 @@ int main(int argc, char** argv) {
             droidvm::SystemService system([&] { return instance->token_exists(); }, [&] { return instance->read_token(); },
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, network_config, host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
+            if (hugepage_service) dispatcher.set_hugepages(hugepage_service.get());
+            if (host_preferences) dispatcher.set_host_preferences(host_preferences.get());
+            if (disk_defaults) dispatcher.set_disk_defaults(disk_defaults.get());
+            if (usb_acm) dispatcher.set_usb_acm(usb_acm.get());
+            if (configuration) dispatcher.set_configuration(configuration.get());
+            if (usb && dispatcher.config_uploads()) dispatcher.config_uploads()->bind_usb_rules(
+                [&](const droidvm::CallContext&) { return usb->rules_snapshot(); },
+                [&](const droidvm::CallContext&, const std::string& revision, const Json::Value& rules) {
+                    return usb->set_rules_checked(rules, revision);
+                });
+#ifdef DROIDVM_WEB_HTTP_TRANSPORT
+            droidvm::SystemBlitProbe system_blit_probe;
+            std::unique_ptr<droidvm::pkg::DiskInspectionService> disk_inspection;
+            std::unique_ptr<droidvm::web::WebService> web;
+            std::shared_ptr<droidvm::ConfigurationBackup> backups;
+            std::shared_ptr<droidvm::pkg::ImageImportService> image_importer;
+            // Also keep HTTP readers' inspection/probe dependencies alive until
+            // their queued handlers have drained. The earlier guard covers setup.
+            WorkerShutdown web_workers(tasks, packages, disk_operations, vms, rescue_sessions, package_transfers,
+                [&] { if (web) web->stop(); });
+            if (layout && vms && host_network && configuration) {
+                backups = std::make_shared<droidvm::ConfigurationBackup>(*configuration);
+                image_importer = std::make_shared<droidvm::pkg::ImageImportService>(*configuration,
+                    (tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir) + "/usr/bin/qemu-img",
+                    [transfers = package_transfers](const std::string& path, int fd) {
+                        if (!transfers) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable,
+                            "Temporary image ownership service is unavailable");
+                        transfers->require_persistent_source(path, fd);
+                    });
+                dispatcher.config_uploads()->bind_backup(
+                    [backups](const auto& caller, std::string_view bytes) { return backups->preview(caller, bytes); },
+                    [backups](const auto& caller, std::string_view bytes, const auto& proof) {
+                        return backups->commit(caller, bytes, proof);
+                    });
+                auto terminals = std::make_shared<droidvm::web::VmTerminalSource>(droidvm::web::VmTerminalSource{
+                    [&](const droidvm::CallContext& caller, const std::string& id) {
+                        const auto target = vms->runtime(caller, id)->console_target();
+                        return droidvm::web::VmTerminalTarget{id, target.observed, target.streams};
+                    },
+                    [&](const droidvm::CallContext& caller, const droidvm::web::VmTerminalRead& request) {
+                        return vms->runtime(caller, request.vm_id)->console_read(request.stream, request.observed, request.cursor, request.tail);
+                    },
+                    [&](const droidvm::CallContext& caller, const droidvm::web::VmTerminalWrite& request) {
+                        return vms->runtime(caller, request.vm_id)->console_write(request.stream, request.observed, request.bytes);
+                    }
+                });
+                auto displays = std::make_shared<droidvm::web::VmDisplaySource>(droidvm::web::VmDisplaySource{
+                    [&](const droidvm::CallContext& caller, const std::string& id) {
+                        const auto native = vms->runtime(caller, id)->display_target();
+                        droidvm::web::VmDisplayTarget result{id, native.observed, {}};
+                        for (const auto& screen : native.screens)
+                            result.screens.push_back({screen.id, screen.available, screen.reason, screen.input_enabled});
+                        return result;
+                    },
+                    [&](const droidvm::CallContext& caller, const std::string& id, const std::string& screen,
+                        const droidvm::vm::Observation& expected) {
+                        auto opened = vms->runtime(caller, id)->open_display(screen, expected);
+                        const auto stream = opened.stream;
+                        return droidvm::web::VmDisplayStream{
+                            [stream] { return stream->connected(); },
+                            [stream](size_t maximum) { return stream->read(maximum); },
+                            [stream](std::string_view bytes) { return stream->write(bytes); },
+                            [stream] { stream->close(); }, std::move(opened.password)};
+                    }
+                });
+                droidvm::HostOverviewOptions overview_options;
+                overview_options.data_directory = tool_data_dir.empty()
+                    ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir;
+                overview_options.daemon.version = DROIDVM_VERSION_NAME;
+                overview_options.host.soc_model = droidvm::vm::host_soc_name();
+                if (const auto model = droidvm::vm::system_property("ro.product.model"); !model.empty())
+                    overview_options.host.device_model = model;
+                auto host_overview = std::make_shared<droidvm::HostOverviewService>(std::move(overview_options));
+                disk_inspection = std::make_unique<droidvm::pkg::DiskInspectionService>(*configuration,
+                    (tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir) + "/usr/bin/qemu-img");
+                auto disk_capacity = std::make_shared<droidvm::HostDiskCapacity>(
+                    [&](const std::string& id, const std::string& revision) -> std::optional<uint64_t> {
+                        const auto detail = disk_inspection->read({"host-capacity", true, true, true}, id);
+                        if (detail.state == "ready" && detail.disks.revision == revision &&
+                            detail.image["virtual-size"].isUInt64()) return detail.image["virtual-size"].asUInt64();
+                        return std::nullopt;
+                    },
+                    [&](std::function<void(bool)> work) {
+                        tasks.post({"host-capacity", true, true, true}, std::move(work));
+                    });
+                auto store = std::make_shared<droidvm::config::JsonFile>(files.get(), "webui.json", layout->owner(),
+                    droidvm::config::JsonFile::Observer{}, 8192, droidvm::config::JsonSyntax::strict);
+                auto load = [store] {
+                    const auto saved = store->load();
+                    return saved ? droidvm::web::WebSettings::parse(saved->value) : droidvm::web::WebSettings{};
+                };
+                // Authorization must never be restored from an older .bak after revocation.
+                auto credentials = std::make_shared<droidvm::config::JsonFile>(files.get(), "webui-sessions.json", layout->owner(),
+                    droidvm::config::JsonFile::Observer{}, 64u << 10, droidvm::config::JsonSyntax::strict, false);
+                auto receipts = std::make_shared<droidvm::config::JsonFile>(files.get(), "webui-task-receipts.json", layout->owner(),
+                    droidvm::config::JsonFile::Observer{}, 2u << 20, droidvm::config::JsonSyntax::strict, false);
+                // A corrupt receipt store must not restore a stale host identity
+                // from backup, nor prevent the daemon's normal VM services.
+                try {
+                    droidvm::web::bind_task_receipts(tasks, {
+                        [receipts] { const auto saved = receipts->load(); return saved ? saved->value : Json::Value(); },
+                        [receipts](const Json::Value& value) { receipts->save(value); }
+                    });
+                } catch (...) { if (log) log->write("WARN", "WebUI operation history unavailable"); }
+                droidvm::web::SessionPersistence session_persistence{
+                    [credentials] { const auto saved = credentials->load(); return saved ? saved->value : Json::Value(); },
+                    [credentials](const Json::Value& value) { credentials->save(value); },
+                    [](std::string_view value) {
+                        unsigned char bytes[32]; droidvm_sha256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), bytes);
+                        constexpr char hex[] = "0123456789abcdef";
+                        std::string result; result.reserve(64);
+                        for (const auto byte : bytes) { result += hex[byte >> 4]; result += hex[byte & 15]; }
+                        return result;
+                    }
+                };
+                droidvm::web::WebSettings settings;
+                try { settings = load(); }
+                catch (...) { if (log) log->write("WARN", "WebUI configuration unavailable; listener disabled"); }
+                web = std::make_unique<droidvm::web::WebService>(tasks, settings,
+                    [&] { return host_network->snapshot({"web-discovery", true, true, true}); },
+                    [&](const droidvm::CallContext& caller) {
+                        auto config = configuration->vms().snapshot(caller);
+                        return droidvm::web::vm_snapshot(vms->list(caller), config.get(),
+                            [&](const std::string& network) {
+                                return network_runtime ? network_runtime->observed_leases(caller, network) : Json::Value();
+                            },
+                            [&](const std::string& id, const std::string& instance, const std::string& revision) {
+                                const auto current = vms->runtime(caller, id)->snapshot();
+                                return droidvm::config::string(current, "state") == "RUNNING" &&
+                                    droidvm::config::string(current, "runtime_instance") == instance &&
+                                    droidvm::config::string(current, "runtime_revision") == revision;
+                            });
+                    },
+                    [store](const Json::Value& value) { store->save(value); }, load,
+                    droidvm::web::WebBuild{DROIDVM_VERSION_NAME, std::to_string(DROIDVM_VERSION_CODE)}, droidvm::web::ipv6_available,
+                    droidvm::web::vm_operations(tasks, [&](const droidvm::CallContext& caller, const droidvm::web::VmOperation& request) {
+                        if (request.action == "start") {
+                            droidvm::VmLifecycleService(configuration->vms(), *vms).start(caller,
+                                {request.config_revision, request.vm_id, {}, {}, std::nullopt, request.observed});
+                            return;
+                        }
+                        auto runtime = vms->runtime(caller, request.vm_id);
+                        bool admitted = false;
+                        if (request.action == "stop") admitted = runtime->stop(request.observed);
+                        else if (request.action == "reboot") admitted = runtime->reboot(request.observed);
+                        else if (request.action == "suspend") admitted = runtime->suspend(request.observed);
+                        else if (request.action == "resume") admitted = runtime->resume(request.observed);
+                        if (!admitted) throw droidvm::ServiceError(droidvm::ErrorCode::conflict, "VM operation was not admitted");
+                    }), droidvm::web::vm_logs({
+                        [&](const droidvm::CallContext& caller, const std::string& id) {
+                            auto runtime = vms->runtime(caller, id);
+                            return droidvm::web::VmLogTarget{id, runtime->observation().instance, runtime->streams()};
+                        },
+                        [&](const droidvm::CallContext& caller, const droidvm::web::VmLogRead& request) {
+                            auto runtime = vms->runtime(caller, request.vm_id);
+                            if (runtime->observation().instance != request.instance_id)
+                                throw droidvm::ServiceError(droidvm::ErrorCode::conflict, "VM instance changed");
+                            auto* log = runtime->log(request.stream);
+                            if (!log) throw droidvm::ServiceError(droidvm::ErrorCode::not_found, "Log stream not found");
+                            return log->read(request.cursor, request.tail);
+                        }
+                    }), droidvm::web::vm_configuration(tasks, {
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& revision, size_t bytes) {
+                            return uploads->begin(caller, revision, bytes);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+                            return uploads->append(caller, id, offset, bytes);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) {
+                            return uploads->commit(caller, id);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) { uploads->abort(caller, id); }
+                    }, [&](const droidvm::CallContext&) {
+                        droidvm::vm::HostFacts host;
+                        host.has_kvm = std::filesystem::exists("/dev/kvm");
+                        host.has_gunyah = std::filesystem::exists("/dev/gunyah");
+                        host.has_gzvm = std::filesystem::exists("/dev/gzvm");
+                        const auto hypervisor = droidvm::vm::command::resolve_hypervisor(
+                            Json::Value(Json::objectValue), host, droidvm::vm::command::Backend::crosvm).value_or("KVM");
+                        auto soc = droidvm::vm::system_property("ro.vendor.qti.soc_model");
+                        if (soc.empty()) soc = droidvm::vm::system_property("ro.soc.model");
+                        return droidvm::vm::new_vm_defaults(
+                            tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir,
+                            hypervisor, soc);
+                    }), droidvm::web::ResourceCatalogs{
+                        [&](const droidvm::CallContext& caller) {
+                            if (!configuration->disks()) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Disk registry unavailable");
+                            const auto snapshot = configuration->disks()->snapshot(caller);
+                            const auto references = droidvm::config::disk_references(Json::Value(Json::objectValue), snapshot->document);
+                            auto result = droidvm::web::disk_catalog(*snapshot, droidvm::config::disk_path,
+                                droidvm::config::valid_disk_paths(snapshot->document), references.bases);
+                            result["vmRevision"] = configuration->vms().snapshot(caller)->revision;
+                            return result;
+                        },
+                        [&](const droidvm::CallContext& caller) {
+                            return droidvm::web::network_catalog(network_config->list(caller));
+                        }
+#ifdef DROIDVM_PLATFORM_SERVICES
+                        , [&](const droidvm::CallContext&) {
+                            return droidvm::web::audio_catalog(audio_table.snapshot());
+                        }
+#else
+                        , {}
+#endif
+                        , usb ? std::function<Json::Value(const droidvm::CallContext&)>([&](const droidvm::CallContext&) {
+                            return droidvm::web::usb_catalog(usb->host_catalog());
+                        }) : std::function<Json::Value(const droidvm::CallContext&)>{}
+                        , [](const droidvm::CallContext&) {
+                            return droidvm::web::cpu_catalog(droidvm::vm::read_cpu_topology());
+                        }
+                        , [&](const droidvm::CallContext&) {
+                            return droidvm::web::host_device_catalog(droidvm::vm::probe_host_devices(
+                                tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir),
+                                system_blit_probe.snapshot());
+                        }
+                        , [&](const droidvm::CallContext& caller, const std::string& id) {
+                            const auto detail = disk_inspection->read(caller, id);
+                            const auto references = droidvm::config::disk_references(detail.vms.document, detail.disks.document);
+                            return droidvm::web::disk_detail(droidvm::web::disk_catalog(detail.disks, droidvm::config::disk_path,
+                                droidvm::config::valid_disk_paths(detail.disks.document), references.bases),
+                                detail.vms, id, detail.state, detail.image);
+                        }
+                        , droidvm::web::disk_operations(tasks, [&](const droidvm::CallContext& caller, const Json::Value& request, droidvm::TaskControl& control) {
+                            if (!disk_operations) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Disk operations unavailable");
+                            return disk_operations->execute(caller, request, control);
+                        })
+                        , droidvm::web::disk_recovery(tasks,
+                            [&](const droidvm::CallContext&) {
+                                if (!disk_operations) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Disk operations unavailable");
+                                return disk_operations->pending();
+                            },
+                            [&](const droidvm::CallContext& caller) {
+                                if (!disk_operations) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Disk operations unavailable");
+                                return disk_operations->recover(caller);
+                            })
+                        , droidvm::web::network_configuration(tasks, {
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string&, size_t bytes) { return uploads->begin_network(caller, bytes); },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) { return uploads->append_network(caller, id, offset, bytes); },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) { return uploads->commit_network(caller, id); },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) { uploads->abort_network(caller, id); }
+                        })
+                        , [&](const droidvm::CallContext& caller, const std::string& id) {
+                            if (!network_runtime) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Network runtime unavailable");
+                            const auto config = network_config->get_with_revision(caller, id);
+                            const auto vms_snapshot = configuration->vms().snapshot(caller);
+                            const auto before = network_runtime->get(caller, id);
+                            Json::Value live;
+                            try { live = network_runtime->live(caller, id); }
+                            catch (const droidvm::ServiceError& error) {
+                                if (error.code() != droidvm::ErrorCode::unavailable && error.code() != droidvm::ErrorCode::io_error && error.code() != droidvm::ErrorCode::conflict) throw;
+                            }
+                            const auto after = network_runtime->get(caller, id);
+                            if (network_config->get_with_revision(caller, id).revision != config.revision ||
+                                configuration->vms().snapshot(caller)->revision != vms_snapshot->revision)
+                                throw droidvm::ServiceError(droidvm::ErrorCode::conflict, "Network references changed during observation");
+                            const auto observation = [](const droidvm::NetworkView& view) {
+                                return droidvm::web::NetworkObservation{view.id, droidvm::network_state_name(view.state), view.generation, view.desired_running};
+                            };
+                            return droidvm::web::network_detail(config.config, *vms_snapshot, observation(before), observation(after), live, config.revision);
+                        }
+                        , [&](const droidvm::CallContext& caller) {
+                            if (!host_network) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Host discovery unavailable");
+                            return droidvm::web::host_network_catalog(host_network->available_interfaces(caller), host_network->uplinks(caller), host_network->addresses(caller));
+                        }
+                        , droidvm::web::network_operations(tasks, [&](const droidvm::CallContext& caller, const droidvm::web::NetworkOperation& operation) {
+                            if (!network_runtime) throw droidvm::ServiceError(droidvm::ErrorCode::unavailable, "Network runtime unavailable");
+                            network_runtime->change_if_matches(caller, operation.network_id, operation.start, operation.generation, operation.state, operation.configuration_revision);
+                        })
+                        , droidvm::web::network_deletion(tasks, {
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& revision, size_t bytes) { return uploads->begin_delete(caller, revision, bytes); },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) { return uploads->append_delete(caller, id, offset, bytes); },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) {
+                                const auto deleted = uploads->commit_delete(caller, id);
+                                Json::Value result; result["networkId"] = deleted.id;
+                                result["vmRevision"] = deleted.vms->revision; result["persistence"] = "persisted";
+                                return result;
+                            },
+                            [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) { uploads->abort_delete(caller, id); }
+                        })
+                        , droidvm::web::configuration_recovery(tasks, [&](const droidvm::CallContext& caller) { configuration->recover(caller); })
+                        , [terminals](const droidvm::CallContext& caller, const std::string& id) { return droidvm::web::vm_terminal_list(*terminals, caller, id); }
+                        , terminals
+                        , droidvm::web::agent_operations(tasks,
+                            [&, sessions = rescue_sessions](const droidvm::CallContext& caller, droidvm::agent::Request request,
+                                const droidvm::agent::Confirmation& confirmed, droidvm::TaskControl& control, bool rescue) {
+                                return droidvm::agent::run_managed(*configuration, caller, std::move(request), confirmed,
+                                    tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir,
+                                    control, rescue ? droidvm::agent::NativeRunOptions{sessions.get()} : droidvm::agent::NativeRunOptions{});
+                            })
+                        , droidvm::web::agent_recovery(tasks,
+                            [&](const droidvm::CallContext&) { return vms->pending_orphaned_managed().size(); },
+                            [&](const droidvm::CallContext&) {
+                                Json::Value result(Json::objectValue);
+                                result["pending"] = Json::UInt64(vms->recover_managed().size());
+                                return result;
+                            })
+                        , droidvm::web::agent_rescue(tasks, *rescue_sessions)
+                        , packages ? droidvm::web::package_exports(tasks,
+                            [&](const droidvm::CallContext& caller, const std::string& id) {
+                                return packages->export_plan(caller, id);
+                            },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request,
+                                const droidvm::pkg::ExportConfirmation& confirmed, const std::string& request_id) {
+                                const auto result = packages->vm_export_checked(caller, request, confirmed, request_id);
+                                return droidvm::TaskRef{result["epoch"].asString(), result["task_id"].asString()};
+                            }) : droidvm::web::PackageExportOperations{}
+                        , packages ? droidvm::web::package_imports(tasks,
+                            [&](const droidvm::CallContext& caller, const std::string& source, const std::string& request_id) {
+                                const auto result = packages->preview_import(caller, source, request_id);
+                                return droidvm::TaskRef{result["epoch"].asString(), result["task_id"].asString()};
+                            },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request,
+                                const std::string& plan_request_id, const std::string& request_id) {
+                                const auto result = packages->vm_import_checked(caller, request, plan_request_id, request_id);
+                                return droidvm::TaskRef{result["epoch"].asString(), result["task_id"].asString()};
+                            }) : droidvm::web::PackageImportOperations{}
+                        , bind_package_transfers(tasks, package_transfers)
+                        , bind_configuration_backup(tasks, dispatcher.config_uploads(), backups)
+                        , {}
+                        , droidvm::web::image_imports(tasks, {
+                            [image_importer](const auto& caller, const auto& source, const auto& cancelled) {
+                                return image_importer->preview(caller, source, cancelled);
+                            },
+                            [image_importer](const auto& caller, const auto& plan, auto& control) {
+                                return image_importer->commit(caller, plan, control);
+                            }
+                        })
+                        , bind_image_uploads(tasks, package_transfers, *configuration,
+                            (tool_data_dir.empty() ? std::string("/data/data/") + DROIDVM_PACKAGE_NAME : tool_data_dir) + "/usr/bin/qemu-img")
+                        , displays
+                        , [&, host_overview, disk_capacity](const droidvm::CallContext& caller) {
+                            auto result = host_overview->snapshot();
+                            // These are independent service observations. A failed
+                            // resource query stays unknown, never a fabricated zero.
+                            try {
+                                const auto rows = vms->list(caller);
+                                if (rows.isArray()) {
+                                    result.inventory.vm_count = static_cast<uint32_t>(rows.size());
+                                    uint32_t running = 0;
+                                    for (const auto& row : rows) if (droidvm::config::string(row, "state") == "RUNNING") ++running;
+                                    result.inventory.running_vm_count = running;
+                                }
+                            } catch (const droidvm::ServiceError&) {}
+                            try {
+                                const auto rows = network_config->list(caller);
+                                if (rows.isArray()) {
+                                    result.inventory.network_count = static_cast<uint32_t>(rows.size());
+                                    if (network_runtime) {
+                                        uint32_t running = 0;
+                                        for (const auto& row : rows)
+                                            if (network_runtime->get(caller, droidvm::config::uuid(row)).state == droidvm::NetworkState::running) ++running;
+                                        result.inventory.running_network_count = running;
+                                    }
+                                }
+                            } catch (const droidvm::ServiceError&) {}
+                            try {
+                                if (configuration->disks()) {
+                                    const auto snapshot = configuration->disks()->snapshot(caller);
+                                    const auto& rows = snapshot->document["disks"];
+                                    if (rows.isArray()) {
+                                        result.inventory.disk_count = static_cast<uint32_t>(rows.size());
+                                        std::vector<std::string> ids;
+                                        ids.reserve(rows.size());
+                                        for (const auto& row : rows) ids.push_back(droidvm::config::uuid(row));
+                                        const auto capacity = disk_capacity->read(snapshot->revision, std::move(ids));
+                                        result.inventory.disk_virtual_bytes = capacity.total_bytes;
+                                        result.inventory.disk_virtual_known_count = capacity.known_count;
+                                        result.inventory.disk_virtual_observed_at_ms = capacity.observed_at_ms;
+                                    }
+                                }
+                            } catch (const droidvm::ServiceError&) {}
+                            return droidvm::web::host_overview_catalog(result);
+                        }
+                        , hugepage_service ? droidvm::web::hugepage_operations({
+                            [&](const droidvm::CallContext& caller) { return hugepage_service->snapshot(caller); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return hugepage_service->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return hugepage_service->status(caller, request); }
+                        }) : droidvm::web::HugepageOperations{}
+                        , hugepage_process_service ? droidvm::web::hugepage_process_operations({
+                            [&](const droidvm::CallContext& caller, const std::string& source) { return hugepage_process_service->snapshot(caller, source); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& expected) { return hugepage_process_service->stack(caller, expected); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return hugepage_process_service->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return hugepage_process_service->status(caller, request); }
+                        }) : droidvm::web::HugepageProcessOperations{}
+                        , host_preferences ? droidvm::web::host_preference_operations({
+                            [&](const droidvm::CallContext& caller) { return host_preferences->snapshot(caller); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return host_preferences->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return host_preferences->status(caller, request); }
+                        }) : droidvm::web::WebServiceOperations{}
+                        , usb_acm ? droidvm::web::usb_acm_operations({
+                            [&](const droidvm::CallContext& caller) { return usb_acm->snapshot(caller); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return usb_acm->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return usb_acm->status(caller, request); }
+                        }) : droidvm::web::WebServiceOperations{}
+                        , disk_defaults ? droidvm::web::host_preference_operations({
+                            [&](const droidvm::CallContext& caller) { return disk_defaults->snapshot(caller); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return disk_defaults->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return disk_defaults->status(caller, request); }
+                        }, droidvm::HostPreferenceDomain::disk_operations) : droidvm::web::WebServiceOperations{}
+                        , [&](const droidvm::CallContext& caller, const std::string& id) {
+                            const auto detail = disk_inspection->read(caller, id, true);
+                            const auto references = droidvm::config::disk_references(detail.vms.document, detail.disks.document);
+                            return droidvm::web::disk_detail(droidvm::web::disk_catalog(detail.disks, droidvm::config::disk_path,
+                                droidvm::config::valid_disk_paths(detail.disks.document), references.bases),
+                                detail.vms, id, detail.state, detail.image, detail.effective_compression);
+                        }
+                        , true
+                    }, usb ? droidvm::web::usb_operations(tasks, [&](const droidvm::CallContext&, const droidvm::web::UsbOperation& operation) {
+                        Json::Value params;
+                        params["device"] = operation.sysfs;
+                        params["target"] = operation.target["kind"] == "idle" ? Json::Value("sink") : operation.target["kind"];
+                        if (operation.vm_observation) {
+                            params["vm_id"] = operation.target["vmId"];
+                            params["controller"] = operation.target["controllerId"];
+                        }
+                        try {
+                            usb->set_target_checked(params, [&](const Json::Value& current) {
+                                droidvm::web::require_usb_observation(operation, droidvm::web::usb_catalog(current));
+                            }, operation.vm_observation);
+                        } catch (const droidvm::usb::RequestError& error) {
+                            throw droidvm::ServiceError(droidvm::ErrorCode::io_error, error.what());
+                        }
+                    }) : droidvm::web::UsbOperations{}, usb ? droidvm::web::usb_rules_configuration(tasks, {
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& revision, size_t bytes) {
+                            return uploads->begin_usb_rules(caller, revision, bytes);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+                            return uploads->append_usb_rules(caller, id, offset, bytes);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) {
+                            return uploads->commit_usb_rules(caller, id);
+                        },
+                        [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& id) { uploads->abort_usb_rules(caller, id); }
+                    }, [&](const droidvm::CallContext&) { return usb->rules_snapshot(); },
+                    [&](const droidvm::CallContext&) { return usb->rule_targets(); },
+                    [&](const droidvm::CallContext&, const std::string& revision) { return usb->rules_preview(revision); }) : droidvm::web::ConfigOperations{}, std::move(session_persistence));
+                auto rescue_maintenance = std::make_shared<RescueMaintenance>(rescue_sessions, package_transfers);
+                dispatcher.set_web([&](const auto& caller, const auto& command, const auto& request) { return web->execute(caller, command, request); },
+                    [&, rescue_maintenance] {
+                        schedule_rescue_maintenance(tasks, rescue_maintenance);
+                        web->schedule();
+                    }, [&] { web->stop(); });
+            }
+#endif
             if (packages) dispatcher.set_packages(packages.get());
             if (configuration) {
-                dispatcher.set_configuration(configuration.get());
                 droidvm::pkg::DiskOperationContext operation_context;
                 operation_context.configuration = configuration.get();
                 operation_context.directory = files.get(); operation_context.owner = layout->owner();
@@ -461,11 +1205,16 @@ int main(int argc, char** argv) {
                 result = droidvm::serve(*instance, dispatcher, token.c_str(), signal_fd.get(), log.get());
             }, report_failure);
             // Task teardown completes while both the instance lock and log are held.
+#ifdef DROIDVM_WEB_HTTP_TRANSPORT
+            if (!cleanup.attempt("WebUI", [&] { if (web) web->stop(); }, report_failure)) incomplete_worker_shutdown();
+#endif
             cleanup.attempt("packages", [&] { if (packages) packages->shutdown(); }, report_failure);
             cleanup.attempt("disk operations", [&] { if (disk_operations) disk_operations->shutdown(); }, report_failure);
-            cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure);
+            if (!cleanup.attempt("tasks", [&] { tasks.shutdown(); }, report_failure)) incomplete_worker_shutdown();
+            if (!cleanup.attempt("rescue sessions", [&] { close_rescue_sessions(rescue_sessions, vms); }, report_failure))
+                incomplete_worker_shutdown();
             // VMs leave before USB/networks: their taps and devices go with them.
-            cleanup.attempt("VMs", [&] { if (vms) vms->stop_all(); }, report_failure);
+            if (!cleanup.attempt("VMs", [&] { if (vms) vms->stop_all(); }, report_failure)) incomplete_worker_shutdown();
             cleanup.attempt("USB", [&] { if (usb) usb->shutdown(); }, report_failure);
             cleanup.attempt("host address monitor", [&] { if (host_ipv4) host_ipv4->stop(); }, report_failure);
 #ifdef DROIDVM_PLATFORM_SERVICES
