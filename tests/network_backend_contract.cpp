@@ -323,6 +323,53 @@ void collision_and_replacement() {
     test.netbox.delete_link(test.name);
     test.finish();
 }
+void tap_bridge_owner_recovery() {
+    for (const bool tagged : {false, true}) {
+        Case test;
+        const auto owner = random_id(true), tap = test.name + "t";
+        {
+            OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+            links.bridge(owner, test.name);
+            auto bridge = test.name;
+            if (tagged) {
+                bridge = OwnedLinks::vlan_device(test.name, 123);
+                const auto leg = OwnedLinks::vlan_leg(test.name, 123);
+                links.bridge(owner, bridge);
+                links.vlan(owner, test.name, leg, 123);
+                test.netbox.master(leg, bridge);
+            }
+            links.tap(owner + "/" + tap, tap);
+            test.netbox.master(tap, bridge);
+        }
+        OwnedLinks restarted(test.directory.get(), getuid(), test.netbox);
+        check(restarted.recover_all().empty(), "restart recovers TAP with network/TAP owner from main or VLAN bridge");
+        check(restarted.inventory()["links"].empty() && !exists(tap) && !exists(test.name), "recovery removes owned TAP and topology");
+        test.finish();
+    }
+    for (const int scenario : {0, 1, 2}) {
+        Case test;
+        const auto owner = random_id(true), tap = test.name + "t";
+        const auto tap_owner = scenario == 0 ? owner + "-other/" + tap :
+            scenario == 1 ? owner + "/wrong-port" : owner + "/" + tap;
+        OwnedLinks links(test.directory.get(), getuid(), test.netbox);
+        links.bridge(owner, test.name);
+        links.tap(tap_owner, tap);
+        if (scenario == 2) {
+            test.netbox.delete_link(test.name);
+            test.netbox.add_bridge(test.name);
+        }
+        test.netbox.master(tap, test.name);
+        const auto bridge_index = if_nametoindex(test.name.c_str()), tap_index = if_nametoindex(tap.c_str());
+        OwnedLinks restarted(test.directory.get(), getuid(), test.netbox);
+        check(restarted.recover_all().size() == 2, "wrong network, wrong TAP suffix or replaced bridge blocks cleanup");
+        check(if_nametoindex(test.name.c_str()) == bridge_index && if_nametoindex(tap.c_str()) == tap_index &&
+            row(test.netbox, tap)["master"] == test.name, "unverified relationship remains untouched");
+        test.netbox.nomaster(tap);
+        if (scenario == 2) test.netbox.delete_link(test.name); // This test created the replacement.
+        check(restarted.recover_all().empty(), "cleanup resumes after test resolves the conflict");
+        test.finish();
+    }
+}
 void dependencies_and_partial_cleanup() {
     Case test;
     OwnedLinks links(test.directory.get(), getuid(), test.netbox);
@@ -892,6 +939,9 @@ void daemon_linux_topology_recovery() {
             OwnedLinks links(run.get(), getuid(), test.netbox);
             OwnedRules rules(run.get(), getuid(), links);
             const auto id = links.inventory()["links"][0]["owner"].asString();
+            const auto tap = test.name + "v";
+            links.tap(id + "/" + tap, tap);
+            test.netbox.master(tap, test.name);
             rules.reconcile(id, test.name, false, {123456});
             rules.reconcile(id, test.name, true, {123456});
             OwnedRoutes route_owner(run.get(), getuid(), links);
@@ -935,7 +985,7 @@ void daemon_linux_topology_recovery() {
             throw std::runtime_error("daemon topology recovery did not reach readiness");
         }
         Fd run(open((test.path + "/run").c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        check(!exists(test.name) && config::JsonFile(run.get(), "network-links.json", getuid()).load()->value["links"].empty(),
+        check(!exists(test.name) && !exists(test.name + "v") && config::JsonFile(run.get(), "network-links.json", getuid()).load()->value["links"].empty(),
             "actual daemon reclaims topology before publishing readiness");
         check(config::JsonFile(run.get(), "network-rules.json", getuid()).load()->value["rules"].empty() &&
             observed_rules(test, false).empty() && observed_rules(test, true).empty(), "actual daemon reclaims both policy families before links and readiness");
@@ -944,7 +994,8 @@ void daemon_linux_topology_recovery() {
         for (const char* name : {"run/network-links.json", "run/network-links.json.bak", "run/network-rules.json", "run/network-rules.json.bak",
                                 "run/network-routes.json", "run/network-routes.json.bak",
                                 "run/network-runtime.json", "run/network-runtime.json.bak", // host address monitor
-                                "run/droidvmd.lock", "cache/daemon.log", "bin/netbox", "fixture.apk"})
+                                "run/droidvmd.lock", "run/audio_devices", "files/vms.config-owner",
+                                "cache/daemon.log", "bin/netbox", "fixture.apk"})
             unlink((test.path + "/" + name).c_str());
         for (const char* name : {"run", "bin", "cache", "files"}) check(rmdir((test.path + "/" + name).c_str()) == 0, "remove isolated daemon topology directory");
         test.finish();
@@ -1184,6 +1235,12 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string_view(argv[1]) == "--firewall-crash") return firewall_crash_child(argv[2], std::string_view(argv[3]) == "6", argv[4]);
     if (argc == 4 && std::string_view(argv[1]) == "--forwarding-namespace") return forwarding_namespace_child(argv[2], argv[3]);
     if (getenv("DROIDVM_NETBOX_TEST")) return fake(argc, argv);
+    if (argc == 5 && std::string_view(argv[1]) == "--tap-recovery-only") {
+        executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
+        return run({{"tap_bridge_owner_recovery", tap_bridge_owner_recovery},
+            {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
+            {"actual_daemon_linux_topology_recovery", daemon_linux_topology_recovery}});
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--routes-only") {
         executable = argv[2]; work = argv[3]; daemon_executable = argv[4];
         return run({{"real_return_routes", real_return_routes}, {"return_route_conflicts", return_route_conflicts},
@@ -1281,7 +1338,8 @@ int main(int argc, char** argv) {
         {"return_route_journal_failures", return_route_journal_failures}, {"twelve_return_route_sigkill_boundaries", return_route_crash_recovery},
         {"policy_conflicts_replacement_and_races", policy_conflicts_and_races}, {"policy_journal_failures", policy_journal_failures},
         {"twelve_policy_sigkill_boundaries", policy_crash_recovery},
-        {"conflicts_and_replaced_identity", collision_and_replacement}, {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
+        {"conflicts_and_replaced_identity", collision_and_replacement}, {"tap_bridge_owner_recovery", tap_bridge_owner_recovery},
+        {"dependencies_and_partial_cleanup", dependencies_and_partial_cleanup},
         {"setup_failure_and_journal_retry", failures_and_journal}, {"twenty_five_sigkill_boundaries", crash_recovery},
         {"exclusive_creation_and_index_deletion_races", lifecycle_races}, {"real_netbox_address_monitor", real_address_monitor},
         {"real_linux_topology", real_linux_topology}, {"linux_topology_failure_and_recovery", linux_topology_failure_and_recovery},

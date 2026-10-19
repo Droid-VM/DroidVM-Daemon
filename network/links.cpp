@@ -267,11 +267,15 @@ void OwnedLinks::remove_at(Json::ArrayIndex index) {
                 if (!entry) { require(errno == 0, "read network dependencies"); break; }
                 const std::string_view child(entry->d_name);
                 if (!child.starts_with("upper_")) continue;
-                // An owned port can be removed from its owned bridge. Other
-                // uppers (notably VLAN children) must be removed explicitly.
+                // VM TAPs use network-owner/TAP-name, while their bridge uses
+                // network-owner. Accept only that exact recorded relationship,
+                // never a shared prefix or an unverified upper interface.
                 bool owned_master = false;
                 for (const auto& row : document_["links"]) if (row["name"] == child.substr(6) &&
-                    row["kind"] == "bridge" && row["owner"] == record["owner"] && matches(row, false))
+                    row["kind"] == "bridge" &&
+                    (row["owner"] == record["owner"] || (record["kind"] == "tap" &&
+                        record["owner"].asString() == row["owner"].asString() + "/" + configured_name)) &&
+                    matches(row, false))
                     owned_master = true;
                 if (!owned_master) throw ServiceError(ErrorCode::conflict, "network link has an unowned upper dependency: " + name);
             }
