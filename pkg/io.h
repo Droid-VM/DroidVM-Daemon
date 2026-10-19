@@ -154,6 +154,8 @@ bool is_file(const std::string& path);
 bool exists(const std::string& path);
 int64_t file_length(const std::string& path); // File.length(): 0 when unknown
 bool make_dirs(const std::string& path, bool durable = false); // File.mkdirs(); optional directory fsync.
+// Match a newly created directory's access to its parent, including Android app ownership.
+void inherit_directory_access(int directory, int parent);
 void delete_tree(const std::string& path);
 // Retains the parent and new directory identities for an import's whole lifetime.
 // Destruction closes handles only; removal is explicit and rejects replacement.

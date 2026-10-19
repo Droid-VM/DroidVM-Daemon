@@ -35,11 +35,12 @@ int write_package(const PackageSpec& spec, const std::string& manifest_bytes, co
         const auto header = Header::build(spec.manifest_version, spec.app_version_code, manifest_bytes.size(), spec.compression,
                                           static_cast<int64_t>(end - start), 0);
         out.write_at(0, std::string_view(header.data(), header.size()));
+        if (spec.completed_file) { out.flush(); spec.completed_file(spec.dest, out.fd()); }
         out.close();
         return 0;
     }
     // Sub-volumes first, then the metadata master at the picked path.
-    VolumeSplitSink volumes(spec.dest, spec.volume_size);
+    VolumeSplitSink volumes(spec.dest, spec.volume_size, spec.completed_file);
     spec.splitting(&volumes);
     try {
         stream(volumes, spec.compression, manifest_bytes, pack);
@@ -61,6 +62,7 @@ int write_package(const PackageSpec& spec, const std::string& manifest_bytes, co
     const auto header = Header::build(spec.manifest_version, spec.app_version_code, manifest_bytes.size(), spec.compression,
                                       index.data_size, count);
     out.write_at(0, std::string_view(header.data(), header.size()));
+    if (spec.completed_file) { out.flush(); spec.completed_file(spec.dest, out.fd()); }
     out.close();
     // Drop higher-numbered sub-volumes left by an earlier, larger export.
     for (int i = count + 1; i <= volume_max_count; ++i) {

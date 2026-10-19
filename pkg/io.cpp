@@ -513,6 +513,19 @@ int64_t file_length(const std::string& path) {
     struct stat info{};
     return stat(path.c_str(), &info) == 0 ? static_cast<int64_t>(info.st_size) : 0;
 }
+void inherit_directory_access(int directory, int parent) {
+    struct stat ancestor{}, opened{};
+    if (fstat(parent, &ancestor) != 0 || fstat(directory, &opened) != 0)
+        throw Error(errno_message("inspect directory access", errno));
+    if ((opened.st_uid != ancestor.st_uid || opened.st_gid != ancestor.st_gid)
+            && fchown(directory, ancestor.st_uid, ancestor.st_gid) != 0)
+        throw Error(errno_message("set directory ownership", errno));
+    if (fstat(directory, &opened) != 0)
+        throw Error(errno_message("inspect directory permissions", errno));
+    const auto mode = ancestor.st_mode & 0777;
+    if ((opened.st_mode & 0777) != mode && fchmod(directory, mode) != 0)
+        throw Error(errno_message("set directory permissions", errno));
+}
 bool make_dirs(const std::string& path, bool durable) {
     if (exists(path)) return false;
     const auto parent = dirname(normalize(path));

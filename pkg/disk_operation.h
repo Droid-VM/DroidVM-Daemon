@@ -41,7 +41,12 @@ public:
     // {"disk_revision","disk_id","action":"resize|convert|flatten",...} ->
     // {"task_id","epoch"}. Admission errors (stale revision, busy files or rows,
     // header/registry mismatch) are thrown before a task exists.
+    // clone optionally accepts create_folder: true to create only the target
+    // folder's final component; its parent must exist. Failed clones keep it.
     Json::Value start(const CallContext& caller, const Json::Value& request);
+    // Execute inside an already-admitted TaskService record. The HTTP adapter
+    // deduplicates before entering this method; no nested task is created.
+    TaskCompletion execute(const CallContext& caller, const Json::Value& request, TaskControl& control);
     // Administrator retry of operations whose cleanup or registry follow-up
     // could not finish. {"pending": n}; nothing is resubmitted.
     Json::Value recover(const CallContext& caller);
@@ -52,6 +57,7 @@ private:
     DiskOperationContext context_;
     std::unique_ptr<config::JsonFile> journal_;
     mutable std::mutex journal_mutex_;
+    std::mutex recovery_mutex_; // App and Web must not replay the same record concurrently.
     Json::Value records_{Json::arrayValue};
     std::set<std::string> running_; // Records owned by live operations; replay skips them.
     std::shared_ptr<std::atomic<bool>> stopping_ = std::make_shared<std::atomic<bool>>(false);
@@ -59,6 +65,7 @@ private:
     void put_record(const Json::Value& record);
     void drop_record(const std::string& id);
     void replay();
+    std::shared_ptr<void> acquire_slot();
     bool replay_one(const Json::Value& record);
     bool replay_new(int directory, const Json::Value& record);
     bool replay_merge(const Json::Value& record);

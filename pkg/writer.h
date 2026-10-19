@@ -15,6 +15,9 @@ struct PackageSpec {
     int app_version_code = 0;
     // The sub-volume set while the data is written, then null.
     std::function<void(const VolumeSplitSink*)> splitting = [](const VolumeSplitSink*) {};
+    // Observe the original flushed inode before close, without reopening paths.
+    // This callback does not imply fsync or durable persistence.
+    std::function<void(const std::string&, int)> completed_file;
 };
 // "manifest too large: N bytes" past the 16-bit header field.
 std::string manifest_text(const Manifest& manifest);

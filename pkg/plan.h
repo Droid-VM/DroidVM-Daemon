@@ -28,6 +28,10 @@ public:
         const std::optional<std::string>& expected) const;
     // Raw qemu-img info of the held inode; backing names in it are descriptor-relative.
     Json::Value leased_info(const config::DiskFileLeases::Lease& lease, const std::string& path) const;
+    // Observe allocated compressed clusters, never repair or follow a backing
+    // image. Unknown/failed inspection is distinct from an uncompressed image.
+    std::optional<std::string> effective_compression(const config::DiskFileLeases::Lease& lease,
+        const std::string& path, const Json::Value& details) const;
     // rebaseBacking: qemu-img rebase -u -b <backing> -F <format> <overlay>.
     void rebase(const std::string& overlay, const std::string& backing) const;
     // Modify the retained overlay inode while storing the durable backing path.

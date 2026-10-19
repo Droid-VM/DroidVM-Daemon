@@ -63,6 +63,42 @@ Fd open_directory(const std::string& path) {
     if (directory.get() < 0) throw ServiceError(ErrorCode::io_error, errno_message("open disk directory", errno));
     return directory;
 }
+void verify_clone_directory(const std::string& path, int directory) {
+    struct stat opened{}, current{};
+    if (fstat(directory, &opened) != 0 || lstat(path.c_str(), &current) != 0
+            || !S_ISDIR(current.st_mode) || !same(opened, current))
+        throw ServiceError(ErrorCode::conflict, "Clone directory changed");
+}
+// Opt-in Linux preparation creates only the final component. Existing folders
+// keep their ownership; new folders inherit the parent's access for the App.
+// The folder deliberately survives failed/cancelled clones, just like App downloads.
+Fd open_clone_directory(const std::string& path) {
+    const auto parent = open_directory(dirname(path));
+    const auto name = file_name(path);
+    struct stat ancestor{};
+    if (fstat(parent.get(), &ancestor) != 0)
+        throw ServiceError(ErrorCode::io_error, errno_message("inspect clone parent directory", errno));
+    const auto mode = ancestor.st_mode & 0777;
+    const bool created = mkdirat(parent.get(), name.c_str(), mode) == 0;
+    if (!created && errno != EEXIST)
+        throw ServiceError(ErrorCode::io_error, errno_message("create clone directory", errno));
+    struct stat entry{};
+    if (fstatat(parent.get(), name.c_str(), &entry, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(entry.st_mode))
+        throw ServiceError(ErrorCode::conflict, "Clone destination must be a real directory");
+    Fd directory(openat(parent.get(), name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    if (directory.get() < 0)
+        throw ServiceError(ErrorCode::io_error, errno_message("open clone directory", errno));
+    struct stat opened{};
+    if (fstat(directory.get(), &opened) != 0 || !same(opened, entry))
+        throw ServiceError(ErrorCode::conflict, "Clone directory changed while opening");
+    if (created) {
+        inherit_directory_access(directory.get(), parent.get());
+        sync_or_throw(directory.get(), "sync clone directory");
+        sync_or_throw(parent.get(), "sync clone parent directory");
+    }
+    verify_clone_directory(path, directory.get());
+    return directory;
+}
 // Installs a new image without replacing a file at the target. FUSE storage
 // (/storage/emulated) has no hard links: fall back to a no-replace rename, and
 // where that flag is unsupported to a rename after checking the target is free.
@@ -230,7 +266,7 @@ Json::Value removed_disks(Json::Value disks, const std::set<std::string>& ids) {
 
 class DiskOperationService::Operation {
 public:
-    Operation(DiskOperationService& owner, const Json::Value& request);
+    Operation(DiskOperationService& owner, const Json::Value& request, std::function<bool()> cancelled = {});
     ~Operation() {
         std::lock_guard lock(owner_.journal_mutex_);
         owner_.running_.erase(id_);
@@ -242,9 +278,11 @@ public:
 private:
     struct Member { std::string id, path, format; std::optional<std::string> parent; };
     DiskOperationService& owner_;
+    std::function<bool()> cancelled_;
     std::string id_ = random_id(false), action_, disk_id_, target_format_, compress_ = "none";
+    std::string confirmed_vm_revision_;
     int64_t size_ = 0;
-    bool shrink_ = false, preallocate_ = false;
+    bool shrink_ = false, preallocate_ = false, create_folder_ = false;
     std::vector<int> cpus_;
     // create/clone write a new registered image instead of replacing one.
     bool fresh_ = false;
@@ -281,8 +319,14 @@ private:
     void finish_flatten();
     Json::Value result() const;
 };
-DiskOperationService::Operation::Operation(DiskOperationService& owner, const Json::Value& request) : owner_(owner) {
+DiskOperationService::Operation::Operation(DiskOperationService& owner, const Json::Value& request, std::function<bool()> cancelled)
+    : owner_(owner), cancelled_(std::move(cancelled)) {
     if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Disk operation request must be an object");
+    if (request.isMember("vm_revision")) {
+        if (!request["vm_revision"].isString() || request["vm_revision"].asString().empty() || request["vm_revision"].asString().size() > 128)
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid VM revision");
+        confirmed_vm_revision_ = request["vm_revision"].asString();
+    }
     const auto& revision = request["disk_revision"];
     if (!revision.isString() || revision.asString().empty() || revision.asString().size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "Disk revision is required");
@@ -290,6 +334,11 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone"
             && action_ != "commit" && action_ != "delete" && action_ != "reset")
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
+    if (request.isMember("create_folder")) {
+        if (action_ != "clone" || !request["create_folder"].isBool())
+            throw ServiceError(ErrorCode::invalid_argument, "create_folder is only valid as a clone boolean");
+        create_folder_ = request["create_folder"].asBool();
+    }
     cpus_ = parse_cpus(request);
     if (action_ == "commit" || action_ == "delete") {
         admit_tree(request, revision.asString());
@@ -302,6 +351,8 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         const auto& name = request["name"];
         if (!folder.isString() || !name.isString()) throw ServiceError(ErrorCode::invalid_argument, "Folder and name are required");
         folder_ = folder.asString(); name_ = name.asString();
+        if (create_folder_ && folder_ == "/")
+            throw ServiceError(ErrorCode::invalid_argument, "Clone directory must have a final component");
         const auto component = [](std::string_view part) { return part.empty() || part == "." || part == ".."; };
         if (folder_.empty() || folder_.front() != '/' || folder_.find('\0') != std::string::npos || folder_.size() > 4096
                 || (folder_.size() > 1 && folder_.back() == '/'))
@@ -400,12 +451,12 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
     std::set<std::string> shared;
     for (size_t i = fresh_ ? 0 : 1; i < chain_.size(); ++i) shared.insert(chain_[i].id);
     if (fresh_) disk_id_ = random_id(true);
-    reservation_ = configuration->reserve_disks(revision.asString(), {disk_id_}, shared);
+    reservation_ = configuration->reserve_disks(revision.asString(), {disk_id_}, shared, confirmed_vm_revision_);
     std::vector<config::DiskFileLeases::Request> files;
     for (size_t i = 0; i < chain_.size(); ++i) files.push_back({chain_[i].path, i == 0 && !fresh_});
     if (!files.empty()) lease_ = configuration->disk_files()->acquire(files);
     const auto stopping = owner_.stopping_;
-    const Images images(tool(), [stopping] { return stopping->load(); }, std::chrono::seconds(10));
+    const Images images(tool(), [stopping, cancelled = cancelled_] { return stopping->load() || (cancelled && cancelled()); }, std::chrono::seconds(10));
     for (auto& member : chain_) {
         try { member.format = images.validate_backing(*lease_, member.path, member.parent).format; }
         catch (const ServiceError&) { throw; }
@@ -519,7 +570,7 @@ void DiskOperationService::Operation::admit_tree(const Json::Value& request, con
             if (exclusive.contains(record["disk_id"].asString()))
                 throw ServiceError(ErrorCode::unavailable, "An interrupted operation on this disk must be recovered first");
     }
-    reservation_ = configuration->reserve_disks(revision, exclusive, shared);
+    reservation_ = configuration->reserve_disks(revision, exclusive, shared, confirmed_vm_revision_);
     if (!files.empty()) lease_ = configuration->disk_files()->acquire(files);
     if (action_ == "delete") {
         if (!lease_) return;
@@ -536,7 +587,7 @@ void DiskOperationService::Operation::admit_tree(const Json::Value& request, con
         return;
     }
     const auto stopping = owner_.stopping_;
-    const Images images(tool(), [stopping] { return stopping->load(); }, std::chrono::seconds(10));
+    const Images images(tool(), [stopping, cancelled = cancelled_] { return stopping->load() || (cancelled && cancelled()); }, std::chrono::seconds(10));
     auto inspect = [&](Member& member) {
         try { member.format = images.validate_backing(*lease_, member.path, member.parent).format; }
         catch (const ServiceError&) { throw; }
@@ -630,7 +681,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     const auto path = target();
     const auto name = file_name(path);
     const auto directory_path = dirname(path);
-    const auto directory = open_directory(directory_path);
+    const auto directory = create_folder_ ? open_clone_directory(directory_path) : open_directory(directory_path);
     struct stat source{};
     if (fresh_) {
         // New images belong to the folder owner, like files the app creates there.
@@ -706,6 +757,7 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
         if (fstatat(directory.get(), temporary.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0 || !same(current, made))
             throw ServiceError(ErrorCode::conflict, "Disk operation temporary file was replaced");
         if (lease_) lease_->verify();
+        if (create_folder_) verify_clone_directory(directory_path, directory.get());
         if (!control.enter_commit()) { discard(); return TaskCompletion::cancelled(); }
         record["phase"] = "replacing";
         owner_.put_record(record);
@@ -728,7 +780,15 @@ TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {
     sync_or_throw(directory.get(), "sync disk directory");
     fault("replaced");
     if (installs() || action_ == "flatten") {
-        try { fresh_ ? register_new() : relocate_ ? relocate_registry() : finish_flatten(); }
+        try {
+            if (create_folder_) {
+                try { verify_clone_directory(directory_path, directory.get()); }
+                catch (const ServiceError&) {
+                    throw ServiceError(ErrorCode::commit_uncertain, "Clone directory changed after installation; recover disk operations");
+                }
+            }
+            fresh_ ? register_new() : relocate_ ? relocate_registry() : finish_flatten();
+        }
         catch (const ServiceError& error) {
             owner_.context_.log("WARN", "DiskOperation: registry update deferred: " + std::string(error.what()));
             // A definite rejection leaves the new file unregistered: roll it back.
@@ -1141,13 +1201,15 @@ size_t DiskOperationService::pending() const {
 }
 Json::Value DiskOperationService::recover(const CallContext& caller) {
     require_access(caller);
+    std::unique_lock recovery(recovery_mutex_, std::try_to_lock);
+    if (!recovery.owns_lock()) throw ServiceError(ErrorCode::conflict, "Disk recovery already running");
+    if (stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
     replay();
     Json::Value result;
     result["pending"] = Json::UInt64(pending());
     return result;
 }
-Json::Value DiskOperationService::start(const CallContext& caller, const Json::Value& request) {
-    require_access(caller);
+std::shared_ptr<void> DiskOperationService::acquire_slot() {
     if (stopping_->load()) throw ServiceError(ErrorCode::unavailable, "the daemon is shutting down");
     struct Slot {
         std::shared_ptr<std::atomic<size_t>> active;
@@ -1160,6 +1222,24 @@ Json::Value DiskOperationService::start(const CallContext& caller, const Json::V
     do { if (count >= max_tasks) throw ServiceError(ErrorCode::resource_exhausted, "Too many disk operations are running"); }
     while (!active_->compare_exchange_weak(count, count + 1));
     slot->held = true;
+    return slot;
+}
+TaskCompletion DiskOperationService::execute(const CallContext& caller, const Json::Value& request, TaskControl& control) {
+    require_access(caller);
+    if (control.cancellation_requested()) return TaskCompletion::cancelled();
+    const auto slot = acquire_slot();
+    std::unique_ptr<Operation> operation;
+    try { operation = std::make_unique<Operation>(*this, request, [&control] { return control.cancellation_requested(); }); }
+    catch (...) {
+        if (control.cancellation_requested()) return TaskCompletion::cancelled();
+        throw;
+    }
+    if (control.cancellation_requested()) return TaskCompletion::cancelled();
+    return operation->run(control);
+}
+Json::Value DiskOperationService::start(const CallContext& caller, const Json::Value& request) {
+    require_access(caller);
+    const auto slot = acquire_slot();
     // One cell: leases and reservations end with the work, not with the callbacks.
     auto cell = std::make_shared<std::shared_ptr<Operation>>(std::make_shared<Operation>(*this, request));
     const auto resource = "disk:" + (*cell)->disk_id();

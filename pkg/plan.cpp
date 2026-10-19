@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "plan.h"
 #include "common/identity.h"
+#include "common/wire.h"
 #include "runtime/child.h"
 #include "store/network_config.h"
 #include "vm/nic.h"
@@ -9,6 +10,7 @@
 #include <climits>
 #include <sys/stat.h>
 #include <map>
+#include <algorithm>
 
 namespace droidvm::pkg {
 Json::Value Images::info(const std::string& path, std::vector<int> fds) const {
@@ -72,6 +74,77 @@ Json::Value Images::leased_info(const config::DiskFileLeases::Lease& lease, cons
     auto details = info("/proc/self/fd/" + std::to_string(fd), {fd});
     lease.verify();
     return details;
+}
+std::optional<std::string> Images::effective_compression(const config::DiskFileLeases::Lease& lease,
+        const std::string& path, const Json::Value& details) const {
+    lease.verify();
+    const auto& format = config::member(details, "format");
+    const auto& data = config::member(config::member(details, "format-specific"), "data");
+    const auto& encrypted = config::member(details, "encrypted");
+    if (!config::member(data, "data-file").isNull() || !config::member(data, "encrypt").isNull() ||
+        (!encrypted.isNull() && (!encrypted.isBool() || encrypted.asBool()))) return std::nullopt;
+    if (!format.isString()) return std::nullopt;
+    if (format.asString() == "raw") return "none";
+    if (format.asString() != "qcow2") return std::nullopt;
+
+    const int fd = lease.read_fd(path); // O_RDONLY; Child only borrows this descriptor.
+    Json::Value graph;
+    graph["driver"] = "qcow2";
+    graph["read-only"] = true;
+    graph["file"]["driver"] = "file";
+    graph["file"]["filename"] = "/proc/self/fd/" + std::to_string(fd);
+    graph["file"]["read-only"] = true;
+    graph["backing"] = Json::nullValue;
+    std::optional<std::string> compression;
+    try {
+        ChildOptions options;
+        // No -r: check is observation only. The explicit graph prevents opening
+        // any unleased header backing path and refuses writes at both layers.
+        options.argv = {qemu_img_, "check", "--output=json", "json:" + wire::stringify(graph)};
+        options.preserve_fds = {fd};
+        const auto output = Child(options).communicate({},
+            std::min(inspection_timeout_, std::chrono::milliseconds(5000)), 64u << 10, cancelled_);
+        if (output.exit_code == 0 && !output.timed_out && !output.cancelled && !output.truncated) {
+            const auto result = parse_object(output.output);
+            const auto nonnegative_integer = [](const Json::Value& value) {
+                return value.type() == Json::uintValue ||
+                    (value.type() == Json::intValue && value.asInt64() >= 0);
+            };
+            const auto zero = [&](const Json::Value& value) {
+                return nonnegative_integer(value) && value.asUInt64() == 0;
+            };
+            bool clean = zero(config::member(result, "check-errors"));
+            for (const char* key : {"corruptions", "leaks", "corruptions-fixed", "leaks-fixed"})
+                if (result.isMember(key) && !zero(result[key])) clean = false;
+            const auto& count = config::member(result, "compressed-clusters");
+            // QEMU collect_image_check omits compressed-clusters when zero.
+            // Accept that encoding only with the mandatory ImageCheck identity
+            // and positive qcow2 scan statistics; a partial object is unknown.
+            bool omitted_zero = !result.isMember("compressed-clusters") &&
+                config::member(result, "format") == "qcow2" &&
+                config::member(result, "filename").isString() && !result["filename"].asString().empty();
+            bool has_statistics = false;
+            for (const char* key : {"image-end-offset", "total-clusters", "allocated-clusters"}) {
+                const auto& value = config::member(result, key);
+                if (result.isMember(key) && !nonnegative_integer(value)) clean = false;
+                if (nonnegative_integer(value) && value.asUInt64() > 0) has_statistics = true;
+            }
+            omitted_zero = omitted_zero && has_statistics;
+            if (clean && (omitted_zero || nonnegative_integer(count))) {
+                if (omitted_zero || count.asUInt64() == 0) compression = "none";
+                else {
+                    const auto& algorithm = config::member(data, "compression-type");
+                    if (algorithm.isString() && algorithm.asString() == "zlib") compression = "deflate";
+                    else if (algorithm.isString() && algorithm.asString() == "zstd") compression = "zstd";
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        // Missing tool, unsupported check and invalid output remain unknown.
+    }
+    // Identity conflicts must escape even when the tool failed.
+    lease.verify();
+    return compression;
 }
 config::DiskImageInfo Images::validate_backing(const config::DiskFileLeases::Lease& lease, const std::string& path,
         const std::optional<std::string>& expected) const {

@@ -4,7 +4,11 @@
 #include "pkg/plan.h"
 #include "pkg/writer.h"
 #include "pkg/service.h"
+#include "pkg/import_preview.h"
+#include "pkg/transfers.h"
 #include "pkg/disk_operation.h"
+#include "pkg/disk_inspection.h"
+#include "pkg/image_import.h"
 #include "services/legacy_events.h"
 #include "services/vm.h"
 #include "services/network_config.h"
@@ -38,11 +42,13 @@ void service_access() {
     context.tasks = &tasks;
     PkgService packages(context);
     for (const auto& caller : {CallContext{}, CallContext{"reader", true, true, false}, CallContext{"admin", true, false, true}}) {
-        for (bool importing : {false, true}) {
+        for (int operation = 0; operation < 4; ++operation) {
             bool denied = false;
             try {
-                if (importing) packages.vm_import(caller, Json::Value());
-                else packages.vm_export(caller, Json::Value());
+                if (operation == 0) packages.vm_import(caller, Json::Value());
+                else if (operation == 1) packages.vm_export(caller, Json::Value());
+                else if (operation == 2) packages.export_plan(caller, "invalid");
+                else packages.vm_export_checked(caller, Json::Value(), {}, "request");
             } catch (const ServiceError& error) {
                 denied = error.code() == (caller.authenticated ? ErrorCode::permission_denied : ErrorCode::unauthenticated);
             }
@@ -365,7 +371,7 @@ std::vector<Entry> read_path(const std::string& path) {
     FileSource in(path);
     return read_package(in);
 }
-void joint_import(const std::string& fault) {
+void joint_import(const std::string& fault, bool checked = false) {
     using namespace std::chrono_literals;
     Temporary dir;
     const CallContext caller{"package-owner", true, true, true};
@@ -377,6 +383,7 @@ void joint_import(const std::string& fault) {
     VmService vms(runtime);
     TaskLimits limits;
     limits.background_workers = 1;
+    limits.max_result_bytes = import_plan_bytes;
     TaskService tasks(limits, [] { return TaskService::Clock::now(); }, {}, gate);
     bool armed = false, injected = false;
     ConfigurationService configuration(directory.get(), getuid(), gate, vms, tasks,
@@ -394,6 +401,11 @@ void joint_import(const std::string& fault) {
     manifest.vm["name"] = "joint-import";
     manifest.vm["networks"] = Json::Value(Json::arrayValue);
     manifest.disks.clear(); manifest.boots.clear(); manifest.networks.clear();
+    if (checked) {
+        auto network = wire::parse(R"({"schema":2,"name":"imported","bridge_name":"brimport","bridge_type":"gvisor","uplink_mode":"l3","pkg_network_ref":"net0","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"10.40.0.1/24","dhcp":{"enabled":true}}}]}})");
+        manifest.networks.push_back(network);
+        manifest.vm["networks"].append(wire::parse(R"({"pkg_network_ref":"net0","dhcp4_lease":{"enabled":true,"offset":64}})"));
+    }
     manifest.compression = Compression::none;
     DiskEntry disk;
     disk.name = disk.archive_path = "disk.img"; disk.format = "RAW"; disk.size = 7;
@@ -410,8 +422,50 @@ void joint_import(const std::string& fault) {
     PkgService packages(context);
     Json::Value request;
     request["src_path"] = spec.dest; request["target_dir"] = dir.at("output");
+    auto await_task = [&](const Json::Value& response) {
+        const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+        auto view = tasks.get(caller, ref);
+        const auto end = TaskService::Clock::now() + 5s;
+        while (!task_terminal(view.state) && TaskService::Clock::now() < end) {
+            std::this_thread::sleep_for(1ms); view = tasks.get(caller, ref);
+        }
+        check(task_terminal(view.state), "import task bounded completion");
+        return view;
+    };
+    if (checked) {
+        request.removeMember("src_path");
+        request["network_plan"] = wire::parse(R"([{"ref":"net0","action":"create"}])");
+        const auto preview = await_task(packages.preview_import(caller, spec.dest, "import-preview"));
+        check(preview.state == TaskState::succeeded && preview.result["networks"].size() == 1 &&
+              preview.result["networks"][0]["create_allowed"].asBool() && !exists(dir.at("output")),
+              "preview reads metadata without extracting or registering");
+        if (fault.empty()) {
+            auto bad = request;
+            bad["network_plan"][0]["action"] = "unknown";
+            const auto invalid = await_task(packages.vm_import_checked(caller, bad, "import-preview", "invalid-import"));
+            check(invalid.state == TaskState::failed && invalid.error == ErrorCode::invalid_argument &&
+                  invalid.result["cleanup_complete"].asBool() && !exists(dir.at("output")), "checked network plan never silently ignores invalid choices");
+            const CallContext stranger{"other-package-owner", true, true, true};
+            const auto foreign = packages.vm_import_checked(stranger, request, "import-preview", "foreign-import");
+            const TaskRef foreign_ref{foreign["epoch"].asString(), foreign["task_id"].asString()};
+            auto foreign_task = tasks.get(stranger, foreign_ref);
+            const auto end = TaskService::Clock::now() + 5s;
+            while (!task_terminal(foreign_task.state) && TaskService::Clock::now() < end) {
+                std::this_thread::sleep_for(1ms); foreign_task = tasks.get(stranger, foreign_ref);
+            }
+            check(foreign_task.state == TaskState::failed && foreign_task.error == ErrorCode::not_found,
+                  "another administrator cannot consume an import preview");
+            const auto bytes = bytes_of(spec.dest);
+            put(spec.dest, bytes);
+            const auto changed = await_task(packages.vm_import_checked(caller, request, "import-preview", "changed-source-import"));
+            check(changed.state == TaskState::failed && changed.error == ErrorCode::conflict &&
+                  changed.result["cleanup_complete"].asBool() && !exists(dir.at("output")), "changed source observation invalidates import preview");
+        }
+        const auto fresh = await_task(packages.preview_import(caller, spec.dest, "fresh-import-preview"));
+        check(fresh.state == TaskState::succeeded, "fresh import preview");
+    }
     armed = true;
-    const auto response = packages.vm_import(caller, request);
+    const auto response = checked ? packages.vm_import_checked(caller, request, "fresh-import-preview", "checked-import") : packages.vm_import(caller, request);
     const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
     const auto deadline = TaskService::Clock::now() + 5s;
     auto task = tasks.get(caller, ref);
@@ -430,6 +484,18 @@ void joint_import(const std::string& fault) {
     const auto disk_view = configuration.disks()->snapshot(caller);
     check(vm_view->document["vms"].size() == (installed ? 1u : 0u) &&
           disk_view->document["disks"].size() == (installed ? 1u : 0u), "both import registries agree");
+    if (checked) {
+        const auto networks = configuration.networks().list(caller);
+        check(networks.size() == (installed ? 1u : 0u), "network commit agrees with VM and disk transaction");
+        check(task.result["registered"].asBool() == fault.empty() &&
+              task.result["registration_uncertain"].asBool() == (!fault.empty() && installed) &&
+              task.result["recovery_required"].asBool() == (!fault.empty() && installed), "checked import receipt distinguishes committed and uncertain registration");
+        if (installed) {
+            const auto& nic = vm_view->document["vms"][0]["networks"][0];
+            check(nic["network_id"] == networks[0]["id"] && nic["dhcp4_lease"]["enabled"].asBool(),
+                  "new network and static lease are prepared before joint registration");
+        }
+    }
     check(disk_view->document["extension"] == disk_document["extension"], "disk root extension retained");
     check(exists(dir.at("output/joint-import/disk.img")) == installed, "only rejected joint import deletes extracted image");
     if (installed) {
@@ -438,7 +504,7 @@ void joint_import(const std::string& fault) {
               "persisted VM references registered imported image");
         check(bytes_of(dir.at("output/joint-import/disk.img")) == "payload", "joint import preserves image bytes");
     }
-    if (fault.empty()) {
+    if (fault.empty() && !checked) {
         // Exercise the coordinator's real worker binding without starting any VMM.
         const auto image = dir.at("output/joint-import/disk.img");
         check(make_dirs(dir.at("usr/bin")), "create isolated image tool directory");
@@ -469,6 +535,96 @@ void joint_import(const std::string& fault) {
         const auto exported_entries = read_path(dir.at("export.vmpkg"));
         check(exported_entries.size() == 2 && exported_entries[1].data == "payload", "export preserves leased image bytes");
         { auto writer = configuration.disk_files()->acquire({{image, true}}); writer->verify(); }
+        // Checked exports share the same package queue, but image inspection
+        // follows acceptance and the three saved configuration confirmations.
+        auto confirmed_plan = packages.export_plan(caller, export_request["vm_id"].asString());
+        check(confirmed_plan["disks"].size() == 1 && confirmed_plan["disks"][0]["index"].asUInt() == 0 &&
+              confirmed_plan["disks"][0]["path"] == image, "export plan retains App attachment indices");
+        auto confirmation = [](const Json::Value& plan) {
+            return ExportConfirmation{plan["vm_revision"].asString(), plan["disk_revision"].asString(),
+                plan["network_revision"].asString()};
+        };
+        auto await_export = [&](const Json::Value& response) {
+            const TaskRef ref{response["epoch"].asString(), response["task_id"].asString()};
+            auto view = tasks.get(caller, ref);
+            const auto end = TaskService::Clock::now() + 5s;
+            while (!task_terminal(view.state) && TaskService::Clock::now() < end) {
+                std::this_thread::sleep_for(1ms); view = tasks.get(caller, ref);
+            }
+            check(task_terminal(view.state), "checked export completes within deadline");
+            return view;
+        };
+        const auto occupied = std::make_shared<std::atomic<bool>>(false);
+        const auto blocker = tasks.submit(caller, {"hold-export", "", 4, true, true}, [occupied](TaskControl& control) {
+            occupied->store(true);
+            while (!control.cancellation_requested()) std::this_thread::sleep_for(1ms);
+            return TaskCompletion::cancelled();
+        });
+        const auto occupied_deadline = TaskService::Clock::now() + 2s;
+        while (!occupied->load() && TaskService::Clock::now() < occupied_deadline) std::this_thread::yield();
+        check(occupied->load(), "hold checked export worker");
+        export_request["dest_path"] = dir.at("checked.vmpkg");
+        Json::Value accepted;
+        {
+            // The plan and acceptance must not inspect even a write-leased disk.
+            auto writer = configuration.disk_files()->acquire({{image, true}});
+            check(packages.export_plan(caller, export_request["vm_id"].asString()) == confirmed_plan,
+                  "export plan performs no image IO");
+            accepted = packages.vm_export_checked(caller, export_request, confirmation(confirmed_plan), "checked-stale");
+            check(tasks.get(caller, {accepted["epoch"].asString(), accepted["task_id"].asString()}).state == TaskState::queued,
+                  "checked export accepts before source inspection");
+            bool duplicate = false;
+            try { packages.vm_export_checked(caller, export_request, confirmation(confirmed_plan), "checked-stale"); }
+            catch (const ServiceError& error) { duplicate = error.code() == ErrorCode::conflict; }
+            check(duplicate, "same export request ID cannot submit another operation");
+        }
+        const auto before_edit = configuration.vms().snapshot(caller);
+        auto edited = before_edit->document;
+        edited["vms"][0]["name"] = "joint-import-renamed";
+        configuration.vms().replace(caller, before_edit->revision, edited);
+        tasks.cancel(caller, blocker);
+        const auto stale_export = await_export(accepted);
+        check(stale_export.state == TaskState::failed && stale_export.error == ErrorCode::conflict &&
+              !exists(dir.at("checked.vmpkg")), "queued export rejects changed configuration without writing");
+        confirmed_plan = packages.export_plan(caller, export_request["vm_id"].asString());
+        for (const bool disk_revision : {true, false}) {
+            auto stale = confirmation(confirmed_plan);
+            (disk_revision ? stale.disk_revision : stale.network_revision) = "obsolete";
+            const auto rejected = await_export(packages.vm_export_checked(caller, export_request, stale,
+                disk_revision ? "checked-disk-stale" : "checked-network-stale"));
+            check(rejected.state == TaskState::failed && rejected.error == ErrorCode::conflict &&
+                  !exists(dir.at("checked.vmpkg")), "checked export verifies every registry revision");
+        }
+        const auto checked_export = await_export(packages.vm_export_checked(caller, export_request,
+            confirmation(confirmed_plan), "checked-success"));
+        check(checked_export.state == TaskState::succeeded && checked_export.kind == "vm_export" &&
+              checked_export.resource == "package" && checked_export.result["done"] == checked_export.result["total"],
+              "checked export retains task identity and result counts");
+        const auto checked_entries = read_path(dir.at("checked.vmpkg"));
+        check(checked_entries.size() == 2 && checked_entries[1].data == "payload", "checked export reuses leased package writer");
+        for (const bool volume_alias : {false, true}) {
+            const auto destination = dir.at(volume_alias ? "source-alias-volume.vmpkg" : "source-alias.vmpkg");
+            const auto alias = volume_alias ? volume_name(destination, 999) : destination;
+            check(link(image.c_str(), alias.c_str()) == 0, "create package output hardlink alias");
+            export_request["dest_path"] = destination;
+            export_request["volume_size"] = Json::Int64(volume_alias ? min_volume_size : 0);
+            const auto rejected = await_export(packages.vm_export_checked(caller, export_request,
+                confirmation(confirmed_plan), volume_alias ? "checked-volume-alias" : "checked-source-alias"));
+            check(rejected.state == TaskState::failed && rejected.error == ErrorCode::conflict && bytes_of(image) == "payload",
+                  "checked export refuses source hardlinks across complete output namespace");
+        }
+        export_request["dest_path"] = dir.at("without-disks.vmpkg");
+        export_request["volume_size"] = 0;
+        export_request["disks"] = Json::Value(Json::arrayValue);
+        const auto without_disks = await_export(packages.vm_export_checked(caller, export_request,
+            confirmation(confirmed_plan), "checked-no-disks"));
+        check(without_disks.state == TaskState::succeeded && read_path(dir.at("without-disks.vmpkg")).size() == 1,
+              "checked empty disk selection exports configuration only");
+        export_request["dest_path"] = image;
+        const auto unselected_alias = await_export(packages.vm_export_checked(caller, export_request,
+            confirmation(confirmed_plan), "checked-unselected-alias"));
+        check(unselected_alias.state == TaskState::failed && unselected_alias.error == ErrorCode::conflict && bytes_of(image) == "payload",
+              "unchecked VM disks remain protected against destination overwrite");
         put(dir.at("usr/bin/qemu-img"), "#!/system/bin/sh\n"
             "case \"$3\" in /proc/self/fd/*) ;; *) exit 21;; esac\n"
             "[ \"$(cat \"$3\")\" = payload ] || exit 22\n"
@@ -683,6 +839,16 @@ void split_packages() {
     auto logical = set.open_logical();
     auto entries = read_package(*logical, set.data_size());
     check(entries.size() == 2 && entries[1].data == disk, "split round trip");
+    {
+        auto pool = std::make_shared<config::DiskFileLeases>();
+        ImportSource observed(pool, volume_name(base, 2));
+        const auto observation = observed.observation();
+        check(observation.size() == 4 && observed.master() == base, "preview observes master and every sub-volume");
+        auto retained = observed.open_logical();
+        const auto held_entries = read_package(*retained, observed.data_size());
+        check(held_entries.size() == 2 && held_entries[1].data == disk, "retained volume readers have independent positions and preserve CRC checks");
+        observed.verify();
+    }
     // The same set, read as one stream, equals a single-file package of that data.
     const auto chunk = bytes_of(volume_name(base, 2));
     put(volume_name(base, 2), chunk.substr(0, chunk.size() - 1));
@@ -761,6 +927,140 @@ void network_plan() {
         {"ref":"net1","action":"bogus","config":{"schema":1}},{"ref":"net2","action":"skip"},{"ref":"net3","config":{"schema":2,"name":"n"}}])"));
     check(parsed.size() == 3 && parsed[0].action == NetworkAction::join && parsed[0].network_id == "a" && parsed[1].action == NetworkAction::skip &&
           parsed[2].action == NetworkAction::create && parsed[2].config && find_ref(parsed, "net3") == &parsed[2] && !find_ref(parsed, "net1"), "plan parse drops bad entries");
+    Manifest manifest;
+    auto source = wire::parse(R"({"schema":2,"name":"source","bridge_name":"brsource","bridge_type":"linux","uplink_mode":"l3","pkg_network_ref":"net0","l3":{"vlans":[{"vlan_id":0,"ipv4":{"cidr":"10.0.0.1/24"},"ipv6":{"cidr":"fd10::1/64"}}]}})");
+    manifest.networks.push_back(source);
+    auto target = source;
+    target["id"] = "00000000-0000-4000-8000-000000000001";
+    Json::Value targets(Json::arrayValue); targets.append(target);
+    check(import_network_conflict(source, targets) == "ipv4", "checked import detects same-kind overlapping prefixes");
+    targets[0]["bridge_type"] = "gvisor";
+    check(import_network_conflict(source, targets).empty() && !import_same_kind(source, targets[0]), "different stacks neither conflict nor qualify for join");
+    const auto join = wire::parse(R"([{"ref":"net0","action":"join","network_id":"00000000-0000-4000-8000-000000000001"}])");
+    fails_any([&] { checked_network_plan(manifest, join, targets); }, "checked join rejects a different network kind");
+    targets[0]["bridge_type"] = "linux";
+    check(checked_network_plan(manifest, join, targets).size() == 1, "checked same-kind join accepted");
+    source["pkg_network_ref"] = "net1";
+    manifest.networks.push_back(source);
+    const auto create = wire::parse(R"([{"ref":"net0","action":"create"},{"ref":"net1","action":"create"}])");
+    fails_any([&] { checked_network_plan(manifest, create, Json::Value(Json::arrayValue)); }, "two newly imported networks cannot overlap each other");
+}
+void package_transfers() {
+    using namespace std::chrono_literals;
+    Temporary dir;
+    Fd directory(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const CallContext caller{"transfer-owner", true, true, true}, stranger{"transfer-other", true, true, true};
+    auto leases = std::make_shared<config::DiskFileLeases>();
+    auto now = TransferService::Clock::now();
+    TransferService::Limits limits;
+    limits.records = 2; limits.file_bytes = 1u << 20; limits.session_bytes = 2u << 20; limits.total_bytes = 2u << 20;
+    limits.free_bytes = 0; limits.ttl = 1s;
+    TransferService transfers(directory.get(), dir.path, getuid(), leases, limits, [&] { return now; });
+    auto transfer = transfers.begin(caller, "upload-one", {{"one.vmpkg", 3}, {"one.vmpkg.001", 0}});
+    check(transfer["files"][0]["offset_bytes"] == "0" && transfer["limits"]["max_file_bytes"] == "1048576", "transfer reports actual quotas and offsets");
+    fails_any([&] { transfers.status(stranger, "upload-one"); }, "upload status strictly owner-scoped");
+    fails_any([&] { transfers.begin(caller, "upload-one", {{"one.vmpkg", 3}}); }, "unknown begin cannot be replayed");
+    transfers.append(caller, "upload-one", 0, 0, "abc");
+    fails_any([&] { transfers.append(caller, "upload-one", 0, 0, "abc"); }, "accepted upload chunk never replays");
+    transfer = transfers.finish(caller, "upload-one");
+    const auto source = transfer["master_path"].asString();
+    check(bytes_of(source) == "abc" && transfer["files"][1]["offset_bytes"] == "0", "upload finish retains exact bytes and permits empty files");
+    auto pin = transfers.pin_source(caller, source);
+    fails_any([&] { transfers.erase(caller, "upload-one"); }, "import-pinned upload cannot be removed");
+    check(transfers.status(caller, "upload-one")["state"] == "ready", "rejected pinned upload delete leaves its state unchanged");
+    const auto alias = dir.at("upload-alias.vmpkg");
+    check(symlink(source.c_str(), alias.c_str()) == 0, "create upload path alias");
+    fails_any([&] { transfers.pin_source(stranger, alias); }, "source aliases cannot bypass upload ownership");
+    pin.reset(); transfers.erase(caller, "upload-one");
+    check(!exists(source), "upload cleanup deletes owned files");
+    const auto exported_path = dir.at("download.vmpkg");
+    put(exported_path, "abcdef");
+    Json::Value exported;
+    exported["_export_manifest"]["destination"] = exported_path;
+    {
+        auto lease = leases->acquire({{exported_path, false}});
+        exported["_export_manifest"]["files"].append(observe_package_file(lease->read_fd(exported_path)));
+    }
+    transfers.prepare_download(caller, "download-one", exported);
+    auto reader = transfers.open_download(caller, "download-one", 0);
+    check(reader->size() == 6 && reader->read(0, 3) == "abc" && reader->read(3, 3) == "def", "download reads a fixed inode in bounded chunks");
+    fails_any([&] { transfers.erase(caller, "download-one"); }, "open download remains accounted while closing");
+    fails_any([&] { reader->read(0, 3); }, "closing download rejects further chunks");
+    reader.reset(); transfers.maintenance();
+    check(bytes_of(exported_path) == "abcdef", "download release never deletes the exported file");
+    transfers.prepare_download(caller, "download-changed", exported);
+    reader = transfers.open_download(caller, "download-changed", 0);
+    put(exported_path, "changed");
+    fails_any([&] { reader->read(0, 3); }, "download detects source metadata change before returning bytes");
+    reader.reset(); transfers.erase(caller, "download-changed");
+    transfers.begin(caller, "upload-expired", {{"empty.vmpkg", 0}});
+    const auto empty = transfers.finish(caller, "upload-expired")["master_path"].asString();
+    now += 2s; transfers.maintenance();
+    check(!exists(empty), "expired upload is reclaimed without another client request");
+    transfers.shutdown();
+    // A generated directory with an unknown child is preserved on restart;
+    // it continues to consume admission until bounded cleanup can finish.
+    const auto residue = dir.at("webui-transfers/upload-" + std::string(64, 'a'));
+    check(mkdir(residue.c_str(), 0700) == 0, "create upload crash residue");
+    put(path_join(residue, "keep.txt"), "owned elsewhere");
+    TransferService restarted(directory.get(), dir.path, getuid(), leases, limits, [&] { return now; });
+    check(exists(path_join(residue, "keep.txt")), "crash cleanup never recursively deletes unknown content");
+    fails_any([&] { restarted.begin(caller, "residue-blocked", {{"fresh.vmpkg", 0}}); }, "unreclaimed uploads retain admission quota");
+    check(unlink(path_join(residue, "keep.txt").c_str()) == 0, "remove test-owned unknown residue");
+    restarted.maintenance();
+    restarted.begin(caller, "after-cleanup", {{"fresh.vmpkg", 0}});
+    restarted.shutdown();
+}
+void package_transfer_cache_owner() {
+    Temporary dir;
+    // This case only runs as root; the synthetic owner needs no account and is
+    // used exclusively inside the disposable fixture, never an App directory.
+    const uid_t owner = geteuid() + 1;
+    check(chown(dir.path.c_str(), owner, owner + 1) == 0 && chmod(dir.path.c_str(), 02700) == 0,
+        "model an App cache with a distinct inherited group");
+    Fd directory(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto leases = std::make_shared<config::DiskFileLeases>();
+    TransferService::Limits limits;
+    limits.free_bytes = 0;
+    const auto root = dir.at("webui-transfers");
+    check(mkdir(root.c_str(), 0700) == 0, "create existing transfer directory with the wrong owner");
+    bool rejected = false;
+    try { TransferService invalid(directory.get(), dir.path, owner, leases, limits); }
+    catch (const ServiceError& error) { rejected = error.code() == ErrorCode::permission_denied; }
+    struct stat held{};
+    check(rejected && stat(root.c_str(), &held) == 0 && held.st_uid == geteuid(),
+        "existing transfer directories with a different owner are rejected without taking ownership");
+    check(rmdir(root.c_str()) == 0, "remove the empty wrong-owner fixture");
+    auto private_path = [&](const std::string& path, mode_t mode) {
+        struct stat info{};
+        check(stat(path.c_str(), &info) == 0 && info.st_uid == owner && info.st_gid == owner &&
+            (info.st_mode & 07777) == mode, "new transfer resource has its requested owner and private permissions");
+    };
+    const CallContext caller{"transfer-cache-owner", true, true, true};
+    {
+        TransferService transfers(directory.get(), dir.path, owner, leases, limits);
+        private_path(root, 0700);
+        transfers.begin(caller, "different-process-owner", {{"owner.vmpkg", 3}});
+        transfers.append(caller, "different-process-owner", 0, 0, "abc");
+        const auto source = transfers.finish(caller, "different-process-owner")["master_path"].asString();
+        const auto upload = pkg::dirname(source);
+        private_path(upload, 0700);
+        private_path(source, 0600);
+        check(bytes_of(source) == "abc", "root-created App-owned upload can finish and be read");
+        transfers.erase(caller, "different-process-owner");
+        check(!exists(source) && !exists(upload), "App-owned upload files and directory are reclaimed");
+        transfers.shutdown();
+    }
+    const auto residue = path_join(root, "upload-" + std::string(64, 'a'));
+    check(mkdir(residue.c_str(), 0700) == 0 && chown(residue.c_str(), owner, owner) == 0,
+        "create App-owned upload crash residue");
+    const auto residue_file = path_join(residue, "owner.vmpkg");
+    put(residue_file, "abc");
+    check(chown(residue_file.c_str(), owner, owner) == 0, "assign crash-residue file ownership");
+    TransferService restarted(directory.get(), dir.path, owner, leases, limits);
+    private_path(root, 0700);
+    check(!exists(residue), "restart reuses the App-owned cache and reclaims its upload residue");
+    restarted.shutdown();
 }
 void lease_offsets() {
     const auto vlan = wire::parse(R"({"vlan_id":0,"ipv4":{"cidr":"10.0.0.1/24","dhcp":{"enabled":true}},"ipv6":{"source":"dhcp_pd","dhcp":{"enabled":true}}})");
@@ -1020,6 +1320,75 @@ void leased_image_inspection(const std::string& mode) {
     check((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0,
         "parent descriptor remains close-on-exec");
 }
+void leased_effective_compression() {
+    Temporary dir;
+    const auto path = dir.at("image.qcow2"), tool = dir.at("image-helper");
+    put(path, "original");
+    config::DiskFileLeases pool;
+    const auto lease = pool.acquire({{path, false}});
+    const int fd = lease->read_fd(path);
+    check((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY, "compression observation holds a read-only descriptor");
+    Json::Value graph;
+    graph["driver"] = "qcow2"; graph["read-only"] = true; graph["backing"] = Json::nullValue;
+    graph["file"]["driver"] = "file"; graph["file"]["read-only"] = true;
+    graph["file"]["filename"] = "/proc/self/fd/" + std::to_string(fd);
+    const std::string script = "#!/system/bin/sh\n"
+        "[ \"$#\" -eq 3 ] && [ \"$1\" = check ] && [ \"$2\" = --output=json ] || exit 20\n"
+        "[ \"$3\" = 'json:" + wire::stringify(graph) + "' ] || exit 21\n"
+        "[ \"$(cat /proc/self/fd/" + std::to_string(fd) + ")\" = original ] || exit 22\n"
+        "printf called > '" + dir.at("called") + "'\n"
+        "cat '" + dir.at("response") + "'\n";
+    put(tool, script);
+    check(chmod(tool.c_str(), 0700) == 0, "enable compression observation helper");
+    Images images(tool);
+    Json::Value details;
+    details["format"] = "qcow2";
+    details["format-specific"]["data"]["compression-type"] = "zlib";
+    const auto observe = [&] { return images.effective_compression(*lease, path, details); };
+    put(dir.at("response"), R"({"check-errors":0,"compressed-clusters":0})");
+    check(observe() == "none", "zlib header alone does not imply allocated compressed clusters");
+    put(dir.at("response"), R"({"check-errors":0,"format":"qcow2","filename":"image.qcow2","image-end-offset":262144})");
+    check(observe() == "none", "real QEMU zero-cluster omission is accepted with successful qcow2 scan evidence");
+    put(dir.at("response"), R"({"check-errors":0,"compressed-clusters":1,"leaks":0,"corruptions":0})");
+    check(observe() == "deflate", "allocated zlib clusters map to deflate");
+    details["format-specific"]["data"]["compression-type"] = "zstd";
+    check(observe() == "zstd", "allocated zstd clusters are detected");
+    details["format-specific"]["data"].removeMember("compression-type");
+    check(!observe(), "missing compression algorithm remains unknown");
+    details["format-specific"]["data"]["compression-type"] = "zlib";
+    for (const auto* invalid : {
+            R"({"compressed-clusters":0})", R"({"check-errors":1,"compressed-clusters":0})",
+            R"({"check-errors":0,"compressed-clusters":-1})", R"({"check-errors":0,"compressed-clusters":0.0})",
+            R"({"check-errors":0,"compressed-clusters":false})", R"({"check-errors":0})",
+            R"({"check-errors":0,"compressed-clusters":0,"leaks":1})",
+            R"({"check-errors":0,"compressed-clusters":0,"corruptions":1})",
+            R"({"check-errors":0,"compressed-clusters":0,"leaks-fixed":1})", "not-json"}) {
+        put(dir.at("response"), invalid);
+        check(!observe(), "malformed/incomplete/damaged image check remains unknown");
+    }
+    put(dir.at("response"), R"({"check-errors":0,"compressed-clusters":0})" + std::string(65536, ' '));
+    check(!observe(), "truncated compression output remains unknown");
+    put(dir.at("response"), R"({"check-errors":0,"compressed-clusters":0})");
+    put(tool, script + "exit 3\n");
+    check(!observe(), "valid-looking output with unsuccessful exit remains unknown");
+    put(tool, "#!/system/bin/sh\nsleep 30\n");
+    check(!Images(tool, {}, std::chrono::milliseconds(50)).effective_compression(*lease, path, details),
+        "compression inspection timeout remains unknown");
+    check(unlink(dir.at("called").c_str()) == 0, "reset observation marker");
+    put(tool, script);
+    details["format"] = "raw";
+    check(observe() == "none" && !exists(dir.at("called")), "raw needs no cluster scan");
+    details["format"] = "qcow2";
+    details["format-specific"]["data"]["data-file"] = "unleased.raw";
+    check(!observe() && !exists(dir.at("called")), "external data is never opened by observation");
+    details["format-specific"]["data"].removeMember("data-file");
+    details["encrypted"] = true;
+    check(!observe() && !exists(dir.at("called")), "encrypted images remain unknown without opening");
+    details.removeMember("encrypted");
+    put(tool, script + "mv '" + path + "' '" + dir.at("moved") + "'\nprintf replacement > '" + path + "'\n");
+    fails_any([&] { observe(); }, "path replacement cannot produce a trustworthy compression result");
+    check(bytes_of(dir.at("moved")) == "original", "compression observation never modifies retained bytes");
+}
 void real_qemu_disk_graph(const std::string& image_tool, const std::string& system_tool) {
     Temporary dir;
     const auto base = dir.at("base.raw"), overlay = dir.at("overlay.qcow2");
@@ -1122,6 +1491,29 @@ void real_retained_rebase(const std::string& tool) {
     Images(tool).validate_backing(*lease, files[2]->path(), files[1]->path());
 }
 
+void real_effective_compression(const std::string& tool) {
+    Temporary dir;
+    const auto raw = dir.at("source.raw");
+    put(raw, std::string(1u << 20, 'A'));
+    for (const bool compressed : {false, true}) {
+        const auto image = dir.at(compressed ? "compressed.qcow2" : "plain.qcow2");
+        ChildOptions convert;
+        convert.argv = {tool, "convert", "-f", "raw", "-O", "qcow2"};
+        if (compressed) convert.argv.push_back("-c");
+        convert.argv.insert(convert.argv.end(), {raw, image});
+        const auto result = Child(convert).communicate({}, std::chrono::seconds(10));
+        check(result.exit_code == 0 && !result.timed_out && !result.truncated, "prepare real compressed/plain image");
+        const auto before = bytes_of(image);
+        config::DiskFileLeases pool;
+        const auto lease = pool.acquire({{image, false}});
+        Images images(tool);
+        const auto details = images.leased_info(*lease, image);
+        check(images.effective_compression(*lease, image, details) == (compressed ? "deflate" : "none"),
+            "real qemu check accepts the retained read-only graph and reports actual compressed clusters");
+        check(bytes_of(image) == before, "real compression observation preserves image bytes");
+    }
+}
+
 // Coordinated in-place disk operations. data_dir empty = fake tool in the fixture.
 struct DiskOps {
     Temporary dir;
@@ -1135,6 +1527,7 @@ struct DiskOps {
     std::unique_ptr<ConfigurationService> configuration;
     std::unique_ptr<DiskOperationService> operations;
     std::function<void(const char*)> fault;
+    config::ConfigTransaction::Observer configuration_fault;
     explicit DiskOps(const std::string& tool = {}) {
         directory = Fd(open(dir.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         if (tool.empty()) {
@@ -1167,7 +1560,7 @@ struct DiskOps {
         limits.background_workers = 2;
         tasks = std::make_unique<TaskService>(limits, [] { return TaskService::Clock::now(); }, EventLimits{}, gate);
         configuration = std::make_unique<ConfigurationService>(directory.get(), getuid(), gate, *vms, *tasks,
-            config::ConfigTransaction::Observer{}, true);
+            [this](const char* stage, size_t index) { if (configuration_fault) configuration_fault(stage, index); }, true);
         DiskOperationContext context;
         context.configuration = configuration.get(); context.directory = directory.get(); context.owner = getuid();
         context.data_dir = data_dir;
@@ -1237,6 +1630,271 @@ struct DiskOps {
         return task;
     }
 };
+void compression_inspection_is_on_demand() {
+    DiskOps ops;
+    put(ops.dir.at("image.qcow2"), "image");
+    const auto id = ops.add("image.qcow2");
+    const auto tool = ops.dir.at("usr/bin/qemu-img");
+    put(tool, "#!/system/bin/sh\ncase \"$1\" in\n"
+        "info) printf '%s' '{\"format\":\"qcow2\",\"format-specific\":{\"data\":{\"compression-type\":\"zlib\"}}}' ;;\n"
+        "check) printf called > '" + ops.dir.at("scanned") + "'; printf '%s' '{\"check-errors\":0,\"compressed-clusters\":0}' ;;\n"
+        "*) exit 9 ;;\nesac\n");
+    DiskInspectionService inspection(*ops.configuration, tool);
+    const auto normal = inspection.read(ops.caller, id);
+    check(normal.state == "ready" && !normal.effective_compression && !exists(ops.dir.at("scanned")),
+        "ordinary disk details do not scan compressed clusters");
+    const auto measured = inspection.read(ops.caller, id, true);
+    check(measured.state == "ready" && measured.effective_compression == "none" && exists(ops.dir.at("scanned")),
+        "explicit compression inspection uses the shared reservation and lease");
+    const auto lease = ops.configuration->disk_files()->acquire({{ops.dir.at("image.qcow2"), true}});
+    check(inspection.read(ops.caller, id, true).state == "busy", "compression inspection respects an active disk writer");
+}
+void image_upload_installation() {
+    using namespace std::chrono_literals;
+    DiskOps ops; Temporary cache;
+    Fd cache_directory(open(cache.path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    auto now = TransferService::Clock::now();
+    TransferService::Limits limits; limits.free_bytes = 0; limits.ttl = 1s;
+    TransferService transfers(cache_directory.get(), cache.path, getuid(), ops.configuration->disk_files(), limits, [&] { return now; });
+    auto upload = [&](const std::string& id) {
+        const auto begun = transfers.begin_image(ops.caller, id, {"browser.img", 7});
+        check(begun["purpose"] == "image" && !begun.isMember("master_path"), "image transfer declares purpose without exposing temporary paths");
+        transfers.append(ops.caller, id, 0, 0, "payload", true);
+        const auto ready = transfers.finish(ops.caller, id, true);
+        check(ready["state"] == "ready" && !ready.isMember("master_path"), "complete image upload is still temporary");
+    };
+    auto run = [&](const std::string& id, const std::string& folder, const std::string& name,
+            TransferService::PublishImage publish = {}) {
+        const auto ref = ops.tasks->submit(ops.caller, {"image_install", "image", 8192, true, true},
+            [&](TaskControl& control) { return transfers.install_image(ops.caller, id, folder, name,
+                ops.dir.at("usr/bin/qemu-img"), control, publish); });
+        auto task = ops.tasks->get(ops.caller, ref);
+        const auto deadline = TaskService::Clock::now() + 10s;
+        while (!task_terminal(task.state) && TaskService::Clock::now() < deadline) {
+            std::this_thread::sleep_for(2ms); task = ops.tasks->get(ops.caller, ref);
+        }
+        check(task_terminal(task.state), "image installation bounded completion");
+        return task;
+    };
+    upload("image-one");
+    fails_any([&] { transfers.status(ops.caller, "image-one"); }, "package status rejects image IDs");
+    fails_any([&] { transfers.finish(ops.caller, "image-one"); }, "package finish rejects image IDs");
+    fails_any([&] { transfers.append(ops.caller, "image-one", 0, 0, "x"); }, "package append rejects image IDs");
+    fails_any([&] { transfers.erase(ops.caller, "image-one"); }, "package erase rejects image IDs");
+    transfers.begin(ops.caller, "package-one", {{"source.vmpkg", 0}});
+    fails_any([&] { transfers.status(ops.caller, "package-one", true); }, "image status rejects package IDs");
+    fails_any([&] { transfers.finish(ops.caller, "package-one", true); }, "image finish rejects package IDs");
+    fails_any([&] { transfers.append(ops.caller, "package-one", 0, 0, "x", true); }, "image append rejects package IDs");
+    fails_any([&] { transfers.erase(ops.caller, "package-one", true); }, "image erase rejects package IDs");
+    transfers.erase(ops.caller, "package-one");
+    // Inspect test-owned storage to exercise aliases without exposing it in the API.
+    std::string temporary;
+    DIR* listing = opendir(cache.at("webui-transfers").c_str());
+    check(listing != nullptr, "inspect owned image upload fixture");
+    while (const auto* entry = readdir(listing))
+        if (std::string(entry->d_name).starts_with("image-upload-"))
+            temporary = cache.at("webui-transfers/" + std::string(entry->d_name) + "/image.bin");
+    closedir(listing);
+    check(!temporary.empty(), "image fixture has one retained source");
+    const auto alias = ops.dir.at("temporary-alias.img");
+    check(link(temporary.c_str(), alias.c_str()) == 0, "create temporary upload inode alias");
+    auto aliased = ops.configuration->disk_files()->acquire({{alias, false}});
+    fails_any([&] { transfers.require_persistent_source(alias, aliased->read_fd(alias)); }, "outside hardlink cannot register temporary upload inode");
+    ImageImportService images(*ops.configuration, ops.dir.at("usr/bin/qemu-img"),
+        [&](const auto& path, int fd) { transfers.require_persistent_source(path, fd); });
+    fails_any([&] { images.preview(ops.caller, alias); }, "host image preview uses the retained-inode temporary guard");
+    check(unlink(alias.c_str()) == 0, "remove upload alias before installation");
+    aliased.reset();
+    const auto success = run("image-one", ops.dir.path, "installed.img",
+        [&](const auto& path, const auto& publish) { ops.configuration->with_unreferenced_disk_path(ops.caller, path, publish); });
+    check(success.state == TaskState::succeeded && success.result["installed"].asBool() &&
+        success.result["durability_confirmed"].asBool() && bytes_of(ops.dir.at("installed.img")) == "payload",
+        "standalone uploaded image is durably installed without registration");
+    check(ops.configuration->disks()->snapshot(ops.caller)->document["disks"].empty(), "installation does not implicitly register the image");
+    check(run("image-one", ops.dir.path, "installed.img").state == TaskState::succeeded,
+        "same upload and destination return original success without copying again");
+    check(run("image-one", ops.dir.path, "another.img").state == TaskState::failed && !exists(ops.dir.at("another.img")),
+        "a different task cannot reuse one upload to create another image");
+    upload("no-overwrite"); put(ops.dir.at("occupied.img"), "original");
+    check(run("no-overwrite", ops.dir.path, "occupied.img").state == TaskState::failed && bytes_of(ops.dir.at("occupied.img")) == "original",
+        "image installation never overwrites an existing target");
+    upload("nested-directory");
+    const auto nested = ops.dir.at("new-images/guest");
+    const auto nested_result = run("nested-directory", nested, "disk.img");
+    struct stat ancestor{}, outer{}, inner{};
+    check(nested_result.state == TaskState::succeeded && bytes_of(path_join(nested, "disk.img")) == "payload"
+        && stat(ops.dir.path.c_str(), &ancestor) == 0 && stat(ops.dir.at("new-images").c_str(), &outer) == 0
+        && stat(nested.c_str(), &inner) == 0 && outer.st_uid == ancestor.st_uid && inner.st_uid == ancestor.st_uid
+        && outer.st_gid == ancestor.st_gid && inner.st_gid == ancestor.st_gid
+        && (outer.st_mode & 0777) == (ancestor.st_mode & 0777) && (inner.st_mode & 0777) == (ancestor.st_mode & 0777),
+        "image installation creates nested persistent directories with inherited access");
+    transfers.erase(ops.caller, "nested-directory", true);
+    check(chmod(nested.c_str(), 0751) == 0, "customize existing image directory access");
+    upload("reuse-directory");
+    check(run("reuse-directory", nested, "second.img").state == TaskState::succeeded
+        && stat(nested.c_str(), &inner) == 0 && (inner.st_mode & 0777) == 0751,
+        "existing image directories are reused without changing permissions");
+    transfers.erase(ops.caller, "reuse-directory", true);
+    upload("failed-directory");
+    const auto failed_directory = run("failed-directory", ops.dir.at("discard-images/guest"), "disk.img",
+        [&](const auto&, const auto&) { throw ServiceError(ErrorCode::conflict, "reject fixture publication"); });
+    check(failed_directory.state == TaskState::failed && !failed_directory.result["recovery_required"].asBool()
+        && !exists(ops.dir.at("discard-images")) && exists(ops.dir.path),
+        "failed installation removes only its newly created empty directories");
+    transfers.erase(ops.caller, "failed-directory", true);
+    upload("shared-directory");
+    const auto shared_directory = ops.dir.at("shared-images/guest");
+    const auto shared_failure = run("shared-directory", shared_directory, "disk.img", [&](const auto&, const auto&) {
+        put(path_join(shared_directory, "other-user.txt"), "keep");
+        throw ServiceError(ErrorCode::conflict, "another writer occupies directory");
+    });
+    check(shared_failure.state == TaskState::failed && shared_failure.result["recovery_required"].asBool()
+        && bytes_of(path_join(shared_directory, "other-user.txt")) == "keep",
+        "failed installation never recursively removes another writer's contents");
+    transfers.erase(ops.caller, "shared-directory", true);
+    upload("replaced-directory");
+    const auto replaced_directory = ops.dir.at("replaced-images");
+    const auto replacement_failure = run("replaced-directory", replaced_directory, "disk.img", [&](const auto&, const auto&) {
+        check(rename(replaced_directory.c_str(), ops.dir.at("retained-images").c_str()) == 0, "move task directory away");
+        check(mkdir(replaced_directory.c_str(), 0700) == 0, "replace task directory");
+        put(path_join(replaced_directory, "other-user.txt"), "replacement");
+        throw ServiceError(ErrorCode::conflict, "directory replaced");
+    });
+    check(replacement_failure.state == TaskState::failed && replacement_failure.result["recovery_required"].asBool()
+        && bytes_of(path_join(replaced_directory, "other-user.txt")) == "replacement" && exists(ops.dir.at("retained-images")),
+        "directory cleanup rejects replacement and retains the moved original");
+    transfers.erase(ops.caller, "replaced-directory", true);
+    upload("blocked-parent");
+    put(ops.dir.at("not-a-directory"), "keep-file");
+    check(run("blocked-parent", ops.dir.at("not-a-directory/child"), "disk.img").state == TaskState::failed
+        && bytes_of(ops.dir.at("not-a-directory")) == "keep-file", "directory creation never replaces a file ancestor");
+    transfers.erase(ops.caller, "blocked-parent", true);
+    upload("nested-cache-target");
+    check(run("nested-cache-target", cache.at("must-not-create/guest"), "disk.img").state == TaskState::failed
+        && !exists(cache.at("must-not-create")), "temporary cache rejection happens before directory creation");
+    transfers.erase(ops.caller, "nested-cache-target", true);
+    upload("cache-target");
+    check(run("cache-target", cache.path, "persistent.img").state == TaskState::failed && !exists(cache.at("persistent.img")),
+        "upload cache is never accepted as a permanent installation directory");
+    upload("before-publication"); int attempts = 0;
+    const auto before = run("before-publication", ops.dir.at("copy-failure/guest"), "not-installed.img", [&](const auto&, const auto& publish) {
+        if (++attempts == 2) throw ServiceError(ErrorCode::conflict, "target became referenced");
+        publish();
+    });
+    check(before.state == TaskState::failed && !before.result["installed"].asBool() &&
+        !before.result["recovery_required"].asBool() && !exists(ops.dir.at("copy-failure")),
+        "publication rejection cleans the owned copy and newly created empty directories");
+    upload("after-publication"); attempts = 0;
+    const auto uncertain = run("after-publication", ops.dir.path, "uncertain.img", [&](const auto&, const auto& publish) {
+        publish();
+        if (++attempts == 2) throw ServiceError(ErrorCode::io_error, "post-publication synchronization failure");
+    });
+    check(uncertain.error == ErrorCode::commit_uncertain && uncertain.result["installed"].asBool() &&
+        uncertain.result["installation_uncertain"].asBool() && uncertain.result["recovery_required"].asBool(),
+        "post-publication failure retains an uncertain installation receipt");
+    now += 2s; transfers.maintenance();
+    check(!exists(temporary) && bytes_of(ops.dir.at("installed.img")) == "payload" && bytes_of(ops.dir.at("uncertain.img")) == "payload",
+        "TTL cleanup only removes uploads and owned temporary names, never persistent destinations");
+    transfers.shutdown();
+}
+void image_install_configuration_boundary() {
+    DiskOps ops;
+    bool published = false;
+    ops.configuration->with_unreferenced_disk_path(ops.caller, ops.dir.at("new.img"), [&] { published = true; });
+    check(published, "unreferenced target enters publication boundary");
+    ops.add("missing.img");
+    published = false;
+    fails_any([&] { ops.configuration->with_unreferenced_disk_path(ops.caller, ops.dir.at("missing.img"), [&] { published = true; }); },
+        "registered but missing image path cannot receive an uploaded replacement");
+    check(!published, "registered target is rejected before publication");
+    Temporary other;
+    const auto alias = other.at("linked-directory");
+    check(symlink(ops.dir.path.c_str(), alias.c_str()) == 0, "create target parent directory alias");
+    fails_any([&] { ops.configuration->with_unreferenced_disk_path(ops.caller, path_join(alias, "missing.img"), [&] { published = true; }); },
+        "parent symlink cannot hide a registered destination");
+    check(!published, "aliased registered target never reaches publication");
+}
+TaskView run_image_import(DiskOps& ops, ImageImportService& images, const Json::Value& plan) {
+    const auto ref = ops.tasks->submit(ops.caller, {"image_import", "image", 8192, true, true},
+        [&](TaskControl& control) { return images.commit(ops.caller, plan, control); });
+    const auto deadline = TaskService::Clock::now() + std::chrono::seconds(40);
+    auto task = ops.tasks->get(ops.caller, ref);
+    while (!task_terminal(task.state) && TaskService::Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2)); task = ops.tasks->get(ops.caller, ref);
+    }
+    check(task_terminal(task.state), "bounded image import task completes");
+    return task;
+}
+void host_image_import_chain() {
+    DiskOps ops;
+    put(ops.dir.at("base.img"), "base"); put(ops.dir.at("child.qcow2"), "child");
+    put(ops.dir.at("child.qcow2.backing"), "base.img");
+    const auto base = ops.add("base.img"); ops.set_vms({{"base VM", {{ops.dir.at("base.img"), false}}}});
+    auto disks = ops.configuration->disks()->snapshot(ops.caller);
+    auto vms = ops.configuration->vms().snapshot(ops.caller);
+    auto extended = disks->document; extended["root_extension"] = "keep"; extended["disks"][0]["future"] = Json::Int64(9007199254740993LL);
+    ops.configuration->replace_vm_disks(ops.caller, vms->revision, disks->revision, vms->document, extended);
+    ImageImportService images(*ops.configuration, ops.dir.at("usr/bin/qemu-img"));
+    const auto plan = images.preview(ops.caller, ops.dir.at("child.qcow2"));
+    check(plan["members"].size() == 2 && !plan["members"][0]["existing"].asBool() && plan["members"][1]["id"] == base
+        && plan["members"][0]["parentId"] == base && plan["members"][0]["virtualSizeBytes"] == "4096"
+        && plan["attachments"].size() == 1 && !plan["attachments"][0]["beforeReadOnly"].asBool()
+        && plan["attachments"][0]["afterReadOnly"].asBool(), "image preview reports full backing chain and base attachment becoming read-only");
+    check(ops.configuration->disks()->snapshot(ops.caller)->document["disks"].size() == 1 && !ops.slots("base VM")[0]["readonly"].asBool(),
+        "image preview never registers files or changes VM slots");
+    const auto imported = run_image_import(ops, images, plan);
+    check(imported.state == TaskState::succeeded && imported.result["registered"].asBool() && imported.result["added"].asUInt() == 1
+        && ops.row(plan["diskId"].asString())["parent"] == base && ops.slots("base VM")[0]["readonly"].asBool(),
+        "confirmed image import registers child and changes VM attachment in one transaction");
+    check(ops.configuration->disks()->snapshot(ops.caller)->document["root_extension"] == "keep"
+        && ops.row(base)["future"].asInt64() == 9007199254740993LL, "image import preserves root and existing row extensions");
+    check(link(ops.dir.at("child.qcow2").c_str(), ops.dir.at("alias.qcow2").c_str()) == 0, "create image alias");
+    put(ops.dir.at("alias.qcow2.backing"), "base.img");
+    const auto alias = images.preview(ops.caller, ops.dir.at("alias.qcow2"));
+    check(alias["source"] != alias["members"][0]["path"] && alias["diskId"] == plan["diskId"]
+        && alias["members"][0]["existing"].asBool(), "registered inode alias reuses original ID and registry path");
+    const auto unchanged = run_image_import(ops, images, alias);
+    check(unchanged.state == TaskState::succeeded && unchanged.result["added"].asUInt() == 0, "already registered image can complete as an unchanged import");
+    check(file_length(ops.dir.at("child.qcow2")) == 5 && file_length(ops.dir.at("base.img")) == 4,
+        "registration leaves source bytes and backing files intact");
+}
+void host_image_import_rejections_and_recovery() {
+    DiskOps ops; put(ops.dir.at("source.img"), "original");
+    ImageImportService images(*ops.configuration, ops.dir.at("usr/bin/qemu-img"));
+    auto reject = [&](const std::string& source) {
+        bool rejected = false; try { images.preview(ops.caller, source); } catch (const ServiceError&) { rejected = true; }
+        check(rejected, "unsafe image import preview is rejected");
+    };
+    reject("https://example.test/image"); reject(ops.dir.at("missing.img"));
+    put(ops.dir.at("source.img.backing"), "source.img"); reject(ops.dir.at("source.img"));
+    check(unlink(ops.dir.at("source.img.backing").c_str()) == 0, "remove cyclic fixture header");
+    auto plan = images.preview(ops.caller, ops.dir.at("source.img"));
+    put(ops.dir.at("source.img"), "changed source");
+    auto changed = run_image_import(ops, images, plan);
+    check(changed.state == TaskState::failed && changed.error == ErrorCode::conflict && !changed.result["registered"].asBool()
+        && !changed.result["registrationUncertain"].asBool() && ops.configuration->disks()->snapshot(ops.caller)->document["disks"].empty(),
+        "changed source rejects confirmation before registration");
+    plan = images.preview(ops.caller, ops.dir.at("source.img"));
+    put(ops.dir.at("unrelated.img"), "other"); ops.add("unrelated.img");
+    changed = run_image_import(ops, images, plan);
+    check(changed.state == TaskState::failed && changed.error == ErrorCode::conflict && !changed.result["registered"].asBool(),
+        "unrelated registry writer invalidates image import confirmation");
+    put(ops.dir.at("bad-info"), "#!/system/bin/sh\nprintf '%s' '{\"format\":\"raw\"}'\n");
+    check(chmod(ops.dir.at("bad-info").c_str(), 0700) == 0, "enable malformed info fixture");
+    ImageImportService malformed(*ops.configuration, ops.dir.at("bad-info"));
+    bool rejected = false; try { malformed.preview(ops.caller, ops.dir.at("source.img")); } catch (const ServiceError&) { rejected = true; }
+    check(rejected, "missing virtual size is not fabricated as image metadata");
+    plan = images.preview(ops.caller, ops.dir.at("source.img"));
+    ops.configuration_fault = [](const char* stage, size_t) {
+        if (std::string_view(stage) == "participant_synced") throw std::runtime_error("image registration journal fault");
+    };
+    const auto uncertain = run_image_import(ops, images, plan);
+    check(uncertain.state == TaskState::failed && uncertain.error == ErrorCode::commit_uncertain
+        && !uncertain.result["registered"].asBool() && uncertain.result["registrationUncertain"].asBool()
+        && uncertain.result["recoveryRequired"].asBool(), "uncertain joint registration is reported without claiming success");
+    ops.configuration_fault = {}; ops.configuration->recover(ops.caller);
+    check(ops.row(plan["diskId"].asString()).isObject(), "ordinary configuration recovery completes image registration");
+}
 ErrorCode start_error(DiskOps& ops, const Json::Value& request, const CallContext* caller = nullptr) {
     try { ops.operations->start(caller ? *caller : ops.caller, request); }
     catch (const ServiceError& error) { return error.code(); }
@@ -1489,6 +2147,97 @@ void disk_operation_create() {
         check(task.state == TaskState::succeeded && slot["path"] == ops.dir.at(follow ? base + ".top" : base)
             && slot["readonly"].asBool() == !follow, std::string("overlay create moves slots: ") + mode);
     }
+}
+void disk_clone_directory() {
+    DiskOps ops;
+    put(ops.dir.at("source.img"), "original");
+    const auto source = ops.add("source.img");
+    auto clone = [&](const std::string& folder, const std::string& name = "copy.img") {
+        auto value = ops.request(source, "clone");
+        value["folder"] = folder; value["name"] = name; value["create_folder"] = true;
+        return value;
+    };
+    auto invalid = clone(ops.dir.at("unused"));
+    invalid["create_folder"] = "true";
+    check(start_error(ops, invalid) == ErrorCode::invalid_argument, "clone directory flag must be boolean");
+    for (const auto* action : {"resize", "convert", "flatten", "create", "commit", "reset", "delete"}) {
+        invalid = ops.request(source, action); invalid["create_folder"] = false;
+        check(start_error(ops, invalid) == ErrorCode::invalid_argument, "other disk actions reject even a false create_folder");
+    }
+    invalid = clone("/");
+    check(start_error(ops, invalid) == ErrorCode::invalid_argument, "clone directory requires a final component");
+    auto unchanged = clone(ops.dir.at("missing-default")); unchanged.removeMember("create_folder");
+    auto task = ops.run(unchanged);
+    check(task.state == TaskState::failed && !exists(ops.dir.at("missing-default")), "ordinary clone does not create directories");
+    unchanged = clone(ops.dir.at("missing-false")); unchanged["create_folder"] = false;
+    task = ops.run(unchanged);
+    check(task.state == TaskState::failed && !exists(ops.dir.at("missing-false")), "false keeps the existing directory requirement");
+    task = ops.run(clone(ops.dir.at("missing-parent/child")));
+    check(task.state == TaskState::failed && !exists(ops.dir.at("missing-parent")), "clone creates no missing ancestors");
+
+    const auto parent = ops.dir.at("vm-parent"), destination = parent + "/Linux-VM";
+    check(mkdir(parent.c_str(), 0770) == 0 && chmod(parent.c_str(), 0770) == 0, "create accessible clone parent");
+    if (geteuid() == 0) check(chown(parent.c_str(), 10001, 10001) == 0, "model an App-owned clone parent");
+    task = ops.run(clone(destination));
+    struct stat ancestor{}, directory{}, image{};
+    check(task.state == TaskState::succeeded && bytes_of(destination + "/copy.img") == "converted"
+        && bytes_of(ops.dir.at("source.img")) == "original", "clone creates one directory and preserves the source");
+    check(stat(parent.c_str(), &ancestor) == 0 && stat(destination.c_str(), &directory) == 0
+        && stat((destination + "/copy.img").c_str(), &image) == 0
+        && directory.st_uid == ancestor.st_uid && directory.st_gid == ancestor.st_gid
+        && (directory.st_mode & 0777) == (ancestor.st_mode & 0777)
+        && image.st_uid == directory.st_uid && image.st_gid == directory.st_gid,
+        "new directory and image retain the parent's App ownership and directory access");
+    const auto inode = directory.st_ino;
+    check(chmod(destination.c_str(), 0750) == 0, "customize existing destination access");
+    task = ops.run(clone(destination, "second.img"));
+    check(task.state == TaskState::succeeded && stat(destination.c_str(), &directory) == 0
+        && directory.st_ino == inode && (directory.st_mode & 0777) == 0750,
+        "an existing real directory is reused without changing its mode or inode");
+    put(destination + "/taken.img", "foreign");
+    check(start_error(ops, clone(destination, "taken.img")) == ErrorCode::conflict
+        && bytes_of(destination + "/taken.img") == "foreign", "directory creation never permits an existing target overwrite");
+    put(ops.dir.at("not-directory"), "foreign");
+    check(start_error(ops, clone(ops.dir.at("not-directory"))) == ErrorCode::conflict,
+        "a file at the directory name is rejected");
+    check(symlink(destination.c_str(), ops.dir.at("linked").c_str()) == 0, "create destination symlink");
+    task = ops.run(clone(ops.dir.at("linked"), "linked-copy.img"));
+    check(task.state == TaskState::failed && task.error == ErrorCode::conflict && !exists(destination + "/linked-copy.img"),
+        "opt-in clone rejects an existing symlink directory");
+
+    put(ops.dir.at("fail"), "");
+    const auto failed = parent + "/Failed";
+    task = ops.run(clone(failed));
+    check(task.state == TaskState::failed && exists(failed) && !exists(failed + "/copy.img")
+        && temporaries(failed) == 0 && ops.operations->pending() == 0,
+        "tool failure keeps the new empty directory and uses the existing file cleanup");
+    check(unlink(ops.dir.at("fail").c_str()) == 0, "clear clone failure marker");
+    const auto swapped = parent + "/Swapped", moved = parent + "/Moved";
+    const auto registered = ops.configuration->disks()->snapshot(ops.caller)->document["disks"].size();
+    ops.fault = [&](const char* stage) {
+        if (std::string_view(stage) != "replaced") return;
+        check(rename(swapped.c_str(), moved.c_str()) == 0 && mkdir(swapped.c_str(), 0700) == 0,
+            "replace destination directory before registry commit");
+    };
+    task = ops.run(clone(swapped));
+    ops.fault = {};
+    check(task.state == TaskState::failed && task.error == ErrorCode::commit_uncertain
+        && ops.configuration->disks()->snapshot(ops.caller)->document["disks"].size() == registered
+        && bytes_of(moved + "/copy.img") == "converted" && !exists(swapped + "/copy.img")
+        && ops.operations->pending() == 1, "a replaced destination cannot register the wrong path");
+    check(rmdir(swapped.c_str()) == 0 && rename(moved.c_str(), swapped.c_str()) == 0,
+        "restore the original directory for ordinary recovery");
+    check(ops.operations->recover(ops.caller)["pending"].asUInt64() == 0 && exists(swapped)
+        && !exists(swapped + "/copy.img"), "existing recovery cleans the unregistered image without deleting its folder");
+    const auto interrupted = parent + "/Interrupted";
+    ops.fault = [](const char* stage) { if (std::string_view(stage) == "replaced") throw std::runtime_error("crash"); };
+    task = ops.run(clone(interrupted));
+    check(task.state == TaskState::failed && exists(interrupted + "/copy.img") && ops.operations->pending() == 1,
+        "interrupted installation in a new directory uses the original recovery journal");
+    ops.fault = {};
+    ops.restart();
+    check(exists(interrupted) && !exists(interrupted + "/copy.img") && temporaries(interrupted) == 0
+        && ops.operations->pending() == 0, "recovery removes only the unregistered image and preserves its directory");
 }
 void disk_operation_relocate() {
     DiskOps ops;
@@ -1743,6 +2492,9 @@ int main(int argc, char** argv) {
         {"joint import rejects before decision", [] { joint_import("before_decision"); }},
         {"joint import retains decided files", [] { joint_import("participant_synced"); }},
         {"joint import recovers removed decision", [] { joint_import("decision_removed"); }},
+        {"checked import registers three domains", [] { joint_import("", true); }},
+        {"checked import rejects before joint decision", [] { joint_import("before_decision", true); }},
+        {"checked import recovers joint decision", [] { joint_import("participant_synced", true); }},
         {"import rejects stale planning revision", [] { persistent_import("conflict"); }},
         {"import cleans pre-install failure", [] { persistent_import("before_install"); }},
         {"import retains uncertain commit files", [] { persistent_import("installed"); }},
@@ -1751,6 +2503,9 @@ int main(int argc, char** argv) {
         {"compression corruption", compression_corruption}, {"header", header_contract}, {"manifest", manifest_contract},
         {"single-file packages", single_file_packages}, {"split packages", split_packages}, {"disk chain plan", chain_plan},
         {"network import plan", network_plan}, {"lease offsets", lease_offsets}, {"org.json behaviour", json_contract},
+        {"bounded package uploads and downloads", package_transfers},
+        {"image upload installation and lifetime", image_upload_installation},
+        {"image installation configuration boundary", image_install_configuration_boundary},
         {"file helpers", file_helpers}, {"exclusive imported files", exclusive_import_files},
         {"cleanup boundaries", cleanup_boundaries}, {"owned import directory", owned_import_directory},
         {"replaced import parent", replaced_import_parent}, {"retained import files", retained_import_files},
@@ -1762,12 +2517,23 @@ int main(int argc, char** argv) {
         {"leased image malformed metadata", [] { leased_image_inspection("malformed"); }},
         {"leased image external data rejected", [] { leased_image_inspection("external-data"); }},
         {"leased image replacement", [] { leased_image_inspection("replacement"); }},
+        {"leased effective compression", leased_effective_compression},
+        {"on-demand compression inspection", compression_inspection_is_on_demand},
         {"disk operation admission", disk_operation_admission}, {"disk operation journal", disk_operation_journal},
-        {"disk operation create and clone", disk_operation_create}, {"disk slot reattachment", disk_slot_reattachment},
+        {"host image import chain and aliases", host_image_import_chain},
+        {"host image import rejection and recovery", host_image_import_rejections_and_recovery},
+        {"disk operation create and clone", disk_operation_create}, {"clone creates one target directory", disk_clone_directory},
+        {"disk slot reattachment", disk_slot_reattachment},
         {"disk operation merge and delete", disk_operation_tree}, {"disk operation relocation", disk_operation_relocate}};
-    if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
+    if (geteuid() == 0) tests.emplace_back("root initializes App-owned transfer cache", package_transfer_cache_owner);
+    if (argc == 2 && std::string_view(argv[1]) == "--image-transfers") {
+        tests = {{"image upload installation and lifetime", image_upload_installation},
+            {"image installation configuration boundary", image_install_configuration_boundary},
+            {"clone creates one target directory", disk_clone_directory}};
+    } else if (argc == 3 && std::string_view(argv[1]) == "--qemu-img") {
         const std::string tool = argv[2];
-        tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }}};
+        tests = {{"real qemu retained rebase", [tool] { real_retained_rebase(tool); }},
+            {"real qemu effective compression", [tool] { real_effective_compression(tool); }}};
     } else if (argc == 4 && std::string_view(argv[1]) == "--qemu-tools") {
         const std::string image_tool = argv[2], system_tool = argv[3];
         tests = {{"real QEMU retained block graph", [=] { real_qemu_disk_graph(image_tool, system_tool); }}};
@@ -1775,10 +2541,12 @@ int main(int argc, char** argv) {
         const std::string tool = argv[2];
         tests = {{"real coordinated disk operations", [tool] { real_disk_operations(tool); }}};
     } else if (argc != 1) {
-        std::cerr << "Usage: pkg-contract [--qemu-img /absolute/path/to/qemu-img | --qemu-tools /path/to/qemu-img /path/to/qemu-system | --disk-ops /path/to/qemu-img]\n";
+        std::cerr << "Usage: pkg-contract [--image-transfers | --qemu-img /absolute/path/to/qemu-img | --qemu-tools /path/to/qemu-img /path/to/qemu-system | --disk-ops /path/to/qemu-img]\n";
         return 2;
     }
     Json::Value report;
+    if (argc == 1 && geteuid() != 0)
+        report["skipped"].append("root initializes App-owned transfer cache (requires root)");
     auto& checks = report["checks"] = Json::Value(Json::arrayValue);
     try {
         for (const auto& [name, test] : tests) {

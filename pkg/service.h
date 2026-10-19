@@ -30,6 +30,10 @@ struct PkgContext {
     std::function<void(const char* level, const std::string& text)> log = [](const char*, const std::string&) {};
     VmConfigService* vm_config = nullptr;
     ConfigurationService* configuration = nullptr; // Optional joint registry owner; startup binding only.
+    std::function<std::shared_ptr<const void>(const CallContext&, const std::string&)> import_source_pin;
+};
+struct ExportConfirmation {
+    std::string vm_revision, disk_revision, network_revision;
 };
 // Shared task records and a bounded background pool, with the existing legacy
 // broadcasts preserved. The returned ID also works with task_get/task_cancel.
@@ -43,6 +47,15 @@ public:
     // {"task_id": ...}. Throws RequestError for legacy RequestException texts;
     // anything else is the legacy "internal error".
     Json::Value vm_export(const CallContext& caller, const Json::Value& request);
+    // Saved configuration only: no image inspection or destination IO.
+    Json::Value export_plan(const CallContext& caller, const std::string& vm_id);
+    // Confirmed exports are accepted before image inspection. Each POST has a
+    // fresh signature: an uncertain submission is resolved through task GET.
+    Json::Value vm_export_checked(const CallContext& caller, const Json::Value& request,
+        const ExportConfirmation& confirmed, const std::string& request_id);
+    Json::Value preview_import(const CallContext& caller, const std::string& source, const std::string& request_id);
+    Json::Value vm_import_checked(const CallContext& caller, const Json::Value& request,
+        const std::string& plan_request_id, const std::string& request_id);
     Json::Value vm_import(const CallContext& caller, const Json::Value& request);
     // Request block-level shutdown; the owning TaskService joins before domain teardown.
     void shutdown();
@@ -50,6 +63,7 @@ private:
     PkgContext context_;
     std::shared_ptr<std::atomic<bool>> stopping_ = std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<size_t>> active_ = std::make_shared<std::atomic<size_t>>(0);
-    TaskRef launch(const CallContext& caller, const char* kind, TaskService::Work body, TaskService::Discarded discarded);
+    TaskRef launch(const CallContext& caller, const char* kind, TaskService::Work body, TaskService::Discarded discarded,
+        const std::string& request_id = {}, size_t result_bytes = 4096);
 };
 }

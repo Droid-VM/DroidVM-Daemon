@@ -246,6 +246,7 @@ void VolumeSplitSink::roll() {
 void VolumeSplitSink::close_current() {
     entries_.push_back({index_, current_bytes_, static_cast<int64_t>(crc_)});
     auto closing = std::move(current_);
+    if (completed_) { closing->flush(); completed_(volume_name(base_, index_), closing->fd()); }
     closing->close();
 }
 void VolumeSplitSink::finish() {
@@ -262,7 +263,8 @@ void VolumeSplitSink::abort() {
 namespace {
 class SubVolumes final : public Source {
 public:
-    SubVolumes(const std::vector<std::string>& files, const std::vector<VolumeEntry>& entries) : files_(files), entries_(entries) {}
+    SubVolumes(const std::vector<std::string>& files, const std::vector<VolumeEntry>& entries, VolumeSet::Open open)
+        : files_(files), entries_(entries), open_(std::move(open)) {}
     size_t read(char* data, size_t size) override {
         for (;;) {
             if (!current_ || !remaining_) {
@@ -280,6 +282,7 @@ public:
 private:
     const std::vector<std::string>& files_;
     const std::vector<VolumeEntry>& entries_;
+    VolumeSet::Open open_;
     std::unique_ptr<FileSource> current_;
     int index_ = -1;
     uint32_t crc_ = 0;
@@ -292,7 +295,8 @@ private:
             current_.reset();
         }
         if (++index_ >= static_cast<int>(files_.size())) { index_ = static_cast<int>(files_.size()); return false; }
-        current_ = std::make_unique<FileSource>(files_[static_cast<size_t>(index_)]);
+        const auto& path = files_[static_cast<size_t>(index_)];
+        current_ = open_ ? std::make_unique<FileSource>(open_(path)) : std::make_unique<FileSource>(path);
         crc_ = static_cast<uint32_t>(crc32(0, nullptr, 0));
         const auto size = entries_[static_cast<size_t>(index_)].size;
         remaining_ = size > 0 ? static_cast<uint64_t>(size) : 0;
@@ -300,12 +304,19 @@ private:
     }
 };
 }
-VolumeSet VolumeSet::discover(const std::string& master) {
-    const auto length = file_length(master);
+VolumeSet VolumeSet::discover(const std::string& master, Open open) {
+    auto length_of = [&](const std::string& path) {
+        if (!open) return file_length(path);
+        auto file = open(path);
+        struct stat info{};
+        if (fstat(file.get(), &info) != 0 || !S_ISREG(info.st_mode)) throw Error("Invalid package source file");
+        return static_cast<int64_t>(info.st_size);
+    };
+    const auto length = length_of(master);
     if (length <= 0 || length > (16ll << 20)) throw Error("unexpected master size: " + std::to_string(length));
     std::string all(static_cast<size_t>(length), '\0');
     {
-        FileSource in(master);
+        FileSource in(open ? FileSource(open(master)) : FileSource(master));
         if (read_some(in, all.data(), all.size()) != all.size()) throw Error("short read on master");
     }
     if (all.size() < header_size) throw Error("master too small");
@@ -319,8 +330,8 @@ VolumeSet VolumeSet::discover(const std::string& master) {
         throw Error("volume count mismatch: header " + std::to_string(header.volume_count) + ", index " + std::to_string(set.index_.volumes.size()));
     for (size_t i = 0; i < set.index_.volumes.size(); ++i) {
         const auto path = volume_name(master, static_cast<int>(i + 1));
-        if (!is_file(path)) throw Error("missing sub-volume " + std::to_string(i + 1) + " (" + file_name(path) + ")");
-        const auto on_disk = file_length(path);
+        if (!open && !is_file(path)) throw Error("missing sub-volume " + std::to_string(i + 1) + " (" + file_name(path) + ")");
+        const auto on_disk = length_of(path);
         if (on_disk != set.index_.volumes[i].size)
             throw Error("sub-volume " + std::to_string(i + 1) + " size mismatch: on-disk " + std::to_string(on_disk) +
                         ", expected " + std::to_string(set.index_.volumes[i].size));
@@ -328,13 +339,14 @@ VolumeSet VolumeSet::discover(const std::string& master) {
     }
     set.head_ = all.substr(0, data_start);
     set.data_start_ = data_start;
+    set.open_ = std::move(open);
     return set;
 }
 std::unique_ptr<Source> VolumeSet::open_logical() const {
     const auto end = data_start_ + static_cast<uint64_t>(std::max<int64_t>(index_.data_size, 0));
     std::vector<std::unique_ptr<Source>> parts;
     parts.push_back(std::make_unique<MemorySource>(head_));
-    parts.push_back(std::make_unique<SubVolumes>(sub_volumes_, index_.volumes));
+    parts.push_back(std::make_unique<SubVolumes>(sub_volumes_, index_.volumes, open_));
     parts.push_back(std::make_unique<ZeroSource>(align_up(end) - end));
     return std::make_unique<ChainSource>(std::move(parts));
 }

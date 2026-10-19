@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <functional>
 
 // lib/pkg: the .vmpkg container. A single-file package is
 //   [24-byte header][zeros to 4 KiB][manifest][zeros to the next 4 KiB, never none]
@@ -96,7 +97,8 @@ std::string master_of(const std::string& path);
 // VolumeSplitOutputStream: the compressed stream sliced across sub-volumes.
 class VolumeSplitSink final : public Sink {
 public:
-    VolumeSplitSink(std::string base, int64_t volume_size) : base_(std::move(base)), volume_size_(volume_size) {}
+    VolumeSplitSink(std::string base, int64_t volume_size, std::function<void(const std::string&, int)> completed = {})
+        : base_(std::move(base)), volume_size_(volume_size), completed_(std::move(completed)) {}
     void write(const char* data, size_t size) override;
     void finish();
     void abort(); // closes without recording, for cleanup
@@ -108,6 +110,7 @@ public:
 private:
     std::string base_;
     int64_t volume_size_;
+    std::function<void(const std::string&, int)> completed_;
     std::vector<VolumeEntry> entries_;
     std::vector<std::string> files_;
     std::unique_ptr<FileSink> current_;
@@ -123,7 +126,10 @@ private:
 // single-file byte stream PackageInput consumes.
 class VolumeSet {
 public:
-    static VolumeSet discover(const std::string& master);
+    using Open = std::function<Fd(const std::string&)>;
+    // Optional retained-inode opener for confirmed imports. Called for the
+    // master and each sub-volume; reads/CRC then use those same admitted files.
+    static VolumeSet discover(const std::string& master, Open open = {});
     int64_t data_size() const { return index_.data_size; }
     int count() const { return static_cast<int>(sub_volumes_.size()); }
     std::unique_ptr<Source> open_logical() const;
@@ -132,6 +138,7 @@ private:
     uint64_t data_start_ = 0;
     VolumeIndex index_;
     std::vector<std::string> sub_volumes_;
+    Open open_;
 };
 
 // PackageInput: header and manifest checked, then the decompressed tar.
