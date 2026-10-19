@@ -101,6 +101,28 @@ VncBinding vnc_binding(const Screen& screen, const std::map<std::string, VncRun>
     return out;
 }
 
+bool vnc_options_overridden(const Json::Value& item, Backend backend) {
+    std::vector<std::string> args;
+    extra_options(item, args);
+    for (size_t i = 0; i < args.size(); ++i) {
+        const auto& raw = args[i];
+        if (raw.find('\0') != std::string::npos) return true;
+        const auto separator = raw.find('=');
+        auto key = raw.substr(0, separator);
+        if (backend == Backend::qemu) {
+            if (key.starts_with("--")) key.erase(0, 1);
+            if (key == "-vnc" || key == "-display" || key == "-readconfig") return true;
+            if (key == "-set") {
+                const auto value = separator != std::string::npos ? raw.substr(separator + 1)
+                    : i + 1 < args.size() ? args[i + 1] : std::string();
+                if (value.starts_with("vnc.")) return true;
+            }
+        } else if (key == "--vnc-server" || key == "--android-display-service" ||
+            key == "--cfg" || key == "--config" || key == "-c") return true;
+    }
+    return false;
+}
+
 std::optional<std::string> resolve_hypervisor(const Json::Value& item, const HostFacts& host, Backend backend) {
     std::string configured = "AUTO";
     if (member(item, "hypervisor").isString()) {

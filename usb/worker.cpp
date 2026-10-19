@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "usb/worker.h"
+#ifndef _WIN32
 #include <pthread.h>
+#endif
 
 namespace droidvm::usb {
 Worker::Worker(std::string name) {
     thread_ = std::thread([this, name = std::move(name)] {
+#ifndef _WIN32
         pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+#else
+        (void)name;
+#endif
         run();
     });
 }

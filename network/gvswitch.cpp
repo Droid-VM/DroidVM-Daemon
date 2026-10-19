@@ -100,11 +100,11 @@ void Gvswitch::stop() {
     if (!failures.empty()) throw ServiceError(ErrorCode::io_error, "VM TAP cleanup incomplete: " + wire::stringify(failures));
 }
 std::string Gvswitch::tap_owner(const std::string& tap) const { return config::uuid(config_) + "/" + tap; }
-ControlResponse Gvswitch::call(HttpMethod method, const std::string& path, const Json::Value* body) const {
+ControlResponse Gvswitch::call(HttpMethod method, const std::string& path, const Json::Value* body, ControlOptions options) const {
     if (!client_) throw std::runtime_error("gvswitch not running");
     std::string text;
     if (body) text = wire::stringify(*body);
-    return client_->request(method, path, body ? std::optional<std::string_view>(text) : std::nullopt, {std::chrono::seconds(5), {}});
+    return client_->request(method, path, body ? std::optional<std::string_view>(text) : std::nullopt, std::move(options));
 }
 void Gvswitch::release_tap(const std::string& tap) {
     const auto rows = links_->cleanup(tap_owner(tap));
@@ -311,21 +311,43 @@ void Gvswitch::live_details(Json::Value& data) const {
         row["state"].append(config::boolean(entry, "static") ? "STATIC" : "LEARNED");
         neighbors.append(std::move(row));
     }
-    auto& leases = data["dhcp_leases"] = Json::Value(Json::arrayValue);
-    for (const auto* vlan : vlans) {
-        const int vid = static_cast<int>(config::integer(*vlan, "vlan_id"));
-        for (const char* family : {"dhcp4", "dhcp6"}) for (const auto& lease : get("/api/v1/gateways/" + std::to_string(vid) + "/" + family + "/leases")) {
-            if (!lease.isObject()) continue;
-            Json::Value row;
-            row["ip"] = config::string(lease, "ip"); row["mac"] = config::string(lease, "mac");
-            row["hostname"] = config::string(lease, "port_identifier"); row["expires"] = config::string(lease, "expires_at");
-            row["vlan"] = vid;
-            leases.append(std::move(row));
-        }
-    }
+    try { data["dhcp_leases"] = dhcp_leases(); } catch (const std::exception&) { data["dhcp_leases"] = Json::Value(); }
+    if (!data["dhcp_leases"].isArray()) data["dhcp_leases"] = Json::Value(Json::arrayValue);
     const auto status = process_.status();
     data["gvswitch_exit_code"] = status.exit_code.value_or(-1);
     data["gvswitch_socket"] = socket_;
+}
+Json::Value Gvswitch::dhcp_leases() const {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    auto get = [&](const std::string& path) {
+        ControlOptions options;
+        options.timeout = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (options.timeout.count() <= 0) throw std::runtime_error("DHCP lease observation timed out");
+        const auto response = call(HttpMethod::get, path, nullptr, std::move(options));
+        if (!response.success()) throw std::runtime_error("DHCP lease observation unavailable");
+        const auto rows = wire::parse(response.body);
+        if (!rows.isArray()) throw std::runtime_error("Invalid DHCP lease observation");
+        return rows;
+    };
+    Json::Value leases(Json::arrayValue);
+    const auto vlans = l3_vlans(config_);
+    if (!healthy() || vlans.size() > 16) return {};
+    for (const auto* vlan : vlans) {
+        const int vid = static_cast<int>(config::integer(*vlan, "vlan_id"));
+        for (const char* family : {"dhcp4", "dhcp6"}) {
+            if (!config::boolean(config::member(config::member(*vlan, std::string(family) == "dhcp6" ? "ipv6" : "ipv4"), "dhcp"), "enabled")) continue;
+            for (const auto& lease : get("/api/v1/gateways/" + std::to_string(vid) + "/" + family + "/leases")) {
+                if (!lease.isObject()) continue;
+                if (leases.size() >= 4096) return {};
+                Json::Value row;
+                row["ip"] = config::string(lease, "ip"); row["mac"] = config::string(lease, "mac");
+                row["hostname"] = config::string(lease, "port_identifier"); row["expires"] = config::string(lease, "expires_at");
+                row["vlan"] = vid;
+                leases.append(std::move(row));
+            }
+        }
+    }
+    return leases;
 }
 Json::Value Gvswitch::forward_failures() const {
     Json::Value result(Json::objectValue);

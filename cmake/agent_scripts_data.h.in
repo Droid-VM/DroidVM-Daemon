@@ -1,0 +1,10 @@
+// Generated from the shared App/native rescue scripts. Do not edit.
+#pragma once
+#include <string_view>
+namespace droidvm::agent::embedded {
+inline constexpr std::string_view preamble = R"DVM_AGENT(@DROIDVM_AGENT_preamble@)DVM_AGENT";
+inline constexpr std::string_view chpasswd = R"DVM_AGENT(@DROIDVM_AGENT_chpasswd@)DVM_AGENT";
+inline constexpr std::string_view autogrow = R"DVM_AGENT(@DROIDVM_AGENT_autogrow@)DVM_AGENT";
+inline constexpr std::string_view epilogue = R"DVM_AGENT(@DROIDVM_AGENT_epilogue@)DVM_AGENT";
+inline constexpr std::string_view finalize = R"DVM_AGENT(@DROIDVM_AGENT_finalize@)DVM_AGENT";
+}

@@ -75,6 +75,9 @@ VncBinding vnc_binding(const Screen& screen, const std::map<std::string, VncRun>
 // VMHypervisor.valueOf(optString("hypervisor","auto").toUpperCase()) then
 // resolveConfigured(backend, ...); nullopt when nothing is supported.
 enum class Backend { crosvm, qemu };
+// Custom listener/configuration options make the generated endpoint ambiguous.
+// Unrelated CPU/device arguments do not disable the graphical connection.
+bool vnc_options_overridden(const Json::Value& item, Backend backend);
 std::optional<std::string> resolve_hypervisor(const Json::Value& item, const HostFacts& host, Backend backend);
 // VMBackendInstance.prepareStraceArguments; returns getStraceFolder().
 std::optional<std::string> strace_args(const Json::Value& item, const HostFacts& host, std::vector<std::string>& args);

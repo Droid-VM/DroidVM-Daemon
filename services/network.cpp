@@ -2,6 +2,9 @@
 #include "network.h"
 #include "store/network_config.h"
 #include "tasks.h"
+#include <arpa/inet.h>
+#include <algorithm>
+#include <cctype>
 
 namespace droidvm {
 const char* network_state_name(NetworkState state) {
@@ -22,8 +25,13 @@ struct NetworkService::Slot {
     std::unique_ptr<NetworkRuntimeLease> lease;
     std::unique_ptr<network::Forwarding::Lease> forwarding;
     std::unique_ptr<network::Backend> backend;
+    // Serialized with attach/detach/stop. Complements the VM-state callback:
+    // a NIC attached after that callback must still block a concurrent stop.
+    std::set<std::string> attached_taps;
     Clock::time_point next_recovery{};
     Clock::time_point next_refresh{};
+    Json::Value leases;
+    Clock::time_point leases_at{}; // observation mutex
 };
 struct NetworkService::Access {
     ConfigurationGate::Admission admission;
@@ -68,6 +76,7 @@ void NetworkService::state(Slot& slot, NetworkState state, bool desired, std::st
     slot.view.tools = std::move(tools);
     slot.view.state = state; slot.view.desired_running = desired;
     slot.view.error = error.substr(0, 4096); ++slot.view.generation;
+    if (state != NetworkState::running) slot.leases = Json::Value();
 }
 NetworkView NetworkService::get(const CallContext& caller, const std::string& id) { return view(*slot(caller, id)); }
 Json::Value NetworkService::tool_log(const CallContext& caller, const std::string& id, const std::string& key) {
@@ -81,25 +90,44 @@ Json::Value NetworkService::tool_log(const CallContext& caller, const std::strin
 void NetworkService::cleanup(Slot& slot) {
     if (slot.backend) slot.backend->stop();
     slot.backend.reset(); slot.forwarding.reset(); slot.lease.reset();
+    slot.attached_taps.clear();
 }
 NetworkView NetworkService::start(const CallContext& caller, const std::string& id) {
     return start_impl(caller, id, false);
 }
-NetworkView NetworkService::start_impl(const CallContext& caller, const std::string& id, bool only_initial) {
+void NetworkService::check_expected(Slot& slot, const Expectation& expected) {
+    const auto observed = view(slot);
+    if (observed.generation != expected.generation || observed.state != expected.state)
+        throw ServiceError(ErrorCode::conflict, "Network runtime changed; reload before applying");
+}
+NetworkView NetworkService::change_if_matches(const CallContext& caller, const std::string& id, bool starting,
+        uint64_t generation, NetworkState expected_state, const std::string& configuration_revision) {
+    if (configuration_revision.empty() || configuration_revision.size() > 128)
+        throw ServiceError(ErrorCode::invalid_argument, "Network configuration revision is required");
+    const Expectation expected{generation, expected_state, configuration_revision};
+    return starting ? start_impl(caller, id, false, &expected) : stop_impl(caller, id, &expected);
+}
+NetworkView NetworkService::start_impl(const CallContext& caller, const std::string& id, bool only_initial, const Expectation* expected) {
     auto target = slot(caller, id);
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
+    if (expected) check_expected(*target, *expected);
     { std::lock_guard lock(mutex_); if (shutting_down_) throw ServiceError(ErrorCode::unavailable, "Network service is shutting down"); }
     if (only_initial && view(*target).generation != 0) return view(*target);
     if (view(*target).state == NetworkState::running) {
+        if (expected && configs_.get_with_revision(caller, id).revision != expected->revision)
+            throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before starting");
         if (target->backend && target->backend->healthy()) return view(*target);
         state(*target, NetworkState::failed, true, "Network backend exited; recovery required");
         throw ServiceError(ErrorCode::unavailable, view(*target).error);
     }
     if (target->lease || target->backend) throw ServiceError(ErrorCode::conflict, "Network requires cleanup before starting");
+    // A failed confirmation must not change runtime state/generation. The
+    // returned lease freezes the accepted configuration through backend start.
+    if (expected) target->lease = configs_.prepare_runtime(caller, id, {}, expected->revision);
     state(*target, NetworkState::starting, true);
     try {
-        target->lease = configs_.prepare_runtime(caller, id);
+        if (!target->lease) target->lease = configs_.prepare_runtime(caller, id);
         target->backend = factory_(target->lease->config());
         if (!target->backend) throw std::runtime_error("Network backend unavailable");
         target->backend->start(target->lease->config());
@@ -121,11 +149,25 @@ NetworkView NetworkService::start_impl(const CallContext& caller, const std::str
     return view(*target);
 }
 NetworkView NetworkService::stop(const CallContext& caller, const std::string& id) {
+    return stop_impl(caller, id);
+}
+NetworkView NetworkService::stop_impl(const CallContext& caller, const std::string& id, const Expectation* expected) {
     auto target = cleanup_slot(caller, id);
     if (in_use_) if (const auto vm = in_use_(view(*target).id); !vm.empty())
         throw ServiceError(ErrorCode::conflict, "Network is in use by running VM " + vm);
     std::unique_lock operation(target->operation, std::try_to_lock);
     if (!operation.owns_lock()) throw ServiceError(ErrorCode::conflict, "Network operation already in progress");
+    if (expected) check_expected(*target, *expected);
+    if (!target->attached_taps.empty())
+        throw ServiceError(ErrorCode::conflict, "Network has attached VM interfaces");
+    // Cleanup remains possible while the configuration gate requires recovery.
+    // Holding the writer lock also protects stopped networks without a lease.
+    std::unique_lock writer(configs_.writer_mutex_, std::defer_lock);
+    if (expected) {
+        writer.lock();
+        if (configs_.state()->revision != expected->revision)
+            throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before stopping");
+    }
     stop_slot(*target);
     return view(*target);
 }
@@ -166,6 +208,7 @@ NetworkView NetworkService::reconcile(const CallContext& caller, const std::stri
             // An unchanged poll must not generate a new observable revision.
             if (previous.state != NetworkState::running || !previous.error.empty() || previous.tools != target->backend->tools())
                 state(*target, NetworkState::running, true);
+            observe_leases(*target);
         } catch (const std::exception& error) {
             state(*target, NetworkState::failed, true, error.what());
             // A control-plane failure can invalidate a still-live process.
@@ -220,12 +263,15 @@ void NetworkService::attach_nic(const CallContext& caller, const std::string& id
     }
     std::lock_guard operation(target->operation);
     if (!target->backend || !target->backend->healthy()) throw ServiceError(ErrorCode::unavailable, "Network " + id + " is not running");
-    target->backend->attach(nic, tap);
+    const auto inserted = target->attached_taps.insert(tap).second;
+    try { target->backend->attach(nic, tap); }
+    catch (...) { if (inserted) target->attached_taps.erase(tap); throw; }
 }
 void NetworkService::detach_nic(const CallContext& caller, const std::string& id, const Json::Value& nic, const std::string& tap) {
     auto target = cleanup_slot(caller, id);
     std::lock_guard operation(target->operation);
     if (target->backend) target->backend->detach(nic, tap);
+    target->attached_taps.erase(tap);
 }
 Json::Value NetworkService::forward_failures(const CallContext& caller, const std::string& id) {
     auto target = slot(caller, id);
@@ -240,6 +286,42 @@ Json::Value NetworkService::live(const CallContext& caller, const std::string& i
     if (!operation.owns_lock() || !target->backend || view(*target).state != NetworkState::running) return data;
     target->backend->live_details(data);
     return data;
+}
+void NetworkService::observe_leases(Slot& target) {
+    Json::Value rows;
+    try {
+        rows = target.backend->dhcp_leases();
+        if (!rows.isArray() || rows.size() > 4096) rows = Json::Value();
+        else {
+            Json::Value valid(Json::arrayValue);
+            for (const auto& row : rows) {
+                if (!row.isObject() || !row["ip"].isString() || !row["mac"].isString() || !row["vlan"].isInt()) continue;
+                const auto ip = row["ip"].asString();
+                auto mac = row["mac"].asString();
+                unsigned char address[16]{};
+                const auto expiry = row["expires"].isInt64() ? row["expires"].asInt64() :
+                    row["expires"].isString() ? network::rfc3339_seconds(row["expires"].asString()) : 0;
+                if (ip.empty() || ip.size() > 45 || ip.find('\0') != std::string::npos || mac.size() != 17 || row["vlan"].asInt() < 0 || row["vlan"].asInt() > 4094 || expiry <= 0 ||
+                    (inet_pton(AF_INET, ip.c_str(), address) != 1 && inet_pton(AF_INET6, ip.c_str(), address) != 1)) continue;
+                std::transform(mac.begin(), mac.end(), mac.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                Json::Value item;
+                item["ip"] = ip; item["mac"] = mac; item["vlan"] = row["vlan"]; item["expires"] = Json::Int64(expiry);
+                valid.append(std::move(item));
+            }
+            rows = std::move(valid);
+        }
+    } catch (const std::exception&) { rows = Json::Value(); }
+    std::lock_guard lock(target.observation);
+    target.leases = std::move(rows);
+    target.leases_at = now_();
+}
+Json::Value NetworkService::observed_leases(const CallContext& caller, const std::string& id) {
+    auto target = slot(caller, id);
+    std::lock_guard lock(target->observation);
+    const auto now = now_();
+    if (target->view.state != NetworkState::running || now < target->leases_at ||
+        now - target->leases_at > std::chrono::seconds(15)) return {};
+    return target->leases;
 }
 bool NetworkService::pd_action(const CallContext& caller, const std::string& id, int vlan, bool release) {
     auto target = slot(caller, id);

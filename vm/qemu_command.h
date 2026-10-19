@@ -61,6 +61,7 @@ struct QemuLaunch {
     std::optional<std::string> strace_dir; // getStraceFolder(): caller recreates the directory
     // agent_mode: QEMU serves the agent socket (connect it before the UART).
     bool agent = false;
+    std::vector<VncEndpoint> vnc_endpoints; // QEMU emits one shared VNC console.
 };
 // The socket paths start() assigns: DATA_DIR/run/<name>-{qmp,uart,agent}.sock,
 // the agent one only in agent_mode. The caller deletes stale files.

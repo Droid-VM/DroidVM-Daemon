@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "acm_control.h"
 #include <json/json.h>
 #include <chrono>
 #include <functional>
@@ -37,6 +38,7 @@ public:
     virtual int make_directory(const std::string& path);                // File.mkdir
     virtual int symlink(const std::string& target, const std::string& link);
     virtual int remove(const std::string& path);                        // File.delete
+    virtual bool tty_node(const std::string& path) const;
 };
 
 struct AcmTiming {
@@ -57,7 +59,7 @@ struct AcmOptions {
     std::function<void(const char* level, const std::string& text)> log;
 };
 
-class AcmPool {
+class AcmPool : public AcmControl {
 public:
     explicit AcmPool(AcmOptions options = {});
     // applyConfig: builds or tears down the pool; failures only log.
@@ -67,11 +69,17 @@ public:
     std::string acquire(int slot, const std::string& owner, const Json::Value& app_config);
     void release(const std::string& owner); // never rebinds
     std::map<std::string, std::string> owners() const; // instance -> owner
+    void transaction(const std::function<void(AcmTransaction&)>&) override;
 private:
+    class Transaction;
     AcmOptions options_;
     std::string functions_, config_, udc_;
     mutable std::mutex mutex_;
     std::map<std::string, std::string> owners_;
+    bool managed_ = false;
+    std::optional<AcmDesired> desired_;
+    Json::Value live_locked(const AcmDesired&) const;
+    void admit_locked(const AcmDesired&) const;
     void reconcile(int pool_size);
     void with_udc_unbound(const std::function<void()>& op);
     bool usb_settled();

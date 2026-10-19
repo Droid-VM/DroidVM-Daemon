@@ -434,7 +434,7 @@ struct Builder {
         arg += ",screen=" + screen.id;
         return arg;
     }
-    void exporters_args() {
+    void exporters_args(CrosvmLaunch& launch) {
         for (const auto& screen : screens_of(item)) {
             if (!screen.enabled()) continue;
             const auto exporter = screen.exporter();
@@ -444,6 +444,9 @@ struct Builder {
             } else if (exporter == "VNC") {
                 args.push_back("--vnc-server");
                 args.push_back(vnc_arg(screen) + transport_cap_arg(screen));
+                const auto binding = vnc_binding(screen, run.vnc);
+                launch.vnc_endpoints.push_back({screen.id, binding.host, std::max<int64_t>(binding.port, 1),
+                    binding.password, screen.input_enabled(), ""});
             }
         }
     }
@@ -644,7 +647,7 @@ struct Builder {
         networks();
         shared_dirs();
         gpu(*hypervisor == "GUNYAH");
-        exporters_args();
+        exporters_args(launch);
         for (const auto& screen : screens_of(item)) launch.input_bridge = launch.input_bridge || (screen.enabled() && screen.exporter() != "NONE");
         if (launch.input_bridge) inputs(launch);
         peripherals();
@@ -707,6 +710,8 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
     Builder builder{config, run, boot, host, data_dir(host), {}};
     CrosvmLaunch launch;
     builder.command(launch);
+    if (vnc_options_overridden(config, Backend::crosvm))
+        for (auto& endpoint : launch.vnc_endpoints) endpoint.unavailable_reason = "unsupported";
     launch.argv = std::move(builder.args);
     if (run.disk_fds) for (const auto& [path, fd] : *run.disk_fds) launch.preserve_fds.push_back(fd);
     if (run.disk_backing_fds) for (const auto& [path, chain] : *run.disk_backing_fds) for (const auto fd : chain) {

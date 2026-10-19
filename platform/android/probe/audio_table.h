@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <atomic>
+#include <chrono>
+#include <json/json.h>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -20,11 +22,16 @@ public:
     bool start(int run_directory, Log log = {}); // false when Binder APIs are missing
     void stop();
     unsigned publications() const { return publications_; }
+    // Cached result of the existing watcher; never makes a Binder call.
+    Json::Value snapshot() const;
 private:
     int directory_ = -1;
     Log log_;
     std::thread worker_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
+    Json::Value devices_{Json::arrayValue};
+    bool available_ = false;
+    std::chrono::steady_clock::time_point refreshed_{};
     std::condition_variable wake_;
     bool stopping_ = false;
     std::atomic<unsigned> publications_{0};

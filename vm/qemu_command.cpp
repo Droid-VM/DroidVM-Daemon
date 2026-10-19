@@ -163,12 +163,14 @@ struct Builder {
         }
         if (fb_screen) add({"-device", "ramfb"});
     }
-    void vnc() {
+    void vnc(QemuLaunch& launch) {
         for (const auto& screen : screens_of(item)) {
             if (!screen.enabled() || screen.exporter() != "VNC") continue;
             auto binding = vnc_binding(screen, run.vnc);
             if (binding.host.empty()) binding.host = "0.0.0.0";
             const auto display = std::max<int64_t>(std::max<int64_t>(binding.port, 1) - 5900, 0);
+            launch.vnc_endpoints.push_back({screen.id, binding.host, display + 5900,
+                binding.password, screen.input_enabled(), screen.input_enabled() ? "" : "input-disabled"});
             if (binding.host.find(':') != std::string::npos) binding.host = "[" + binding.host + "]";
             auto arg = binding.host + ":" + decimal(display);
             if (!binding.password.empty()) {
@@ -234,7 +236,7 @@ struct Builder {
             shared_dirs();
             audio();
             gpu();
-            vnc();
+            vnc(launch);
         } else {
             add({"-chardev", "socket,id=agent0,path=" + or_null(run.agent_socket_path) + ",server=on,wait=off"});
             add({"-device", "virtio-serial-pci,id=agent-bus," + std::string(pci)});
@@ -264,6 +266,8 @@ QemuLaunch qemu_command(const Json::Value& config, const QemuRun& run, const Boo
     launch.agent = boolean(config, "agent_mode", false);
     Builder builder{config, run, boot, host, launch.agent, {}, 0, 0};
     builder.command(launch);
+    if (vnc_options_overridden(config, Backend::qemu))
+        for (auto& endpoint : launch.vnc_endpoints) endpoint.unavailable_reason = "unsupported";
     launch.argv = std::move(builder.args);
     if (run.disk_graph) {
         launch.preserve_fds = run.disk_graph->preserve_fds;

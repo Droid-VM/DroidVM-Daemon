@@ -108,14 +108,14 @@ std::string BridgeDhcp::endpoint(int vlan) const {
     if (at == devices_.end()) throw ServiceError(ErrorCode::not_found, "DHCP VLAN not available");
     return "/v1/ifaces/" + ControlHttp::component(at->second);
 }
-Json::Value BridgeDhcp::request(HttpMethod method, const std::string& path, std::optional<std::string_view> body) const {
+Json::Value BridgeDhcp::request(HttpMethod method, const std::string& path, std::optional<std::string_view> body, ControlOptions options) const {
     if (!healthy() || !client_) throw ServiceError(ErrorCode::unavailable, "DHCP helper is not ready");
-    const auto response = client_->request(method, path, body);
+    const auto response = client_->request(method, path, body, std::move(options));
     if (!response.success()) throw ServiceError(ErrorCode::unavailable, "DHCP control request failed with HTTP " + std::to_string(response.code));
     return response.body.empty() ? Json::Value() : wire::parse(response.body);
 }
 Json::Value BridgeDhcp::status() const { return request(HttpMethod::get, "/v1/status"); }
-Json::Value BridgeDhcp::leases(int vlan, bool ipv6) const { return request(HttpMethod::get, endpoint(vlan) + (ipv6 ? "/leases/6" : "/leases/4")); }
+Json::Value BridgeDhcp::leases(int vlan, bool ipv6, ControlOptions options) const { return request(HttpMethod::get, endpoint(vlan) + (ipv6 ? "/leases/6" : "/leases/4"), {}, std::move(options)); }
 PdSnapshot BridgeDhcp::poll_pd(bool force) {
     if (!healthy()) throw ServiceError(ErrorCode::unavailable, "DHCP helper is not ready");
     return pd_.poll(process_.take_output(), [&] { return status(); }, force);

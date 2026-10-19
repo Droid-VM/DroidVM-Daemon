@@ -4,6 +4,7 @@
 // gadget writer and a fake clock; never touches the real /config.
 #include "contracts.h"
 #include "vm/usb_acm.h"
+#include "services/context.h"
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
@@ -61,6 +62,7 @@ struct Kernel : GadgetFs {
     bool bind_raced = false; // the HAL binds first: our bind fails with EBUSY
     bool bind_lost = false;  // our bind fails and the UDC stays unbound
     bool no_nodes = false;   // tty nodes never appear
+    bool unbind_error_after_effect = false;
     Kernel() {
         auto pattern = scratch + "/droidvm-acm-XXXXXX";
         std::vector<char> name(pattern.begin(), pattern.end());
@@ -115,7 +117,8 @@ struct Kernel : GadgetFs {
             events.push_back("unbind");
             if (refuse_unbind > 0) { --refuse_unbind; return EBUSY; }
             nodes(false);
-            return GadgetFs::write(path, text);
+            const auto result = GadgetFs::write(path, text);
+            return unbind_error_after_effect ? EIO : result;
         }
         events.push_back("bind:" + value);
         if (bind_lost) return EBUSY;
@@ -130,6 +133,7 @@ struct Kernel : GadgetFs {
         write_file(fs::path(path) / "port_num", std::to_string(port) + "\n");
         return 0;
     }
+    bool tty_node(const std::string& path) const override { return fs::is_regular_file(path); }
     int symlink(const std::string& target, const std::string& link) override {
         if (bound()) return EINVAL;
         events.push_back("link:" + relative(link));
@@ -192,6 +196,62 @@ void config_values() {
     check(acm_ports(app(true, 0)) == 1 && acm_ports(app(true, -5)) == 1, "clamped to one");
     check(acm_ports(app(true, 3)) == 3 && acm_ports(app(true, 6)) == 6 && acm_ports(app(true, 99)) == 6, "clamped to max");
     check(acm_ports(app(true, Json::Int64(4294967298LL))) == 2, "(int) narrowing of optLong");
+}
+void managed_authority_and_live() {
+    Fixture f;
+    f.pool->transaction([&](AcmTransaction& tx) {
+        tx.bind(std::nullopt);
+        check(tx.live({true, 2})["available"].asBool(), "initial gadget observation available");
+    });
+    check(f.take().empty(), "binding an uninitialized owner never edits gadget");
+    error_of<AcmSlotUnavailable>([&] { f.pool->acquire(0, "vm-a/serial1", app(true, 2)); });
+    f.pool->transaction([&](AcmTransaction& tx) { tx.admit({true, 2}); tx.bind(AcmDesired{true, 2}); tx.apply(); });
+    f.take();
+    expect(f.pool->acquire(0, "vm-a/serial1", app(false, 1)), f.dev(0));
+    const auto owners = f.pool->owners();
+    f.pool->apply_config(app(false, 1));
+    check(f.take().empty() && f.pool->owners() == owners, "stale App config cannot rebind authoritative pool");
+    bool rejected = false;
+    try { f.pool->transaction([](AcmTransaction& tx) { tx.admit({true, 3}); }); }
+    catch (const ServiceError& error) { rejected = error.code() == ErrorCode::conflict; }
+    check(rejected && f.take().empty() && f.pool->owners() == owners, "active slot forbids even expansion rebind");
+    f.pool->transaction([&](AcmTransaction& tx) {
+        const auto live = tx.live({true, 2});
+        check(live["applied"].asBool() && live["udcBound"].asBool() && live["ports"] == 2 &&
+            live["owners"][0]["slot"] == 0 && live["owners"][0]["vmId"] == "vm-a", "strict live observation wrong");
+    });
+    check(f.take().empty(), "GET mutated gadget");
+    f.pool->release("vm-a/serial1");
+    fs::remove(f.kernel->config / "acm.dvmpool1");
+    fs::create_symlink(f.kernel->functions / "ffs.adb", f.kernel->config / "acm.dvmpool1");
+    f.pool->transaction([&](AcmTransaction& tx) {
+        const auto live = tx.live({true, 2});
+        check(!live["available"].asBool() && !live["applied"].asBool() && live["ports"].isNull(), "wrong-target link was trusted");
+        error_of<ServiceError>([&] { tx.apply(); });
+    });
+    check(f.take().empty(), "unsafe link silently rewritten");
+    fs::remove(f.kernel->config / "acm.dvmpool1");
+    fs::create_symlink(f.kernel->functions / "acm.dvmpool1", f.kernel->config / "acm.dvmpool1");
+    write_file(f.kernel->functions / "acm.dvmpool1/port_num", "-1\n");
+    f.pool->transaction([&](AcmTransaction& tx) {
+        const auto live = tx.live({true, 2});
+        check(!live["available"].asBool() && live["ports"].isNull(), "invalid port produced a partial count");
+    });
+}
+void managed_udc_error_restores_without_retry() {
+    Fixture f; f.kernel->unbind_error_after_effect = true;
+    f.pool->transaction([&](AcmTransaction& tx) {
+        tx.bind(AcmDesired{true, 1});
+        error_of<std::runtime_error>([&] { tx.apply(); });
+    });
+    const auto events = f.take();
+    check(std::count(events.begin(), events.end(), "unbind") == 1 &&
+        std::count(events.begin(), events.end(), "bind:a600000.dwc3") == 1 && f.kernel->bound(), "ambiguous unbind failed to restore or retried");
+    f.pool->transaction([&](AcmTransaction& tx) {
+        const auto live = tx.live({true, 1});
+        check(live["available"].asBool() && live["udcBound"].asBool() && !live["applied"].asBool(), "restored partial composition not reported");
+    });
+    check(f.take().empty(), "observing partial failure retried mutation");
 }
 void pool_build_and_teardown() {
     Fixture f;
@@ -416,6 +476,8 @@ void failures() {
 int main(int argc, char** argv) {
     if (argc > 1) scratch = argv[1];
     return test::run({{"config_values", config_values},
+                      {"managed_authority_and_live", managed_authority_and_live},
+                      {"managed_udc_error_restores_without_retry", managed_udc_error_restores_without_retry},
                       {"pool_build_and_teardown", pool_build_and_teardown},
                       {"port_count_changes", port_count_changes},
                       {"acquire_and_release", acquire_and_release},

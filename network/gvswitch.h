@@ -28,6 +28,7 @@ public:
     void detach(const Json::Value& nic, const std::string& tap) override;
     Json::Value forward_failures() const override;
     void live_details(Json::Value& data) const override;
+    Json::Value dhcp_leases() const override;
     ProcessStatus status() const { return process_.status(); }
     std::deque<ProcessLine> log() const { return process_.log(); }
     // Administrative lifecycle control uses held pidfd, never a raw PID.
@@ -48,7 +49,7 @@ private:
     std::string socket_; // control socket, as appendInfo gvswitch_socket
     void remove_directory();
     std::string tap_owner(const std::string& tap) const;
-    ControlResponse call(HttpMethod method, const std::string& path, const Json::Value* body = nullptr) const;
+    ControlResponse call(HttpMethod method, const std::string& path, const Json::Value* body = nullptr, ControlOptions options = {std::chrono::seconds(5), {}}) const;
     void post_port(const Json::Value& nic, const std::string& tap);
     void apply_leases(const Json::Value& nic, const std::string& tap);
     void remove_leases(const Json::Value& nic, const std::string& tap);

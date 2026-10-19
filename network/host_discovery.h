@@ -17,7 +17,16 @@ struct HostInterface {
     uint32_t index = 0;
     bool wireless = false, up = false, ethernet = false, physical = false;
     bool leaf = false, virtual_device = false, bridge = false, tun = false;
+    bool cellular = false;
+    bool operator==(const HostInterface&) const = default;
     bool real_l2() const { return ethernet && leaf && !virtual_device && (up || physical); }
+};
+// Preserve direct prefix/route metadata for access policies. The legacy
+// host_addresses projection intentionally exposes only three display fields.
+struct HostNetworkSnapshot {
+    std::vector<HostInterface> interfaces;
+    Json::Value links{Json::arrayValue};
+    Json::Value addresses{Json::arrayValue};
 };
 // One fresh snapshot per service operation. Logical identifiers re-resolve on
 // each scan; a caller mutating an uplink must separately hold/check its identity.

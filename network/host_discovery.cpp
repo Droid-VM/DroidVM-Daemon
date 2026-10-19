@@ -104,6 +104,7 @@ UplinkSnapshot UplinkSnapshot::scan(const std::string& root) {
         row.physical = exists_at(device.get(), "device");
         row.bridge = exists_at(device.get(), "bridge"); row.tun = exists_at(device.get(), "tun_flags");
         const auto lines = "\n" + *uevent + "\n";
+        row.cellular = lines.find("\nDEVTYPE=wwan\n") != std::string::npos;
         for (const auto* type : {"vlan", "vxlan", "gretap", "erspan"})
             if (lines.find(std::string("\nDEVTYPE=") + type + "\n") != std::string::npos) row.virtual_device = true;
         result.interfaces_.push_back(std::move(row));

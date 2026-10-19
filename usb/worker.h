@@ -27,7 +27,8 @@ public:
     // false when the worker is shut down (RejectedExecutionException).
     bool schedule(std::function<void()> task, std::chrono::milliseconds delay = std::chrono::milliseconds(0), Cancel cancel = {});
     // Runs [task] on the worker and waits; nullopt when rejected. A thrown
-    // exception is rethrown here (ExecutionException).
+    // exception is rethrown here (ExecutionException). Nested submissions from
+    // this worker run inline; waiting on its own queue would deadlock.
     template <typename F> auto submit(F task) -> std::optional<decltype(task())>;
     // Waits up to [timeout] for queued work, then marks the worker
     // interrupted (waits inside tasks end early) and joins. Returns whether
@@ -49,6 +50,7 @@ private:
     void run();
 };
 template <typename F> auto Worker::submit(F task) -> std::optional<decltype(task())> {
+    if (on_worker()) return task();
     using T = decltype(task());
     struct Slot { std::mutex mutex; std::condition_variable done; bool finished = false; std::optional<T> value; std::exception_ptr error; };
     // Completes the wait when the task is destroyed, run or dropped at shutdown.

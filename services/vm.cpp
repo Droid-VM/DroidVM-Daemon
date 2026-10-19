@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vm.h"
+#include "host_preferences.h"
+#include "usb_acm.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include "store/vm_ownership.h"
@@ -13,6 +15,8 @@
 #include <unistd.h>
 #include <array>
 #include <memory>
+#include <exception>
+#include <shared_mutex>
 
 namespace droidvm {
 namespace {
@@ -47,24 +51,55 @@ Json::Value parse_strict(const std::string& text) {
     return value;
 }
 }
-VmService::VmService(vm::RuntimeContext context) : context_(std::move(context)) {
+struct VmService::ManagedLifetime {
+    mutable std::shared_mutex mutex;
+    VmService* owner = nullptr;
+};
+struct VmService::ManagedClaim {};
+VmService::ManagedVm::ManagedVm(std::shared_ptr<ManagedLifetime> lifetime,
+        std::shared_ptr<ManagedClaim> claim, std::shared_ptr<vm::VmRuntime> target)
+    : lifetime_(std::move(lifetime)), target_(std::move(target)), claim_(std::move(claim)) {}
+std::shared_ptr<vm::VmRuntime> VmService::ManagedVm::runtime() const {
+    std::shared_lock lifetime(lifetime_->mutex);
+    auto* owner = lifetime_->owner;
+    if (!owner) throw ServiceError(ErrorCode::unavailable, "VM service is unavailable");
+    std::lock_guard lock(owner->mutex_);
+    const auto* entry = owner->find(target_->id());
+    if (!entry || !entry->managed || entry->vm != target_)
+        throw ServiceError(ErrorCode::not_found, "Managed VM is no longer registered");
+    return target_;
+}
+void VmService::ManagedVm::remove(std::chrono::milliseconds timeout) {
+    if (timeout < std::chrono::milliseconds::zero())
+        throw ServiceError(ErrorCode::invalid_argument, "VM cleanup timeout cannot be negative");
+    std::shared_lock lifetime(lifetime_->mutex);
+    auto* owner = lifetime_->owner;
+    if (!owner) throw ServiceError(ErrorCode::unavailable, "VM service is unavailable");
+    owner->remove_managed(target_, timeout);
+}
+VmService::VmService(vm::RuntimeContext context, HostPreferencesService* preferences, UsbAcmService* acm_preferences, HostPreferencesService* disk_defaults)
+    : context_(std::move(context)), preferences_(preferences), acm_preferences_(acm_preferences), disk_defaults_(disk_defaults), managed_lifetime_(std::make_shared<ManagedLifetime>()) {
+    managed_lifetime_->owner = this;
     auto flag = shutting_down_;
     auto outer = context_.shutting_down;
     context_.shutting_down = [flag, outer] { return flag->load() || outer(); };
     // KEY_OPTIMIZE_SDCARD through DataItem.optBoolean: only a boolean counts.
     context_.optimize_sdcard = [this] {
+        if (preferences_) return preferences_->values()["optimize_sdcard"].asBool();
         std::lock_guard lock(app_mutex_);
         const auto& value = config::member(app_config_, "optimize_sdcard");
         return value.isBool() ? value.asBool() : true;
     };
     context_.hugepage_auto_reserve = [this] {
+        if (preferences_) return preferences_->values()["vm_hugepage_auto_reserve"].asBool();
         std::lock_guard lock(app_mutex_);
         const auto& value = config::member(app_config_, "vm_hugepage_auto_reserve");
         return value.isBool() ? value.asBool() : true;
     };
     context_.app_config = [this] { return app_config(); };
 }
-VmService::VmService(int files_directory, vm::RuntimeContext context) : VmService(std::move(context)) {
+VmService::VmService(int files_directory, vm::RuntimeContext context, HostPreferencesService* preferences, UsbAcmService* acm_preferences, HostPreferencesService* disk_defaults)
+    : VmService(std::move(context), preferences, acm_preferences, disk_defaults) {
     config::require_legacy_vm_config(files_directory, context_.owner);
     try {
         const auto document = parse_strict(read_file(files_directory, "vms.json"));
@@ -87,7 +122,14 @@ VmService::VmService(int files_directory, vm::RuntimeContext context) : VmServic
         entries_.clear(); loaded_ = 0; load_error_ = error.what();
     }
 }
-VmService::~VmService() { try { stop_all(); } catch (...) {} }
+VmService::~VmService() {
+    {
+        // Drain handle calls before invalidating their route back into the service.
+        std::unique_lock lifetime(managed_lifetime_->mutex);
+        managed_lifetime_->owner = nullptr;
+    }
+    try { stop_all(); } catch (...) {}
+}
 std::optional<std::string> VmService::canonical(const std::string& id) {
     Json::Value value;
     value["id"] = id;
@@ -99,7 +141,8 @@ const VmService::Entry* VmService::find(const std::string& id) const {
     for (const auto& entry : entries_) if (entry.id == *key) return &entry;
     return nullptr;
 }
-void VmService::add(const std::string& id, Json::Value config) {
+void VmService::add(const std::string& id, Json::Value config, bool managed,
+        std::shared_ptr<const void> reservation, std::weak_ptr<ManagedClaim> claim) {
     const auto& name = config::member(config, "name");
     // IllegalArgumentException in DataStore.add: never a legacy business message.
     if (!name.isString()) throw ServiceError(ErrorCode::invalid_argument, "Config name cannot be null");
@@ -107,8 +150,13 @@ void VmService::add(const std::string& id, Json::Value config) {
         if (other.id == id) throw ServiceError(ErrorCode::invalid_argument, "Config ID already exists: " + id);
         if (config::member(other.vm->config(), "name") == name) throw ServiceError(ErrorCode::invalid_argument, "Config name already exists: " + name.asString());
     }
-    auto runtime = std::make_shared<vm::VmRuntime>(id, config, context_);
-    entries_.push_back({id, std::move(runtime), std::move(config)});
+    auto context = context_;
+    // VmRuntime validates the narrow rescue profile and isolates every console
+    // sink/callback. A user-supplied JSON flag cannot select this runtime mode.
+    if (managed) context.private_console = true;
+    auto runtime = std::make_shared<vm::VmRuntime>(id, config, context);
+    entries_.push_back({id, std::move(reservation), std::move(runtime), std::move(config),
+        managed, managed, std::move(claim)});
 }
 class VmService::ConfigUpdate final : public VmConfigService::Commit {
 public:
@@ -149,7 +197,7 @@ public:
             const auto id = config::uuid(row);
             const auto* previous = owner.find(id);
             if (previous && previous->definition == row && !disk_affected.contains(id)) entries_.push_back(*previous);
-            else entries_.push_back({id, std::make_shared<vm::VmRuntime>(id, row, owner.context_), row});
+            else entries_.push_back({id, {}, std::make_shared<vm::VmRuntime>(id, row, owner.context_), row});
         }
         for (const auto& entry : owner.entries_) if (entry.temporary) entries_.push_back(entry);
     }
@@ -180,12 +228,8 @@ Json::Value VmService::list(const CallContext& caller) const {
     std::lock_guard lock(mutex_);
     Json::Value rows(Json::arrayValue);
     for (const auto& entry : entries_) {
-        auto row = entry.vm->config();
-        row["state"] = vm_state_name(entry.vm->state());
-        row["pid"] = Json::Int64(entry.vm->pid());
-        row["streams"] = Json::Value(Json::arrayValue);
-        for (const auto& name : entry.vm->streams()) row["streams"].append(name);
-        rows.append(std::move(row));
+        if (entry.managed) continue;
+        rows.append(entry.vm->snapshot());
     }
     return rows;
 }
@@ -197,25 +241,27 @@ Json::Value VmService::get(const CallContext& caller, const std::string& id) con
 bool VmService::exists(const CallContext& caller, const std::string& id) const {
     access(caller);
     std::lock_guard lock(mutex_);
-    return find(id) != nullptr;
+    const auto* entry = find(id);
+    return entry && !entry->managed;
 }
 VmState VmService::state(const CallContext& caller, const std::string& id) const { return runtime(caller, id)->state(); }
 std::shared_ptr<vm::VmRuntime> VmService::runtime(const CallContext& caller, const std::string& id) const {
     access(caller);
     std::lock_guard lock(mutex_);
     const auto* entry = find(id);
-    if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
+    if (!entry || entry->managed) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
     return entry->vm;
 }
 bool VmService::start_configured(const CallContext& caller, const std::string& id,
-        const Json::Value& expected, const Json::Value& overrides, std::optional<std::string> boot_entry, bool clear_logs) {
+        const Json::Value& expected, const Json::Value& overrides, std::optional<std::string> boot_entry, std::optional<bool> clear_logs,
+        std::optional<vm::Observation> observed) {
     access(caller);
     std::shared_ptr<vm::VmRuntime> target;
     {
         std::lock_guard lock(mutex_);
-        if (!config_managed_) throw ServiceError(ErrorCode::unavailable, "Persistent VM configuration is not attached");
         const auto* entry = find(id);
-        if (!entry) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
+        if (!entry || entry->managed) throw ServiceError(ErrorCode::not_found, "VM not found: " + id);
+        if (!config_managed_) throw ServiceError(ErrorCode::unavailable, "Persistent VM configuration is not attached");
         if (entry->definition != expected)
             throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before starting");
         target = entry->vm;
@@ -223,7 +269,7 @@ bool VmService::start_configured(const CallContext& caller, const std::string& i
     // Never hold inventory across lifecycle/network callbacks. If a writer won
     // after the comparison, its stopped lease retires target and start refuses.
     // If start wins, the writer cannot acquire the stopped lease and must fail.
-    try { return target->start(std::move(boot_entry), overrides, clear_logs); }
+    try { return target->start(std::move(boot_entry), overrides, clear_logs_before_start(clear_logs), std::move(observed)); }
     catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::invalid_argument, error.what()); }
 }
 std::string VmService::create(const CallContext& caller, Json::Value value) {
@@ -241,11 +287,87 @@ std::string VmService::create(const CallContext& caller, Json::Value value) {
     entries_.back().temporary = temporary && config_managed_;
     return id;
 }
+std::unique_ptr<VmService::ManagedVm> VmService::create_managed(Json::Value value,
+        std::shared_ptr<const void> reservation) {
+    auto admission = ConfigurationGate::enter(context_.configuration_gate);
+    auto config = config::migrate_vm(std::move(value));
+    const auto id = config::uuid(config);
+    config["id"] = id;
+    config["temporary"] = true;
+    config["auto_up"] = false;
+    // Allocate the capability before publication so allocation failure cannot
+    // leave an unclaimed inventory entry behind.
+    auto owner = std::unique_ptr<ManagedVm>(
+        new ManagedVm(managed_lifetime_, std::make_shared<ManagedClaim>(), {}));
+    std::lock_guard lock(mutex_);
+    if (shutting_down_->load())
+        throw ServiceError(ErrorCode::unavailable, "VM service is shutting down");
+    if (find(id)) throw ServiceError(ErrorCode::conflict, "VM " + id + " already exists");
+    // Keep the parameter's reference until after mutex_ unlocks, including if
+    // runtime validation or a duplicate name rejects creation.
+    add(id, std::move(config), true, reservation, owner->claim_);
+    owner->target_ = entries_.back().vm;
+    return owner;
+}
+std::vector<std::string> VmService::pending_orphaned_managed() const {
+    std::lock_guard lock(mutex_);
+    std::vector<std::string> pending;
+    for (const auto& entry : entries_)
+        if (entry.managed && entry.managed_claim.expired()) pending.push_back(entry.id);
+    return pending;
+}
+std::vector<std::string> VmService::recover_managed(std::chrono::milliseconds timeout) {
+    if (timeout < std::chrono::milliseconds::zero())
+        throw ServiceError(ErrorCode::invalid_argument, "VM cleanup timeout cannot be negative");
+    std::vector<std::shared_ptr<vm::VmRuntime>> targets;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& entry : entries_)
+            if (entry.managed && entry.managed_claim.expired()) targets.push_back(entry.vm);
+    }
+    // An expired claim cannot be revived or looked up by ID. Recovery therefore
+    // never stops a runner that still owns its capability, even after unlocking.
+    // Removal checks runtime identity so a concurrent recovery cannot affect a
+    // later incarnation with the same ID.
+    for (const auto& target : targets) {
+        try { remove_managed(target, timeout); }
+        catch (...) { /* Keep its private registration for the next retry. */ }
+    }
+    return pending_orphaned_managed();
+}
+void VmService::remove_managed(const std::shared_ptr<vm::VmRuntime>& target,
+        std::chrono::milliseconds timeout) {
+    {
+        std::lock_guard lock(mutex_);
+        const auto* entry = find(target->id());
+        if (!entry || entry->vm != target) return;
+        if (!entry->managed) throw ServiceError(ErrorCode::permission_denied, "Managed VM ownership required");
+    }
+    // Shutdown may time out without throwing. Only a stopped lease proves that
+    // the process and its worker have left, and excludes a stale owner start.
+    target->shutdown(timeout);
+    std::shared_ptr<const void> released;
+    {
+        std::lock_guard lock(mutex_);
+        const auto* entry = find(target->id());
+        if (!entry || entry->vm != target) return;
+        auto edit = target->try_edit();
+        if (!edit) throw ServiceError(ErrorCode::unavailable, "Managed VM cleanup is incomplete");
+        edit.retire();
+        released = entry->reservation;
+        std::erase_if(entries_, [&](const Entry& row) { return row.vm == target; });
+    }
+    // Reservation teardown may enter ConfigurationService; never call it while
+    // holding inventory or runtime lifecycle locks.
+    released.reset();
+}
 std::string VmService::modify(const CallContext& caller, Json::Value value) {
     access(caller);
     auto config = config::migrate_vm(std::move(value));
     const auto id = config::uuid(config);
     std::lock_guard lock(mutex_);
+    if (const auto* entry = find(id); entry && entry->managed)
+        throw ServiceError(ErrorCode::not_found, "VM " + id + " not found");
     require_legacy_writer();
     auto at = entries_.begin();
     while (at != entries_.end() && at->id != id) ++at;
@@ -269,6 +391,7 @@ bool VmService::remove(const CallContext& caller, const std::string& id) {
     {
         std::lock_guard lock(mutex_);
         const auto* entry = find(id);
+        if (entry && entry->managed) return false;
         if (!entry || !entry->temporary) require_legacy_writer();
         if (!entry) return false;
         target = entry->vm;
@@ -311,6 +434,7 @@ std::map<int, network::DhcpStatics> VmService::statics(const Json::Value& networ
         const bool dhcp6 = (config::string(ipv6, "source") == "dhcp_pd" || !config::string(ipv6, "cidr").empty()) &&
             config::boolean(config::member(ipv6, "dhcp"), "enabled");
         for (const auto& entry : entries_) {
+            if (entry.managed) continue;
             const auto config = entry.vm->config();
             const auto& nics = config::member(config, "networks");
             if (!nics.isArray()) continue;
@@ -341,6 +465,7 @@ std::map<int, network::DhcpStatics> VmService::statics(const Json::Value& networ
 std::string VmService::running_vm_using(const std::string& network) const {
     std::lock_guard lock(mutex_);
     for (const auto& entry : entries_) {
+        if (entry.managed) continue;
         if (entry.vm->state() == VmState::stopped) continue;
         const auto config = entry.vm->config();
         const auto& nics = config::member(config, "networks");
@@ -353,6 +478,7 @@ std::vector<std::string> VmService::busy_vms_using(const std::string& network) c
     std::vector<std::string> names;
     std::lock_guard lock(mutex_);
     for (const auto& entry : entries_) {
+        if (entry.managed) continue;
         const auto config = entry.vm->config();
         const auto& nics = config::member(config, "networks");
         if (!nics.isArray()) continue;
@@ -373,6 +499,7 @@ void VmService::drop_network(const std::string& network) {
     std::vector<vm::VmRuntime::StoppedLease> leases;
     leases.reserve(entries_.size());
     for (auto& entry : next) {
+        if (entry.managed) continue;
         auto config = entry.definition;
         const auto& nics = config::member(config, "networks");
         if (!nics.isArray()) continue;
@@ -392,6 +519,7 @@ void VmService::drop_network(const std::string& network) {
 Json::Value VmService::vm_by_tap(const std::string& tap) const {
     std::lock_guard lock(mutex_);
     for (const auto& entry : entries_) {
+        if (entry.managed) continue;
         if (entry.vm->state() == VmState::stopped) continue;
         const auto config = entry.vm->config();
         const auto& nics = config::member(config, "networks");
@@ -414,7 +542,8 @@ void VmService::auto_up() {
     {
         std::lock_guard lock(mutex_);
         for (const auto& entry : entries_)
-            if (config::boolean(entry.vm->config(), "auto_up") && entry.vm->state() == VmState::stopped) pending.push_back(entry.vm);
+            if (!entry.managed && config::boolean(entry.vm->config(), "auto_up") && entry.vm->state() == VmState::stopped)
+                pending.push_back(entry.vm);
     }
     for (const auto& target : pending) {
         if (shutting_down_->load()) {
@@ -422,8 +551,12 @@ void VmService::auto_up() {
             return;
         }
         if (target->state() != VmState::stopped) continue;
-        if (!target->start())
-            context_.warn("Failed to auto-start VM " + config::string(target->config(), "name") + " [" + target->id() + "]");
+        try {
+            if (!target->start({}, {}, clear_logs_before_start()))
+                context_.warn("Failed to auto-start VM " + config::string(target->config(), "name") + " [" + target->id() + "]");
+        } catch (const std::exception& error) {
+            context_.warn("Failed to auto-start VM " + target->id() + ": " + error.what());
+        }
     }
 }
 Json::Value VmService::boot_scan(const CallContext& caller, const std::string& image) const {
@@ -433,16 +566,50 @@ Json::Value VmService::boot_scan(const CallContext& caller, const std::string& i
 void VmService::set_app_config(const CallContext& caller, Json::Value value) {
     access(caller);
     if (!value.isObject()) throw std::invalid_argument("config is not an object");
+    if (preferences_) {
+        const auto shared = preferences_->sync_legacy(caller, value)["values"];
+        for (const auto& key : shared.getMemberNames()) value[key] = shared[key];
+    }
+    if (acm_preferences_) {
+        const auto shared = acm_preferences_->sync_legacy(caller, value)["desired"];
+        value[vm::acm_enable_key] = shared["enabled"];
+        value[vm::acm_ports_key] = shared["ports"];
+    }
+    if (disk_defaults_) {
+        const auto shared = disk_defaults_->sync_legacy(caller, value)["values"];
+        value["vm_optimize_compression"] = shared["optimizeCompression"];
+        std::string csv;
+        for (const auto& cpu : shared["qemuImgCpus"]) {
+            if (!csv.empty()) csv += ',';
+            csv += std::to_string(cpu.asInt());
+        }
+        value["qemu_img_cpu_affinity"] = csv;
+    }
     {
         std::lock_guard lock(app_mutex_);
         app_config_ = value;
     }
     // The ACM pool is standing state driven by this config; failures only log.
-    if (context_.acm) context_.acm->apply_config(value);
+    if (context_.acm && !acm_preferences_) context_.acm->apply_config(value);
 }
 Json::Value VmService::app_config() const {
+    Json::Value result;
+    { std::lock_guard lock(app_mutex_); result = app_config_; }
+    if (preferences_) {
+        const auto shared = preferences_->values();
+        for (const auto& key : shared.getMemberNames()) result[key] = shared[key];
+    }
+    return result;
+}
+bool VmService::clear_logs_before_start(std::optional<bool> override) const {
+    if (preferences_) {
+        const auto shared = preferences_->values();
+        return override ? *override : shared["vm_clear_logs_before_start"].asBool();
+    }
+    if (override) return *override;
     std::lock_guard lock(app_mutex_);
-    return app_config_;
+    const auto& value = config::member(app_config_, "vm_clear_logs_before_start");
+    return value.isBool() && value.asBool();
 }
 void VmService::stop_all() {
     shutting_down_->store(true);
@@ -453,10 +620,38 @@ void VmService::stop_all() {
     }
     std::vector<std::shared_ptr<vm::VmRuntime>> targets;
     { std::lock_guard lock(mutex_); for (const auto& entry : entries_) targets.push_back(entry.vm); }
-    for (auto& target : targets) if (target->state() != VmState::stopped) target->stop();
-    for (auto& target : targets) target->shutdown();
-    // VMInstanceStore.stopAll ends with clear(); the store accepts no starts afterwards.
-    std::lock_guard lock(mutex_);
-    entries_.clear();
+    std::exception_ptr failure;
+    for (auto& target : targets) {
+        try { if (target->state() != VmState::stopped) target->stop(); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+    for (auto& target : targets) {
+        try { target->shutdown(); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+    std::vector<std::shared_ptr<const void>> released;
+    {
+        std::lock_guard lock(mutex_);
+        released.reserve(entries_.size());
+        for (auto at = entries_.begin(); at != entries_.end();) {
+            if (at->managed) {
+                auto edit = at->vm->try_edit();
+                if (!edit) {
+                    // Keep the owner, runtime and disk reservation together until
+                    // a later stop_all/remove can prove complete shutdown.
+                    if (!failure) failure = std::make_exception_ptr(
+                        ServiceError(ErrorCode::unavailable, "Managed VM cleanup is incomplete"));
+                    ++at;
+                    continue;
+                }
+                edit.retire();
+                released.push_back(at->reservation);
+            }
+            // Preserve legacy clear semantics for ordinary inventory entries.
+            at = entries_.erase(at);
+        }
+    }
+    released.clear();
+    if (failure) std::rethrow_exception(failure);
 }
 }

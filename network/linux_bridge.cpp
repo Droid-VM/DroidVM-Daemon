@@ -364,26 +364,42 @@ void LinuxBridge::live_details(Json::Value& data) const {
     };
     add_neighbors(bridge);
     for (const auto* vlan : vlans) if (vid_of(*vlan)) add_neighbors(device(vid_of(*vlan)));
-    auto& leases = data["dhcp_leases"] = Json::Value(Json::arrayValue);
+    try { data["dhcp_leases"] = dhcp_leases(); } catch (const std::exception&) { data["dhcp_leases"] = Json::Value(); }
+    if (!data["dhcp_leases"].isArray()) data["dhcp_leases"] = Json::Value(Json::arrayValue);
+    // appendInfo.
+    if (!pd_status.empty()) data["pd_status"] = std::move(pd_status);
+    if (!l3_ && !uplink_.empty()) data["resolved_uplink"] = uplink_;
+    if (!mac_security_.empty()) for (const auto& [tap, active] : mac_security_) data["mac_security_active"][tap] = active;
+}
+Json::Value LinuxBridge::dhcp_leases() const {
+    Json::Value leases(Json::arrayValue);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto vlans = l3_vlans(config_);
+    if (!running_ || !l3_ || !dhcp_needed_ || !dhcp_.healthy() || vlans.size() > 16) return {};
     if (dhcp_needed_ && dhcp_.healthy()) for (const auto* vlan : vlans) for (const bool v6 : {false, true}) {
+        const auto vid = static_cast<int>(config::integer(*vlan, "vlan_id"));
+        if (!config::boolean(config::member(config::member(*vlan, v6 ? "ipv6" : "ipv4"), "dhcp"), "enabled")) continue;
         try {
-            const auto response = dhcp_.leases(vid_of(*vlan), v6);
+            ControlOptions options;
+            options.timeout = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (options.timeout.count() <= 0) return {};
+            const auto response = dhcp_.leases(vid, v6, std::move(options));
             const auto& rows = config::member(response, "leases");
-            if (rows.isArray()) for (const auto& lease : rows) {
+            if (!rows.isArray()) return {};
+            for (const auto& lease : rows) {
                 if (!lease.isObject()) continue;
+                if (leases.size() >= 4096) return {};
                 Json::Value item;
+                item["vlan"] = vid;
                 item["expires"] = Json::Int64(rfc3339_seconds(config::string(lease, "expiry")));
                 item["mac"] = config::string(lease, "mac");
                 item["ip"] = config::string(lease, "ip");
                 item["hostname"] = config::string(lease, "hostname");
                 leases.append(std::move(item));
             }
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) { return {}; }
     }
-    // appendInfo.
-    if (!pd_status.empty()) data["pd_status"] = std::move(pd_status);
-    if (!l3_ && !uplink_.empty()) data["resolved_uplink"] = uplink_;
-    if (!mac_security_.empty()) for (const auto& [tap, active] : mac_security_) data["mac_security_active"][tap] = active;
+    return leases;
 }
 bool LinuxBridge::manual_address(const std::string& cidr, bool add) {
     if (!running_) return false;

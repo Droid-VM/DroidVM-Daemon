@@ -12,6 +12,7 @@ public:
     Json::Value available_interfaces(const CallContext& caller) const;
     Json::Value uplinks(const CallContext& caller) const;
     Json::Value addresses(const CallContext& caller) const;
+    network::HostNetworkSnapshot snapshot(const CallContext& caller) const;
 private:
     network::Netbox netbox_;
 };

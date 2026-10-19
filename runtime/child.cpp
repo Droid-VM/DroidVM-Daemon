@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "child.h"
+#include "common/pipe_write.h"
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
@@ -28,23 +29,6 @@ std::vector<char*> strings(const std::vector<std::string>& values) {
     }
     result.push_back(nullptr);
     return result;
-}
-ssize_t pipe_write(int fd, const char* bytes, size_t size) {
-    sigset_t block, previous, pending;
-    sigemptyset(&block); sigaddset(&block, SIGPIPE);
-    const int masked = pthread_sigmask(SIG_BLOCK, &block, &previous);
-    if (masked) { errno = masked; return -1; }
-    sigpending(&pending);
-    const bool existed = sigismember(&pending, SIGPIPE);
-    const auto count = write(fd, bytes, size);
-    const int error = errno;
-    if (count < 0 && error == EPIPE && !existed && !sigismember(&previous, SIGPIPE)) {
-        timespec zero{};
-        while (sigtimedwait(&block, nullptr, &zero) < 0 && errno == EINTR) {}
-    }
-    pthread_sigmask(SIG_SETMASK, &previous, nullptr);
-    errno = error;
-    return count;
 }
 }
 Child::Child(const ChildOptions& options) : group_(options.new_process_group) {

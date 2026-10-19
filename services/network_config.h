@@ -38,6 +38,12 @@ public:
     bool has_events() const { return events_ != nullptr; }
     Json::Value list(const CallContext& caller) const;
     Json::Value get(const CallContext& caller, const std::string& id) const;
+    struct Snapshot { Json::Value config; std::string revision; };
+    // Active rows and their global revision from the same immutable state.
+    Snapshot snapshot(const CallContext& caller) const;
+    // One immutable configuration observation. The conservative global version
+    // also changes when an unrelated network is edited or runtime IDs persist.
+    Snapshot get_with_revision(const CallContext& caller, const std::string& id) const;
     bool exists(const CallContext& caller, const std::string& id) const;
     std::string create(const CallContext& caller, Json::Value value);
     std::string update(const CallContext& caller, Json::Value value);
@@ -48,13 +54,14 @@ public:
     // Internal atomic import primitive. Each operation contains config and
     // expected (null for creation, exact observed object for replacement).
     // No deletes; preserve all unrelated/inactive entries and root extensions.
-    Json::Value merge_if_matches(const CallContext& caller, const Json::Value& operations);
+    Json::Value merge_if_matches(const CallContext& caller, const Json::Value& operations,
+        const std::string& expected_revision = {});
     bool remove(const CallContext& caller, const std::string& id); // false when unknown; conflict while reserved
     // Persist stable Linux MAC/DUID/PD table identities before returning a
     // runtime lease. occupied_tables excludes host tables from NEW allocation;
     // existing allocations still require backend ownership checks before use.
     std::unique_ptr<NetworkRuntimeLease> prepare_runtime(const CallContext& caller, const std::string& id,
-        const std::set<uint32_t>& occupied_tables = {});
+        const std::set<uint32_t>& occupied_tables = {}, const std::string& expected_revision = {});
     bool recovered() const;
     size_t inactive() const;
 private:
@@ -62,6 +69,7 @@ private:
     friend class NetworkService;
     struct State {
         Json::Value document;
+        std::string revision;
         std::map<std::string, Json::ArrayIndex> ids;
         size_t inactive = 0;
         bool recovered = false;

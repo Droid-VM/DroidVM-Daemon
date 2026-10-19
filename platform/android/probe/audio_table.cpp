@@ -47,10 +47,18 @@ bool AudioTable::start(int run_directory, Log log) {
     return true;
 }
 void AudioTable::stop() {
-    { std::lock_guard lock(mutex_); stopping_ = true; }
+    { std::lock_guard lock(mutex_); stopping_ = true; available_ = false; devices_.clear(); }
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
     if (directory_ >= 0) { close(directory_); directory_ = -1; }
+}
+Json::Value AudioTable::snapshot() const {
+    std::lock_guard lock(mutex_);
+    Json::Value result;
+    result["available"] = available_ && !stopping_ &&
+        std::chrono::steady_clock::now() - refreshed_ <= std::chrono::seconds(5);
+    result["devices"] = result["available"].asBool() ? devices_ : Json::Value(Json::arrayValue);
+    return result;
 }
 void AudioTable::run() {
     ServiceManager manager;
@@ -83,6 +91,9 @@ void AudioTable::run() {
         previous_generation = generation;
         previous_available = available;
         std::unique_lock lock(mutex_);
+        available_ = available && !pending && !stopping_;
+        devices_ = available_ ? snapshot["devices"] : Json::Value(Json::arrayValue);
+        refreshed_ = std::chrono::steady_clock::now();
         if (wake_.wait_for(lock, std::chrono::milliseconds(250), [&] { return stopping_; })) return;
     }
 }

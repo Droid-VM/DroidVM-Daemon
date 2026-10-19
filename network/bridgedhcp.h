@@ -20,7 +20,7 @@ public:
     void stop(); // temporary resources only; lease state survives normal stop
     bool healthy() const { return ready_ && process_.status().running; }
     Json::Value status() const;
-    Json::Value leases(int vlan, bool ipv6) const;
+    Json::Value leases(int vlan, bool ipv6, ControlOptions options = {}) const;
     // Single mailbox consumer; force=true provides the watcher's periodic
     // status backstop even if no stdout event arrived. Do not mix with raw
     // take_output consumption. Logs remain available through tool_log().
@@ -49,6 +49,6 @@ private:
     bool ready_ = false;
     std::string endpoint(int vlan) const;
     Json::Value request(HttpMethod method, const std::string& path,
-                        std::optional<std::string_view> body = {}) const;
+                        std::optional<std::string_view> body = {}, ControlOptions options = {}) const;
 };
 }

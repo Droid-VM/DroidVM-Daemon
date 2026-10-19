@@ -1,0 +1,3 @@
+# Embedded in C++ and packaged as Java resources; both consumers need LF bytes.
+agent/scripts/droidvm-agent/*.sh text eol=lf
+tests/agent_finalize_contract.sh text eol=lf

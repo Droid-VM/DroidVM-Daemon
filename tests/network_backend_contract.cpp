@@ -229,6 +229,11 @@ void uplink_snapshot_policy() {
     write_property("eth1/operstate", "down");
     const auto ethernet = UplinkSnapshot::scan(root).resolve("Ethernet");
     check(ethernet == "eth0" || ethernet == "eth1", "unplugged physical ethernet remains fallback");
+    write_property("eth1/uevent", "INTERFACE=eth1\nDEVTYPE=wwan");
+    bool cellular = false;
+    const auto classified = UplinkSnapshot::scan(root);
+    for (const auto& iface : classified.interfaces()) if (iface.name == "eth1") cellular = iface.cellular;
+    check(cellular, "cellular metadata is retained even with Ethernet-like link properties");
     error(ErrorCode::io_error, [&] { UplinkSnapshot::scan(root + "/absent"); });
     for (const auto& file : files) unlink((root + "/" + file).c_str());
     for (auto at = directories.rbegin(); at != directories.rend(); ++at) check(rmdir((root + "/" + *at).c_str()) == 0, "remove fixture interface directory");

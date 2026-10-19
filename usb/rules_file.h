@@ -15,15 +15,17 @@ public:
     static constexpr const char* name = "usb_rules.json";
     using Log = std::function<void(const char* level, const std::string& message)>;
     // [directory] is the app files directory; empty disables persistence.
-    RulesFile(std::string directory, Log log);
+    RulesFile(std::string directory, Log log, config::JsonFile::Observer observer = {});
     std::string path() const { return directory_ + "/" + name; }
     // The saved rules, or none when absent or unreadable (the file is kept).
-    Rules load();
-    // Throws on failure; the caller only logs it.
-    void save(const Rules& rules);
+    Rules load(bool* persisted = nullptr);
+    // False means persistence was disabled. Exceptions preserve JsonFile's
+    // installed flag so the caller can distinguish an uncertain disk commit.
+    bool save(const Rules& rules);
 private:
     std::string directory_;
     Log log_;
+    config::JsonFile::Observer observer_;
     std::unique_ptr<config::JsonFile> file_;
     config::JsonFile& file();
 };

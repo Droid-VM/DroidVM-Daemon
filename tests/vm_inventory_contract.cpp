@@ -4,6 +4,7 @@
 #include "common/identity.h"
 #include "services/vm.h"
 #include "services/configuration.h"
+#include "services/configuration_backup.h"
 #include "store/network_config.h"
 #include "store/vm_ownership.h"
 #include "transport/dispatcher.h"
@@ -21,6 +22,39 @@
 using namespace droidvm;
 using namespace droidvm::test;
 namespace {
+void vnc_launch_metadata() {
+    Json::Value config;
+    config["id"] = random_id(true); config["name"] = "vnc-contract";
+    config["gpu_backend"] = "GPU_2D";
+    for (const auto* id : {"gpu-0", "simplefb"}) {
+        auto& screen = config["screens"][id];
+        screen["enabled"] = true; screen["exporter"] = "VNC";
+        screen["input_enabled"] = false;
+        screen["vnc"]["host"] = "127.0.0.1";
+        screen["vnc"]["port"] = 1234;
+        screen["vnc"]["password"] = "secret";
+    }
+    vm::HostFacts host; host.has_kvm = true;
+    auto qemu = vm::qemu_command(config, {}, {}, host);
+    check(qemu.vnc_endpoints.size() == 1 && qemu.vnc_endpoints[0].screen == "gpu-0" &&
+        qemu.vnc_endpoints[0].port == 5900 && qemu.vnc_endpoints[0].unavailable_reason == "input-disabled",
+        "QEMU records its single actual listener and refuses unenforced view-only");
+    auto crosvm = vm::crosvm_command(config, {}, {}, host);
+    check(crosvm.vnc_endpoints.size() == 2 && crosvm.vnc_endpoints[0].port == 1234 &&
+        !crosvm.vnc_endpoints[0].input_enabled && crosvm.vnc_endpoints[0].unavailable_reason.empty(),
+        "crosvm records per-screen ports and its enforced view-only mode");
+    config["screens"]["gpu-0"]["input_enabled"] = true;
+    config["extra_options"] = Json::Value(Json::arrayValue);
+    config["extra_options"].append("-cpu"); config["extra_options"].append("max");
+    qemu = vm::qemu_command(config, {}, {}, host);
+    check(qemu.vnc_endpoints[0].unavailable_reason.empty(), "unrelated CPU options preserve VNC availability");
+    config["extra_options"][0] = "-vnc"; config["extra_options"][1] = "127.0.0.1:17";
+    qemu = vm::qemu_command(config, {}, {}, host);
+    check(qemu.vnc_endpoints[0].unavailable_reason == "unsupported", "custom QEMU listeners invalidate generated metadata");
+    config["extra_options"][0] = "--cfg"; config["extra_options"][1] = "/custom/config.json";
+    crosvm = vm::crosvm_command(config, {}, {}, host);
+    check(crosvm.vnc_endpoints[0].unavailable_reason == "unsupported", "external crosvm config invalidates generated metadata");
+}
 void crosvm_disk_capability_process() {
     const auto directory = std::filesystem::temp_directory_path() / ("crosvm-probe-" + random_id(true));
     std::filesystem::create_directory(directory);
@@ -573,6 +607,118 @@ VmDiskInput seed_vm_disk(Coordinated& c) {
     disks["disks"].append(registered_disk()); disks["root_extension"] = Json::Int64(9007199254740993LL);
     return {c.service.replace_vm_disks(admin, vm->revision, disk->revision, vms, disks),
         row["id"].asString(), unrelated["id"].asString()};
+}
+void configuration_backup_staging() {
+    Fixture fixture; Coordinated c(fixture, {}, true); const auto seeded = seed_vm_disk(c);
+    ConfigurationBackup backup(c.service);
+    auto now = ConfigUploads::Clock::now();
+    ConfigUploads uploads(&c.service.vms(), &c.service.networks(), [&] { return now; }, {}, c.service.disks());
+    uploads.bind_backup([&](const CallContext& caller, std::string_view bytes) { return backup.preview(caller, bytes); },
+        [&](const CallContext& caller, std::string_view bytes, const Json::Value& preview) { return backup.commit(caller, bytes, preview); });
+    auto exported = backup.export_file(admin);
+    const auto document = config::parse_json(*exported);
+    check(document["version"].asInt() == 1 && document["vms"].size() == 2 && document["disks"].size() == 1 &&
+        document["revisions"]["vms"] == seeded.baseline.vms->revision &&
+        document["vms"][0]["disks"][0]["extension"].asInt64() == 9007199254740993LL,
+        "backup export preserves complete rows and one coherent revision set");
+    auto held = exported; exported.reset();
+    error(ErrorCode::resource_exhausted, [&] { backup.export_file(admin); });
+    held.reset(); exported = backup.export_file(admin); exported.reset();
+    Json::Value input; input["version"] = 1; input["vms"] = Json::Value(Json::arrayValue);
+    auto row = seeded.baseline.vms->document["vms"][1]; row["name"] = "backup replacement";
+    row["backup_extension"] = Json::Int64(9007199254740993LL); input["vms"].append(row);
+    input["disks"] = Json::Value(Json::arrayValue);
+    const auto bytes = config::encode_json(input);
+    error(ErrorCode::invalid_argument, [&] { uploads.begin_backup(admin, ConfigUploads::max_backup_bytes + 1); });
+    const auto quota = uploads.begin_backup(admin, ConfigUploads::max_backup_bytes);
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin(admin, seeded.baseline.vms->revision, 2u << 20); });
+    uploads.abort_backup(admin, quota);
+    auto stage = [&] {
+        const auto id = uploads.begin_backup(admin, bytes.size());
+        for (size_t offset = 0; offset < bytes.size(); offset += ConfigUploads::chunk_bytes)
+            uploads.append_backup(admin, id, offset, std::string_view(bytes).substr(offset, ConfigUploads::chunk_bytes));
+        return id;
+    };
+    const auto id = stage();
+    auto stranger = admin; stranger.principal = "backup stranger";
+    error(ErrorCode::permission_denied, [&] { uploads.preview_backup(stranger, id); });
+    error(ErrorCode::not_found, [&] { uploads.append(admin, id, 0, "x"); });
+    const auto preview = uploads.preview_backup(admin, id);
+    check(preview["categories"]["vms"]["replaced"].asUInt() == 1 &&
+        preview["categories"]["disks"]["present"].asBool() && !preview["categories"]["networks"]["present"].asBool(),
+        "preview distinguishes absent and empty categories and counts same-ID replacements");
+    check(uploads.preview_backup(admin, id) == preview, "repeat preview retains one confirmation token");
+    error(ErrorCode::conflict, [&] { uploads.append_backup(admin, id, 0, "{"); });
+    error(ErrorCode::conflict, [&] { uploads.commit_backup(admin, id, "wrong-token"); });
+    const auto receipt = uploads.commit_backup(admin, id, preview["previewToken"].asString());
+    check(!receipt.isMember("failedStage") && receipt["completed"].size() == 2, "confirmed backup commits present categories");
+    const auto current = c.service.snapshot(admin);
+    check(current.vms->document["root_extension"] == "keep" && current.vms->document["vms"][0] == seeded.baseline.vms->document["vms"][0]
+        && current.vms->document["vms"][1]["backup_extension"].asInt64() == 9007199254740993LL
+        && current.disks->document == seeded.baseline.disks->document, "merge preserves roots, untouched rows, extensions and empty-array contents");
+    error(ErrorCode::not_found, [&] { uploads.commit_backup(admin, id, preview["previewToken"].asString()); });
+    const auto stale = stage(); const auto proof = uploads.preview_backup(admin, stale);
+    auto changed = current.vms->document; changed["another_writer"] = true;
+    c.service.vms().replace(admin, current.vms->revision, changed);
+    const auto rejected = uploads.commit_backup(admin, stale, proof["previewToken"].asString());
+    check(rejected["failedStage"] == "validation" && rejected["completed"].empty(), "stale confirmation cannot write any category");
+    const auto expired = stage(); uploads.preview_backup(admin, expired); now += ConfigUploads::lifetime;
+    error(ErrorCode::not_found, [&] { uploads.preview_backup(admin, expired); });
+    auto invalid = input; invalid["version"] = 2;
+    error(ErrorCode::invalid_argument, [&] { backup.preview(admin, config::encode_json(invalid)); });
+    invalid = input; invalid["networks"] = Json::Value(Json::objectValue);
+    error(ErrorCode::invalid_argument, [&] { backup.preview(admin, config::encode_json(invalid)); });
+    invalid = input; invalid["vms"].append(row);
+    error(ErrorCode::conflict, [&] { backup.preview(admin, config::encode_json(invalid)); });
+}
+void configuration_backup_partial_and_uncertain() {
+    Fixture fixture; bool fail = false;
+    Coordinated c(fixture, [&](const char* point, size_t) {
+        if (fail && std::string_view(point) == "participant_synced") throw std::runtime_error("backup journal fault");
+    }, true);
+    ConfigurationBackup backup(c.service);
+    Json::Value network = config("backup network"); network["schema"] = 2; network["bridge_name"] = "backup0";
+    Json::Value input; input["version"] = 1; input["networks"].append(network);
+    auto vm = config("backup missing network"); Json::Value nic; nic["network_id"] = random_id(true); vm["networks"].append(nic);
+    input["vms"].append(vm);
+    auto bytes = config::encode_json(input); auto preview = backup.preview(admin, bytes);
+    const auto partial = backup.commit(admin, bytes, preview);
+    check(partial["completed"].size() == 1 && partial["completed"][0] == "networks" && partial["failedStage"] == "vm_disks"
+        && !partial["recoveryRequired"].asBool() && !partial.isMember("uncertainStage")
+        && c.service.networks().exists(admin, network["id"].asString()) && c.service.vms().snapshot(admin)->document["vms"].empty(),
+        "later VM validation failure reports already-committed networks without claiming atomic rollback");
+    input.removeMember("networks"); input["vms"][0]["networks"].clear();
+    bytes = config::encode_json(input); preview = backup.preview(admin, bytes); fail = true;
+    const auto uncertain = backup.commit(admin, bytes, preview);
+    check(uncertain["completed"].empty() && uncertain["failedStage"] == "vm_disks" && uncertain["uncertainStage"] == "vm_disks"
+        && uncertain["recoveryRequired"].asBool(), "journal uncertainty never claims completed VM/disk categories");
+    fail = false; c.service.recover(admin);
+    check(c.service.vms().snapshot(admin)->document["vms"].size() == 1, "normal coordinator redo recovers backup joint commit");
+    Json::Value future; future["version"] = 1; network["schema"] = 99; future["networks"].append(network);
+    error(ErrorCode::invalid_argument, [&] { backup.preview(admin, config::encode_json(future)); });
+}
+void coordinated_disk_reference_reservation() {
+    Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
+    const auto disk_id = input.baseline.disks->document["disks"][0]["id"].asString();
+    error(ErrorCode::conflict, [&] { c.service.reserve_disks(input.baseline.disks->revision, {disk_id}, {}, "stale"); });
+    auto reservation = c.service.reserve_disks(input.baseline.disks->revision, {disk_id}, {}, input.baseline.vms->revision);
+    auto changed = input.baseline.vms->document;
+    changed["vms"][0]["disks"][0]["readonly"] = true;
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, input.baseline.vms->revision, changed); });
+    error(ErrorCode::conflict, [&] { c.service.replace_vm_disks(admin, input.baseline.vms->revision,
+        input.baseline.disks->revision, changed, input.baseline.disks->document); });
+    changed = input.baseline.vms->document;
+    changed["vms"][1]["name"] = "unrelated edit remains allowed";
+    const auto unrelated = c.service.vms().replace(admin, input.baseline.vms->revision, changed);
+    changed["vms"][0]["disks"].clear();
+    const auto committed = c.service.replace_vm_disks(admin, unrelated->revision,
+        input.baseline.disks->revision, changed, input.baseline.disks->document, reservation);
+    check(committed.vms->document["vms"][0]["disks"].empty(), "reservation owner may detach confirmed slots");
+    changed["vms"][0]["disks"] = input.baseline.vms->document["vms"][0]["disks"];
+    error(ErrorCode::conflict, [&] { c.service.vms().replace(admin, committed.vms->revision, changed); });
+    reservation.reset();
+    check(c.service.vms().replace(admin, committed.vms->revision, changed)->document == changed,
+        "released reference reservation permits edits again");
 }
 void coordinated_vm_disk_commit() {
     Fixture fixture; Coordinated c(fixture, {}, true); auto input = seed_vm_disk(c);
@@ -1391,6 +1537,7 @@ void session_overrides_worker_abort() {
     const auto baseline = target->config();
     Json::Value overrides; overrides["pseudo_unprotected"] = true;
     target->log("stdio")->append("previous run\n");
+    const auto before = target->observation();
     check(target->start({}, overrides, true), "session reaches asynchronous worker");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (target->state() != vm::State::stopped && std::chrono::steady_clock::now() < deadline)
@@ -1399,6 +1546,45 @@ void session_overrides_worker_abort() {
     check(target->config() == baseline, "STOPPED publication restores complete baseline after worker abort");
     check(target->log("stdio")->contents().find("previous run") == std::string::npos, "admitted start clears previous run logs");
     check(bool(target->try_edit()), "completed session releases lifecycle admission");
+    check(target->observation().instance == before.instance && target->observation().revision > before.revision,
+        "STOPPED to STARTING to STOPPED preserves incarnation but invalidates observation");
+    const auto admitted = admissions.load();
+    error(ErrorCode::conflict, [&] { target->start({}, {}, false, before); });
+    check(admissions == admitted, "state ABA cannot start from an old observation");
+}
+void guarded_lifecycle_observations() {
+    Fixture fixture;
+    const auto value = config("guarded");
+    auto target = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
+    const auto before = target->observation();
+    auto row = target->snapshot();
+    check(row["state"] == "STOPPED" && row["runtime_instance"] == before.instance && row["runtime_revision"] == "0",
+        "state and observation belong to one runtime snapshot");
+    check(!target->start({}, {}, false, before) && fixture.starts == 1, "matching observation reaches existing admission");
+    error(ErrorCode::conflict, [&] { target->start({}, {}, false, before); });
+    error(ErrorCode::conflict, [&] { target->stop(before); });
+    error(ErrorCode::conflict, [&] { target->reboot(before); });
+    error(ErrorCode::conflict, [&] { target->suspend(before); });
+    error(ErrorCode::conflict, [&] { target->resume(before); });
+    check(fixture.starts == 1, "stale guarded calls have no admission side effects");
+    const auto fresh = target->observation();
+    check(!target->stop(fresh) && target->observation() == fresh, "a forbidden state does not claim an operation");
+    auto contender = [&] {
+        try { target->start({}, {}, false, fresh); return false; }
+        catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict, "same observation loses admission"); return true; }
+    };
+    auto first = std::async(std::launch::async, contender), second = std::async(std::launch::async, contender);
+    const bool a = first.get(), b = second.get();
+    check(a != b && fixture.starts == 2, "same observation permits only one concurrent start attempt");
+    const auto old = target->observation();
+    check(!target->start() && fixture.starts == 3, "legacy admission remains available");
+    error(ErrorCode::conflict, [&] { target->start({}, {}, false, old); });
+    { auto lease = target->try_edit(); check(bool(lease), "stopped runtime edit admitted"); lease.retire(); }
+    check(target->snapshot()["runtime_actions"].empty(), "retired runtime exposes no lifecycle actions");
+    auto replacement = std::make_shared<vm::VmRuntime>(value["id"].asString(), value, fixture.context);
+    error(ErrorCode::conflict, [&] { replacement->start({}, {}, false, target->observation()); });
+    check(replacement->id() == target->id() && replacement->observation().instance != target->observation().instance,
+        "same VM ID does not identify the replacement runtime");
 }
 void lease_abort_and_lifetime() {
     Fixture fixture;
@@ -1756,7 +1942,9 @@ void revisioned_batch_adapter() {
 int main() {
     if (std::getenv("DROIDVM_TEST_CROSVM"))
         return run({{"crosvm_disk_capability_process", crosvm_disk_capability_process}});
-    return run({{"crosvm_disk_capabilities", crosvm_disk_capabilities},
+    return run({{"guarded_lifecycle_observations", guarded_lifecycle_observations},
+        {"crosvm_disk_capabilities", crosvm_disk_capabilities},
+        {"vnc_launch_metadata", vnc_launch_metadata},
         {"crosvm_disk_capability_process", crosvm_disk_capability_process},
         {"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
         {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},
@@ -1776,12 +1964,15 @@ int main() {
         {"coordinated_vm_disk_restart", coordinated_vm_disk_restart},
         {"coordinated_vm_disk_readonly", coordinated_vm_disk_readonly},
         {"coordinated_vm_disk_uploads", coordinated_vm_disk_uploads},
+        {"configuration_backup_staging", configuration_backup_staging},
+        {"configuration_backup_partial_uncertain", configuration_backup_partial_and_uncertain},
         {"coordinated_vm_disk_adapter", coordinated_vm_disk_adapter},
         {"coordinated_historical_disk_references", coordinated_historical_disk_references},
         {"coordinated_disk_start_guard", coordinated_disk_start_guard},
         {"runtime_disk_lease_admission", runtime_disk_lease_admission},
         {"sixteen_coordinated_disk_reference_races", coordinated_disk_reference_races},
         {"coordinated_disk_redo_before_load", coordinated_disk_redo_before_load},
+        {"coordinated_disk_reference_reservation", coordinated_disk_reference_reservation},
         {"coordinated_vm_network_references", coordinated_vm_network_references},
         {"coordinated_historical_network_references", coordinated_historical_network_references},
         {"sixteen_coordinated_reference_delete_races", coordinated_reference_delete_races},

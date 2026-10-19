@@ -10,20 +10,9 @@ namespace droidvm {
 namespace {
 constexpr size_t document_chunk_bytes = 48u << 10;
 std::string document_chunk(const std::string& document, size_t offset) {
-    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const auto count = std::min(document_chunk_bytes, document.size() - offset);
-    std::string encoded;
-    encoded.reserve((count + 2) / 3 * 4);
-    for (size_t i = 0; i < count; i += 3) {
-        uint32_t value = static_cast<unsigned char>(document[offset + i]) << 16;
-        if (i + 1 < count) value |= static_cast<unsigned char>(document[offset + i + 1]) << 8;
-        if (i + 2 < count) value |= static_cast<unsigned char>(document[offset + i + 2]);
-        encoded += alphabet[(value >> 18) & 63]; encoded += alphabet[(value >> 12) & 63];
-        encoded += i + 1 < count ? alphabet[(value >> 6) & 63] : '=';
-        encoded += i + 2 < count ? alphabet[value & 63] : '=';
-    }
     Json::Value row;
-    row["type"] = "chunk"; row["offset"] = Json::UInt64(offset); row["data"] = std::move(encoded);
+    row["type"] = "chunk"; row["offset"] = Json::UInt64(offset); row["data"] = wire::encode_base64(std::string_view(document).substr(offset, count));
     return wire::stringify(row);
 }
 void validate_scope(const EventScope& scope) {

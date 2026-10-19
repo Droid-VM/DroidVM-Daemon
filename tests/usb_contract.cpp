@@ -11,6 +11,7 @@
 #include "usb/rules.h"
 #include "usb/rules_file.h"
 #include "usb/service.h"
+#include "services/context.h"
 #include <sys/stat.h>
 #include <unistd.h>
 #include <atomic>
@@ -265,11 +266,12 @@ struct Rig {
     };
     Watch* watch = nullptr;
     std::unique_ptr<UsbService> service;
-    void make(bool with_files = true) {
+    void make(bool with_files = true, config::JsonFile::Observer observer = {}) {
         UsbOptions options;
         options.sys_root = tree.sys();
         options.dev_root = tree.dev();
         if (with_files) options.files_dir = tree.files.string();
+        options.rules_observer = std::move(observer);
         options.vms = &vms;
         options.control = &control;
         auto owned = std::make_unique<Watch>();
@@ -626,6 +628,155 @@ void set_target_flow() {
     check(res["previous"]["vm_id"] == vm_b && res["state"] == "hostuse" && rig.host_row("1-1.1")["lock"] == true, "back to the host, locked");
     rig.settle();
 }
+void checked_target() {
+    Rig rig;
+    rig.tree.add("1-1.1", keyboard(), true);
+    rig.make();
+    auto& s = *rig.service;
+    const auto params = parse(R"({"device":"1-1.1","target":"sink"})");
+    expect(request_error([&] { s.set_target_checked(params, [](const Json::Value&) {}); }), "USB manager unavailable");
+    s.start();
+    rig.settle();
+    rig.kernel->clear();
+    const auto observed = s.host_catalog();
+    check(observed["available"].asBool() && observed["devices"].size() == 1, "checked catalogue ready");
+    write_file(rig.tree.dir("1-1.1") / "devnum", "99\n");
+    expect(request_error([&] {
+        s.set_target_checked(params, [&](const Json::Value& current) {
+            if (current != observed) throw RequestError("stale USB observation");
+        });
+    }), "stale USB observation");
+    check(rig.kernel->writes.empty() && rig.control.calls.empty(), "stale observation made no writes");
+    const auto fresh = s.host_catalog();
+    const auto result = s.set_target_checked(params, [&](const Json::Value& current) {
+        check(current == fresh, "validator receives fresh catalogue");
+    });
+    check(result["state"] == "idle" && s.host_catalog()["devices"][0]["lock"] == true, "checked target applied");
+    s.shutdown();
+    expect(request_error([&] { s.set_target_checked(params, [](const Json::Value&) {}); }), "USB manager stopped");
+}
+void checked_rules() {
+    Rig rig;
+    rig.vms.add(vm_a, "stopped", VmState::stopped, {"xhci-0", "xhci-1"});
+    rig.vms.add(vm_b, "no-controller", VmState::running, {});
+    rig.make();
+    auto& service = *rig.service;
+    check(!service.rules_snapshot()["available"].asBool(), "rules unavailable before start");
+    service.start(); rig.settle();
+    const auto targets = service.rule_targets();
+    check(targets.size() == 2 && targets[0]["controllerId"] == "xhci-0" && targets[1]["controllerId"].isNull(), "rule targets include stopped VMs and report first controller only");
+    const auto first = service.rules_snapshot();
+    check(first["available"].asBool() && first["persistence"] == "unpersisted", "default rules not saved");
+    const auto off = parse(R"({"version":1,"enabled":false})");
+    Json::Value params; params["rules"] = off;
+    service.usb_rules_set(params);
+    const auto legacy = service.rules_snapshot();
+    check(legacy["revision"] != first["revision"] && legacy["persistence"] == "persisted", "App save advances shared version");
+    rig.kernel->clear();
+    try {
+        service.set_rules_checked(off, first["revision"].asString());
+        check(false, "old App baseline accepted");
+    } catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict, "old baseline conflicts"); }
+    check(rig.kernel->writes.empty() && service.rules_snapshot() == legacy, "conflict has no runtime side effects");
+    const auto saved = service.set_rules_checked(off, legacy["revision"].asString());
+    check(saved["revision"] != legacy["revision"] && saved["persistence"] == "persisted", "conditional save advances even identical rules");
+    const auto revision = saved["revision"].asString();
+    try {
+        service.set_rules_checked(parse(R"({"bogus":[]})"), revision);
+        check(false, "invalid rules accepted");
+    } catch (const ServiceError& error) { check(error.code() == ErrorCode::invalid_argument, "invalid rules refused"); }
+    check(service.rules_snapshot()["revision"] == revision, "validation failure preserves version");
+    service.shutdown();
+    check(!service.rules_snapshot()["available"].asBool(), "rules unavailable after stop");
+    try {
+        service.set_rules_checked(off, revision);
+        check(false, "rules accepted after stop");
+    } catch (const ServiceError& error) { check(error.code() == ErrorCode::unavailable, "stopped rules unavailable"); }
+    Rig temporary;
+    temporary.make(false); temporary.service->start(); temporary.settle();
+    const auto before = temporary.service->rules_snapshot();
+    try {
+        temporary.service->set_rules_checked(off, before["revision"].asString());
+        check(false, "disabled persistence accepted");
+    } catch (const ServiceError& error) { check(error.code() == ErrorCode::unavailable, "disabled persistence refused"); }
+    check(temporary.service->rules_snapshot() == before, "disabled persistence leaves active rules unchanged");
+}
+void readonly_rules_preview() {
+    Rig rig;
+    write_file(rig.tree.files / "usb_rules.json", R"({"enabled":false})");
+    rig.make();
+    auto& service = *rig.service;
+    try { service.rules_preview("before-start"); check(false, "preview before start"); }
+    catch (const ServiceError& error) { check(error.code() == ErrorCode::unavailable, "preview requires started service"); }
+    service.start(); rig.settle();
+    // Publish devices after startup without delivering a uevent. Only a fresh
+    // read can see these; there is no automatic pass to confuse write counts.
+    rig.tree.add("1-1.1", keyboard(), true);
+    rig.tree.add("1-1.2", stick(), true);
+    rig.vms.add(vm_a, "preview", VmState::running, {"xhci-0"});
+    const auto off = service.rules_snapshot();
+    auto preview = service.rules_preview(off["revision"].asString());
+    check(!preview["enabled"].asBool() && preview["devices"].size() == 2, "disabled preview has fresh devices");
+    check(preview["devices"][0]["result"].isNull() && !preview["devices"][0]["eligible"].asBool(), "disabled preview has no decision");
+    const auto rules = parse(R"({"enabled":true,"exact":[
+        {"id":"046d:c31c:KB01","port":"1.1","target":"vm","vm":"missing"},
+        {"id":"046d:c31c:KB01","port":"1.1","target":"vm","vm":"11111111-1111-1111-1111-111111111111","controller":"xhci-0"}
+    ],"any":[{"target":"sink"}]})");
+    write_file(rig.tree.files / "usb_rules.json", wire::stringify(rules));
+    service.load_rules(); // Test-only load hook, no rule application.
+    const auto before = service.rules_snapshot();
+    const auto disk = read_file(rig.tree.files / "usb_rules.json");
+    rig.kernel->clear();
+    const auto calls = rig.control.calls.size();
+    preview = service.rules_preview(before["revision"].asString());
+    check(preview["devices"][0]["result"]["layer"] == "exact" && preview["devices"][0]["result"]["index"] == 1, "real engine skips missing VM and matches exact rule");
+    check(preview["devices"][0]["result"]["vm"] == vm_a && preview["devices"][0]["eligible"] == true, "running VM is eligible");
+    check(preview["devices"][1]["result"]["target"] == "sink", "real engine matches fallback");
+    check(service.rules_preview(before["revision"].asString()) == preview, "repeated observation preserves flags");
+    check(rig.kernel->writes.empty() && rig.control.calls.size() == calls && service.rules_snapshot() == before && read_file(rig.tree.files / "usb_rules.json") == disk, "preview has no driver/control/rule/file writes");
+    try { service.rules_preview(off["revision"].asString()); check(false, "stale preview accepted"); }
+    catch (const ServiceError& error) { check(error.code() == ErrorCode::conflict, "old preview version conflicts"); }
+    rig.vms.set_state(vm_a, VmState::stopped);
+    preview = service.rules_preview(before["revision"].asString());
+    check(preview["devices"][0]["result"]["target"] == "sink", "fresh VM states participate in preview");
+    service.usb_set_target(parse(R"({"device":"1-1.1","target":"sink"})"));
+    rig.settle(); rig.kernel->clear();
+    preview = service.rules_preview(before["revision"].asString());
+    check(preview["devices"][0]["lock"] == true && preview["devices"][0]["eligible"] == false && !preview["devices"][0]["result"].isNull(), "locked devices still report matches separately from eligibility");
+    check(rig.kernel->writes.empty(), "locked preview does not recover drivers");
+    service.shutdown();
+    try { service.rules_preview(before["revision"].asString()); check(false, "preview after stop"); }
+    catch (const ServiceError& error) { check(error.code() == ErrorCode::unavailable, "stopped preview unavailable"); }
+}
+void rules_persistence_state() {
+    for (const auto* boundary : {"before_install", "installed"}) {
+        std::string fault;
+        Rig rig;
+        rig.make(true, [&](const char* stage) {
+            if (fault == stage) throw std::runtime_error("injected rules persistence failure");
+        });
+        auto& service = *rig.service;
+        service.start(); rig.settle();
+        const auto initial = service.set_rules_checked(parse(R"({"enabled":false})"), service.rules_snapshot()["revision"].asString());
+        fault = boundary;
+        try {
+            service.set_rules_checked(parse(R"({"enabled":true})"), initial["revision"].asString());
+            check(false, "failed persistence reported success");
+        } catch (const ServiceError& error) { check(error.code() == ErrorCode::commit_uncertain, "active but unsaved rules require readback"); }
+        const auto current = service.rules_snapshot();
+        check(current["rules"]["enabled"].asBool() && current["revision"] != initial["revision"], "failed write still has new active rules and revision");
+        const bool installed = fault == "installed";
+        check(current["persistence"] == (installed ? "uncertain" : "unpersisted"), "disk failure boundary reported accurately");
+        check(parse(read_file(rig.tree.files / RulesFile::name))["enabled"].asBool() == installed, "disk contents reflect installation boundary");
+        fault.clear();
+        const auto repaired = service.set_rules_checked(current["rules"], current["revision"].asString());
+        check(repaired["persistence"] == "persisted", "explicit fresh save repairs persistence");
+        fault = "before_install";
+        Json::Value params; params["rules"] = parse(R"({"enabled":false})");
+        service.usb_rules_set(params);
+        check(service.rules_snapshot()["persistence"] == "unpersisted" && !service.rules_snapshot()["rules"]["enabled"].asBool(), "legacy save remains active but snapshot reports failed persistence");
+    }
+}
 void rules_passes_and_hooks() {
     Rig rig;
     rig.make();
@@ -768,6 +919,10 @@ int main(int argc, char** argv) {
                       {"handler_messages", handler_messages},
                       {"attach_detach_flow", attach_detach_flow},
                       {"set_target_flow", set_target_flow},
+                      {"checked_target", checked_target},
+                      {"checked_rules", checked_rules},
+                      {"readonly_rules_preview", readonly_rules_preview},
+                      {"rules_persistence_state", rules_persistence_state},
                       {"rules_passes_and_hooks", rules_passes_and_hooks},
                       {"uevent_plug_and_unplug", uevent_plug_and_unplug},
                       {"leftovers_recovery", leftovers_recovery},

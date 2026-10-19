@@ -1,0 +1,4 @@
+// Generated from the App's shared creation data; do not edit.
+#pragma once
+inline constexpr auto vm_defaults_json = R"DVM_JSON(@DROIDVM_vm_defaults_JSON@)DVM_JSON";
+inline constexpr auto gunyah_json = R"DVM_JSON(@DROIDVM_gunyah_JSON@)DVM_JSON";

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "network_config.h"
+#include "network_state.h"
 #include "network/backend.h"
 #include "network/forwarding.h"
 #include <chrono>
@@ -9,8 +10,6 @@
 
 namespace droidvm {
 class TaskService;
-enum class NetworkState { stopped, starting, running, recovering, stopping, failed };
-const char* network_state_name(NetworkState state);
 struct NetworkView {
     std::string id;
     NetworkState state = NetworkState::stopped;
@@ -32,6 +31,11 @@ public:
     NetworkView get(const CallContext& caller, const std::string& id);
     NetworkView start(const CallContext& caller, const std::string& id);
     NetworkView stop(const CallContext& caller, const std::string& id);
+    // Browser confirmation is checked under the same operation lock as the
+    // effect. Start additionally compares configuration under its writer lock
+    // before acquiring the runtime lease; stop uses that writer lock directly.
+    NetworkView change_if_matches(const CallContext& caller, const std::string& id, bool start,
+        uint64_t generation, NetworkState expected_state, const std::string& configuration_revision);
     // Owner schedules bounded worker ticks; no hidden unbounded watchdog thread.
     // Healthy backends refresh every five seconds. Refresh failures retain the
     // config lease and retry; unhealthy backends recover with the same backoff.
@@ -47,6 +51,9 @@ public:
     Json::Value forward_failures(const CallContext& caller, const std::string& id);
     // InfoHandler's RUNNING-only lists and appendInfo; empty when busy or not running.
     Json::Value live(const CallContext& caller, const std::string& id);
+    // Cached actual DHCP leases, at most 15s old; no backend I/O or operation wait.
+    // Null is unknown. Private/static reservations are never synthesized here.
+    Json::Value observed_leases(const CallContext& caller, const std::string& id);
     bool pd_action(const CallContext& caller, const std::string& id, int vlan, bool release);
     bool manual(const CallContext& caller, const std::string& id, bool address, const std::string& value, bool add);
     // NetworkInstance.findRunningVMUsing: a running VM's name blocks a user stop.
@@ -78,6 +85,10 @@ private:
     static NetworkView view(Slot& slot);
     static void state(Slot& slot, NetworkState state, bool desired, std::string error = {});
     static void cleanup(Slot& slot);
-    NetworkView start_impl(const CallContext& caller, const std::string& id, bool only_initial);
+    void observe_leases(Slot& slot); // worker, operation held; failures only invalidate telemetry
+    struct Expectation { uint64_t generation; NetworkState state; std::string revision; };
+    NetworkView start_impl(const CallContext& caller, const std::string& id, bool only_initial, const Expectation* expected = nullptr);
+    NetworkView stop_impl(const CallContext& caller, const std::string& id, const Expectation* expected = nullptr);
+    static void check_expected(Slot& slot, const Expectation& expected);
 };
 }

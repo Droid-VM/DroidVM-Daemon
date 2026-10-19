@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "network_host.h"
+#include <algorithm>
 
 namespace droidvm {
 namespace {
@@ -16,6 +17,20 @@ Json::Value NetworkHostService::addresses(const CallContext& caller) const {
     access(caller);
     const auto links = netbox_.links();
     return network::host_addresses(links, netbox_.addresses());
+}
+network::HostNetworkSnapshot NetworkHostService::snapshot(const CallContext& caller) const {
+    access(caller);
+    network::HostNetworkSnapshot result;
+    result.interfaces = network::UplinkSnapshot::scan().interfaces();
+    result.links = netbox_.links();
+    result.addresses = netbox_.addresses();
+    auto after = network::UplinkSnapshot::scan().interfaces();
+    const auto by_name = [](const auto& left, const auto& right) { return left.name < right.name; };
+    std::sort(result.interfaces.begin(), result.interfaces.end(), by_name);
+    std::sort(after.begin(), after.end(), by_name);
+    if (result.interfaces != after)
+        throw ServiceError(ErrorCode::unavailable, "Host interfaces changed during discovery");
+    return result;
 }
 Json::Value NetworkHostService::available_interfaces(const CallContext& caller) const {
     access(caller);

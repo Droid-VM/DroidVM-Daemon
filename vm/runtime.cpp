@@ -12,6 +12,9 @@
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include "common/identity.h"
+#include "vm/qmp_control.h"
+#include "vm/console_write.h"
+#include "vm/console_busy.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -46,6 +49,22 @@ std::string lower(std::string text) { for (auto& c : text) if (c >= 'A' && c <= 
 Json::Value& child(Json::Value& parent, const char* key) {
     if (!parent[key].isObject()) parent[key] = Json::Value(Json::objectValue);
     return parent[key];
+}
+void require_private_config(const Json::Value& value) {
+    // This is a trusted rescue-runtime capability, not a user-facing VM option.
+    // Restrict channels before any command construction can create file/USB/
+    // syslog consoles or inject tracing and alternative character devices.
+    auto reject = [] { throw std::invalid_argument("Invalid private VM configuration"); };
+    if (!value.isObject()) reject();
+    const auto& backend = config::member(value, "backend");
+    const auto& agent = config::member(value, "agent_mode");
+    const auto& strace = config::member(value, "strace");
+    if (!backend.isString() || (backend.asString() != "qemu" && backend.asString() != "QEMU") ||
+        !agent.isBool() || !agent.asBool() || (!strace.isNull() && (!strace.isBool() || strace.asBool()))) reject();
+    for (const char* key : {"extra_options", "environment_variables", "networks", "peripherals", "shared_dirs", "serial_ports"}) {
+        const auto& entries = config::member(value, key);
+        if (!entries.isNull() && (!entries.isArray() || !entries.empty())) reject();
+    }
 }
 // new String(bytes, UTF_8): malformed sequences become U+FFFD.
 std::string utf8_lossy(std::string_view bytes) {
@@ -158,20 +177,92 @@ bool crosvm_disk_capabilities_supported(const std::string& executable, const std
     return supported;
 }
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
-    : id_(std::move(id)), context_(context), config_(std::move(config)) { create_streams(); }
+    : id_(std::move(id)), context_(context), config_(std::move(config)) {
+    if (context_.private_console) {
+        require_private_config(config_);
+        // Clear the copied callbacks once so all startup, worker, cleanup and
+        // exception paths share the same boundary. Safety/admission callbacks
+        // and process identities remain intact for leases and stop_all.
+        context_.events = nullptr;
+        context_.state_changed = {};
+        context_.input_status = {};
+        context_.warn = [](const std::string&) {};
+        context_.info = [](const std::string&) {};
+    }
+    create_streams();
+}
 VmRuntime::~VmRuntime() = default;
 void VmRuntime::create_streams() {
     for (const auto& name : config::vm_streams(config_)) {
         const auto stream = name.asString();
         if (logs_.contains(stream)) continue;
-        // Persistent agent logs are disabled in the legacy QEMU backend.
-        logs_[stream] = std::make_unique<ConsoleLog>(console_log_path(context_.cache_dir, id_, stream), context_.owner, stream != "agent");
+        // Disabling persistence alone still reloads history. A private runtime
+        // has no log path at all, including stdout/stderr and the agent stream.
+        const auto path = context_.private_console ? std::string() : console_log_path(context_.cache_dir, id_, stream);
+        logs_[stream] = std::make_unique<ConsoleLog>(path, context_.owner, !context_.private_console && stream != "agent");
         order_.push_back(stream);
     }
 }
 State VmRuntime::state() const { std::lock_guard lock(state_mutex_); return state_; }
 int64_t VmRuntime::pid() const { return pid_.load(); }
 Json::Value VmRuntime::config() const { std::lock_guard lock(state_mutex_); return config_; }
+Observation VmRuntime::observation() const { std::lock_guard lock(state_mutex_); return version_.observe(); }
+bool VmRuntime::inspect_process(const std::function<void(int64_t, const Observation&)>& visitor) const {
+    std::lock_guard lock(state_mutex_);
+    if (retired_ || context_.private_console || !process_ ||
+        (state_ != State::running && state_ != State::suspended && state_ != State::stopping)) return false;
+    pollfd descriptor{process_->pidfd(), POLLIN, 0};
+    int ready;
+    do { ready = poll(&descriptor, 1, 0); } while (ready < 0 && errno == EINTR);
+    if (ready < 0 || (descriptor.revents & POLLNVAL))
+        throw ServiceError(ErrorCode::unavailable, "VM process identity is unavailable");
+    if (ready != 0) return false;
+    visitor(process_->pid(), version_.observe());
+    return true;
+}
+bool VmRuntime::signal_process(int64_t pid, const Observation& expected, int number) {
+    if (number != SIGTERM && number != SIGKILL)
+        throw ServiceError(ErrorCode::invalid_argument, "Unsupported VM process signal");
+    std::lock_guard lock(lock_);
+    {
+        std::lock_guard state(state_mutex_);
+        version_.require(expected);
+        if (retired_ || context_.private_console || !process_ || pid <= 1 || process_->pid() != pid ||
+            (state_ != State::running && state_ != State::suspended && state_ != State::stopping))
+            throw ServiceError(ErrorCode::conflict, "VM process changed before signalling");
+        version_.admit(expected);
+        if (!process_->signal(number)) return false;
+        stopped_by_user_ = true;
+        reboot_requested_ = false;
+    }
+    // A delivered signal is not an observed exit. Keep resources until the
+    // normal worker reaps this exact Child and publishes STOPPED.
+    set_state(State::stopping);
+    return true;
+}
+Json::Value VmRuntime::snapshot() const {
+    std::lock_guard lock(state_mutex_);
+    auto row = config_;
+    row["state"] = state_name(state_); row["pid"] = Json::Int64(pid_.load());
+    row["runtime_uptime_ms"] = Json::Value();
+    if (process_ && process_started_ && (state_ == State::running || state_ == State::suspended || state_ == State::stopping)) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - *process_started_).count();
+        if (elapsed >= 0) row["runtime_uptime_ms"] = std::to_string(elapsed);
+    }
+    row["streams"] = Json::Value(Json::arrayValue);
+    for (const auto& name : order_) row["streams"].append(name);
+    const auto observed = version_.observe();
+    row["runtime_instance"] = observed.instance;
+    row["runtime_revision"] = std::to_string(observed.revision);
+    row["runtime_uncertain"] = control_uncertain_;
+    auto& actions = row["runtime_actions"] = Json::Value(Json::arrayValue);
+    if (retired_) return row;
+    if (state_ == State::stopped && !worker_) actions.append("start");
+    if (state_ == State::starting || state_ == State::running || state_ == State::suspended || state_ == State::rebooting) actions.append("stop");
+    if (state_ == State::running && !reboot_requested_ && !control_uncertain_) { actions.append("reboot"); actions.append("suspend"); }
+    if (state_ == State::suspended && !reboot_requested_ && !control_uncertain_) actions.append("resume");
+    return row;
+}
 VmRuntime::StoppedLease::StoppedLease(std::shared_ptr<VmRuntime> target)
     : target_(std::move(target)), lock_(target_->lock_, std::try_to_lock) {
     if (!lock_.owns_lock()) return;
@@ -180,7 +271,9 @@ VmRuntime::StoppedLease::StoppedLease(std::shared_ptr<VmRuntime> target)
 }
 void VmRuntime::StoppedLease::retire() {
     if (!lock_.owns_lock()) throw std::logic_error("Stopped VM lease required");
+    std::lock_guard state(target_->state_mutex_);
     target_->retired_ = true;
+    target_->version_.changed();
 }
 VmRuntime::StoppedLease VmRuntime::try_edit() { return StoppedLease(shared_from_this()); }
 std::vector<std::string> VmRuntime::streams() const { std::lock_guard lock(state_mutex_); return order_; }
@@ -192,7 +285,7 @@ ConsoleLog* VmRuntime::log(const std::string& stream) const {
 void VmRuntime::clear_logs() { std::lock_guard lock(state_mutex_); for (auto& [name, log] : logs_) log->clear(); }
 void VmRuntime::set_state(State next) {
     // Release before publishing STOPPED so a new start keeps its reservation.
-    if (next == State::stopped && context_.pool) context_.pool->release(id_);
+    if (next == State::stopped && context_.pool) context_.pool->release(id_, hugepage_generation_.load());
     {
         std::lock_guard lock(state_mutex_);
         if (next == State::stopped && session_base_) {
@@ -200,6 +293,8 @@ void VmRuntime::set_state(State next) {
             session_base_.reset();
         }
         state_ = next;
+        if (next != State::stopping) control_uncertain_ = false;
+        version_.changed();
     }
     if (context_.info && (next == State::running || next == State::rebooting || next == State::stopping))
         context_.info("VM " + id_ + " (" + config::string(config(), "name") + "): " + lower(state_name(next)) +
@@ -230,20 +325,22 @@ void VmRuntime::fire(const std::string& event, const Json::Value& extra) {
     if (extra.isObject()) for (const auto& key : extra.getMemberNames()) data[key] = extra[key];
     context_.events->publish(data);
 }
-bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& overrides, bool clear_logs) {
+bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& overrides, bool clear_logs, std::optional<Observation> expected) {
     std::unique_lock lock(lock_);
     if (retired_) return false;
     {
         std::lock_guard state(state_mutex_);
+        version_.require(expected);
         if (state_ != State::stopped || worker_) return false;
+        std::optional<Json::Value> session;
         if (!overrides.isNull()) {
             if (!overrides.isObject()) throw std::invalid_argument("Invalid VM start overrides");
-            auto session = config_;
+            session = config_;
             for (const auto& key : overrides.getMemberNames()) {
                 if (key == "pseudo_unprotected") {
                     if (!overrides[key].isBool() || !overrides[key].asBool())
                         throw std::invalid_argument("Invalid protection override");
-                    session["protected_vm"] = "pseudo_unprotected";
+                    (*session)["protected_vm"] = "pseudo_unprotected";
                 } else if (key == "readonly_disks") {
                     if (!overrides[key].isArray()) throw std::invalid_argument("Invalid read-only disk overrides");
                     std::set<Json::ArrayIndex> seen;
@@ -251,16 +348,16 @@ bool VmRuntime::start(std::optional<std::string> boot_entry, const Json::Value& 
                         if (!slot.isUInt() || (slot.type() != Json::intValue && slot.type() != Json::uintValue))
                             throw std::invalid_argument("Invalid read-only disk slot");
                         const auto index = slot.asUInt();
-                        if (!session["disks"].isArray() || index >= session["disks"].size() ||
-                            !session["disks"][index].isObject() || !seen.insert(index).second)
+                        if (!(*session)["disks"].isArray() || index >= (*session)["disks"].size() ||
+                            !(*session)["disks"][index].isObject() || !seen.insert(index).second)
                             throw std::invalid_argument("Invalid or repeated read-only disk slot");
-                        session["disks"][index]["readonly"] = true;
+                        (*session)["disks"][index]["readonly"] = true;
                     }
                 } else throw std::invalid_argument("Unknown VM start override");
             }
-            session_base_ = config_;
-            config_.swap(session);
         }
+        version_.admit(expected);
+        if (session) { session_base_ = config_; config_.swap(*session); }
         boot_entry_ = std::move(boot_entry);
     }
     try {
@@ -292,6 +389,7 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         if (worker_) return false;
     }
     try {
+        if (context_.private_console) require_private_config(config());
         if (context_.validate_start) {
             if (!*context_.validate_start) throw std::runtime_error("VM start validation is not available");
             (*context_.validate_start)(config());
@@ -322,11 +420,13 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         HostFacts facts;
         facts.has_kvm = access("/dev/kvm", F_OK) == 0;
         facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
-        if (!relaunch && context_.pool && resolves_to_gunyah(config, facts) && context_.hugepages.resizable()
-                && context_.hugepage_auto_reserve()) {
+        if (!relaunch && context_.pool && resolves_to_gunyah(config, facts)) {
+            static std::atomic<uint64_t> next_consumer{1};
+            hugepage_generation_ = next_consumer.fetch_add(1);
             const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
-            if (!context_.pool->reserve(id_, (mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb))
-                throw std::runtime_error("Could not set huge-page reserve target");
+            const bool automatic = context_.hugepages.resizable() && context_.hugepage_auto_reserve();
+            if (!context_.pool->admit(id_, hugepage_generation_.load(), (mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, automatic))
+                throw std::runtime_error("Huge-page control is busy or reserve target could not be set");
         }
         set_state(State::starting);
         { std::lock_guard state(state_mutex_); worker_ = true; }
@@ -420,11 +520,15 @@ void VmRuntime::run() {
     facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
     bool ready = true;
     if (resolves_to_gunyah(config, facts)) {
-        const bool required = context_.pool && context_.pool->contains(id_);
+        const bool required = context_.pool && context_.pool->automatic(id_);
         // Automatic sizing off: start on the reserve as the user left it, without waiting.
         if (required || (context_.hugepages.present() && context_.hugepage_auto_reserve())) {
             const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
-            ready = context_.hugepages.wait((mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, aborted);
+            ready = context_.hugepages.wait((mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, aborted,
+                300, std::chrono::seconds(1), 5, [&] {
+                    if (context_.pool) context_.pool->control([&] { context_.hugepages.acquire(); });
+                    else context_.hugepages.acquire();
+                });
         }
     }
     if (aborted()) { finish_stopped(0); return; }
@@ -447,7 +551,10 @@ void VmRuntime::run() {
         readers.emplace_back(&VmRuntime::read_stream, this, process_->stderr_fd(), "stderr", true);
         for (const auto& serial : serials_) readers.emplace_back(&VmRuntime::read_stream, this, serial.local_read.get(), serial.stream, false);
     }
-    if (!stopped_by_user_) set_state(State::running);
+    {
+        std::lock_guard lock(lock_);
+        if (!stopped_by_user_) set_state(State::running);
+    }
     const auto started = std::chrono::steady_clock::now();
     pollfd exit_event{process_->pidfd(), POLLIN, 0};
     while (poll(&exit_event, 1, -1) < 0 && errno == EINTR) {}
@@ -459,6 +566,9 @@ void VmRuntime::run() {
     const auto ran = std::chrono::steady_clock::now() - started;
     reading_ = false;
     for (auto& reader : readers) reader.join();
+    // Keep control calls away from teardown and from the next process/socket.
+    // The worker must never publish RUNNING/SUSPENDED after a completed stop.
+    std::lock_guard lock(lock_);
     reap_and_cleanup();
     exit_code_ = code;
     bool restart = !stopped_by_user_ && (code == crosvm_reset || reboot_requested_);
@@ -475,7 +585,6 @@ void VmRuntime::run() {
     if (stopped_by_user_ && code != 0) exit_code_ = 0;
     cleanup_taps();
     cleanup_backend();
-    std::lock_guard lock(lock_);
     if (restart && !stopped_by_user_ && !context_.shutting_down()) {
         reboot_requested_ = false;
         exit_code_ = -1;
@@ -487,7 +596,7 @@ void VmRuntime::run() {
             std::this_thread::sleep_for(500ms);
             std::lock_guard relaunch(self->lock_);
             if (self->state() != State::rebooting) return;
-            if (!self->start_locked(true)) self->finish_stopped(-1);
+            if (!self->start_locked(true)) self->finish_stopped_locked(-1);
         }).detach();
         return;
     }
@@ -639,7 +748,9 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
             for (size_t i = 0; i < matches.gl_pathc; ++i) write_quiet(matches.gl_pathv[i], std::to_string(*command.udmabuf_limit_mb));
         globfree(&matches);
     }
-    return spawn(command.argv, command.env, command.strace_dir, "crosvm", failure, command.preserve_fds);
+    if (!spawn(command.argv, command.env, command.strace_dir, "crosvm", failure, command.preserve_fds)) return false;
+    { std::lock_guard lock(state_mutex_); vnc_endpoints_ = command.vnc_endpoints; }
+    return true;
 }
 bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std::string& failure) {
     auto host = probe_host({context_.owner, context_.run_dir + "/app-gids", context_.optimize_sdcard(),
@@ -710,6 +821,7 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
             if (path) { unlink(path->c_str()); sockets_.push_back(*path); }
         qemu_ = true;
         control_socket_ = run.qmp_socket_path;
+        vnc_endpoints_ = command.vnc_endpoints;
     }
     if (!spawn(command.argv, command.env, command.strace_dir, "qemu", failure, command.preserve_fds)) return false;
     // agent0 is declared before the blocking UART chardev: connect it first so
@@ -743,6 +855,10 @@ bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std
 bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<std::pair<std::string, std::string>>& env,
                       const std::optional<std::string>& strace_dir, const char* label, std::string& failure,
                       const std::vector<int>& preserve_fds) {
+    if (context_.private_console && strace_dir) {
+        failure = "Tracing is unavailable for a private VM";
+        return false;
+    }
     std::shared_ptr<config::DiskFileLeases::Lease> lease;
     { std::lock_guard lock(state_mutex_); lease = disk_lease_; }
     if (lease) lease->verify();
@@ -762,6 +878,7 @@ bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<st
     options.argv = argv;
     options.environment = merged_environment(env);
     options.limits = {{RLIMIT_NOFILE, 65536, 65536}, {RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY}};
+    if (context_.private_console) options.limits.push_back({RLIMIT_CORE, 0, 0});
     {
         std::lock_guard lock(state_mutex_);
         for (const auto& serial : serials_) { options.preserve_fds.push_back(serial.remote_write.get()); options.preserve_fds.push_back(serial.remote_read.get()); }
@@ -787,6 +904,7 @@ bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<st
         std::lock_guard lock(state_mutex_);
         pid_ = process->pid();
         process_ = std::move(process);
+        process_started_ = std::chrono::steady_clock::now();
         for (auto& serial : serials_) { serial.remote_write = Fd(); serial.remote_read = Fd(); }
     } catch (const std::exception& error) {
         failure = std::string("Failed to start ") + label + " process: " + error.what();
@@ -798,6 +916,7 @@ void VmRuntime::read_stream(int fd, std::string name, bool also_stdio) {
     char buffer[4096];
     auto deliver = [&](const std::string& stream, std::string_view data) {
         if (auto* log = this->log(stream)) log->append(data);
+        if (context_.private_console) return;
         Json::Value extra;
         extra["stream"] = stream;
         extra["data"] = url_encode_bytes(data);
@@ -836,12 +955,17 @@ void VmRuntime::cleanup_backend() {
     if (control_socket_) { unlink(control_socket_->c_str()); control_socket_.reset(); }
     for (const auto& path : sockets_) unlink(path.c_str());
     sockets_.clear(); qemu_ = false;
+    vnc_endpoints_.clear();
     serials_.clear();
     if (!identity_.name.empty() && context_.identities) {
         try { context_.identities->cleanup(identity_.name); identity_.directory = Fd(); identity_.name.clear(); } catch (const std::exception&) {}
     }
 }
 void VmRuntime::finish_stopped(int code) {
+    std::lock_guard lock(lock_);
+    finish_stopped_locked(code);
+}
+void VmRuntime::finish_stopped_locked(int code) {
     exit_code_ = code;
     cleanup_taps();
     cleanup_backend();
@@ -853,6 +977,12 @@ void VmRuntime::finish_stopped(int code) {
 void VmRuntime::release_disks() {
     std::shared_ptr<config::DiskFileLeases::Lease> released;
     { std::lock_guard state(state_mutex_); released.swap(disk_lease_); disk_images_.clear(); }
+}
+std::shared_ptr<config::DiskFileLeases::Lease> VmRuntime::private_disk_lease() const {
+    if (!context_.private_console)
+        throw ServiceError(ErrorCode::permission_denied, "Private VM ownership required");
+    std::lock_guard state(state_mutex_);
+    return disk_lease_;
 }
 void VmRuntime::kill_process() {
     std::lock_guard lock(state_mutex_);
@@ -870,40 +1000,51 @@ int VmRuntime::send_qmp(const std::string& command) {
     std::optional<std::string> path;
     { std::lock_guard lock(state_mutex_); path = control_socket_; }
     if (!path) return -1;
-    Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     if (socket_fd.get() < 0 || path->size() >= sizeof(address.sun_path)) return -1;
     std::copy(path->begin(), path->end(), address.sun_path);
-    timeval timeout{5, 0};
-    setsockopt(socket_fd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(socket_fd.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    if (connect(socket_fd.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) return -1;
-    char buffer[4096];
-    auto receive = [&]() -> ssize_t { ssize_t count; do count = recv(socket_fd.get(), buffer, sizeof(buffer), 0); while (count < 0 && errno == EINTR); return count; };
-    auto send_line = [&](const Json::Value& value) {
-        Json::StreamWriterBuilder builder; builder["indentation"] = "";
-        const auto text = Json::writeString(builder, value) + "\n";
-        return ::send(socket_fd.get(), text.data(), text.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(text.size());
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    auto ready = [&](short events) {
+        for (;;) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) return false;
+            pollfd fd{socket_fd.get(), events, 0};
+            const int result = poll(&fd, 1, static_cast<int>(remaining));
+            if (result < 0 && errno == EINTR) continue;
+            return result > 0 && (fd.revents & (events | POLLERR | POLLHUP));
+        }
     };
-    if (receive() <= 0) return -1;
-    Json::Value capabilities;
-    capabilities["execute"] = "qmp_capabilities";
-    if (!send_line(capabilities)) return -1;
-    receive();
-    if (!send_line(request)) return -1;
-    const auto count = receive();
-    if (count <= 0) return -1;
-    Json::CharReaderBuilder reader_builder;
-    std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
-    Json::Value response;
-    std::string error;
-    if (!reader->parse(buffer, buffer + count, &response, &error) || !response.isObject()) return -1;
-    if (response.isMember("return")) return 0;
-    return response.isMember("error") ? -1 : 0;
+    if (connect(socket_fd.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        if (errno != EINPROGRESS || !ready(POLLOUT)) return -1;
+        int error = 0; socklen_t length = sizeof(error);
+        if (getsockopt(socket_fd.get(), SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error) return -1;
+    }
+    const auto send_all = [&](std::string_view value) {
+        while (!value.empty()) {
+            if (!ready(POLLOUT)) return false;
+            const auto count = ::send(socket_fd.get(), value.data(), value.size(), MSG_NOSIGNAL);
+            if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            if (count <= 0) return false;
+            value.remove_prefix(static_cast<size_t>(count));
+        }
+        return true;
+    };
+    const auto receive = [&]() -> std::string {
+        for (;;) {
+            if (!ready(POLLIN)) return {};
+            char buffer[4096]; const auto count = recv(socket_fd.get(), buffer, sizeof(buffer), 0);
+            if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            return count > 0 ? std::string(buffer, static_cast<size_t>(count)) : std::string();
+        }
+    };
+    return qmp_control(request, send_all, receive) ? 0 : -1;
 }
 int VmRuntime::send_control(const std::string& command) {
-    if (qemu_) return send_qmp(command);
+    bool qemu;
+    { std::lock_guard lock(state_mutex_); qemu = qemu_; }
+    if (qemu) return send_qmp(command);
     const char* request = command == "stop" ? "Exit" : command == "powerbtn" ? "Powerbtn" : command == "sleepbtn" ? "Sleepbtn" :
         command == "resume" ? "ResumeVcpus" : command == "suspend" ? "SuspendVcpus" : nullptr;
     std::optional<std::string> path;
@@ -925,10 +1066,24 @@ int VmRuntime::send_control(const std::string& command) {
     if (count <= 0) return -1;
     return std::string_view(response, static_cast<size_t>(count)) == "\"Ok\"" ? 0 : -1;
 }
-bool VmRuntime::stop() {
+std::optional<State> VmRuntime::claim_action(const std::optional<Observation>& expected, std::initializer_list<State> allowed,
+                                           bool allow_uncertain) {
+    if (retired_) return {};
+    std::lock_guard state(state_mutex_);
+    version_.require(expected);
+    if (control_uncertain_ && !allow_uncertain) {
+        if (expected) throw ServiceError(ErrorCode::commit_uncertain, "VM control state is unconfirmed; stop before another transition");
+        return {};
+    }
+    if (std::find(allowed.begin(), allowed.end(), state_) == allowed.end()) return {};
+    version_.admit(expected);
+    return state_;
+}
+bool VmRuntime::stop(std::optional<Observation> expected) {
     std::lock_guard lock(lock_);
-    const auto current = state();
-    if (current == State::rebooting) {
+    const auto current = claim_action(expected, {State::running, State::starting, State::suspended, State::rebooting}, true);
+    if (!current) return false;
+    if (*current == State::rebooting) {
         // A relaunch has no live process: cancel it and release its budget.
         stopped_by_user_ = true;
         exit_code_ = 0;
@@ -937,7 +1092,6 @@ bool VmRuntime::stop() {
         fire("exited");
         return true;
     }
-    if (current != State::running && current != State::starting && current != State::suspended) return false;
     stopped_by_user_ = true;
     set_state(State::stopping);
     { std::lock_guard state(state_mutex_); if (!process_) return true; } // the worker observes stopped_by_user_
@@ -945,26 +1099,39 @@ bool VmRuntime::stop() {
     kill_process();
     return true;
 }
-bool VmRuntime::reboot() {
-    if (state() != State::running) return false;
+bool VmRuntime::reboot(std::optional<Observation> expected) {
+    std::lock_guard lock(lock_);
+    if (reboot_requested_ || !claim_action(expected, {State::running})) return false;
     reboot_requested_ = true;
     if (send_control("stop") == 0) return true;
     kill_process();
     return true;
 }
-bool VmRuntime::suspend() {
-    if (state() != State::running) return false;
-    if (send_control("suspend") != 0) return false;
-    set_state(State::suspended);
+bool VmRuntime::suspend(std::optional<Observation> expected) {
+    return control_transition(std::move(expected), State::running, State::suspended, "suspend");
+}
+bool VmRuntime::resume(std::optional<Observation> expected) {
+    return control_transition(std::move(expected), State::suspended, State::running, "resume");
+}
+bool VmRuntime::control_transition(std::optional<Observation> expected, State from, State to, const std::string& command) {
+    std::lock_guard lock(lock_);
+    if (reboot_requested_ || !claim_action(expected, {from})) return false;
+    if (send_control(command) != 0) {
+        { std::lock_guard state(state_mutex_); control_uncertain_ = true; version_.changed(); }
+        if (expected) throw ServiceError(ErrorCode::commit_uncertain, "VM control outcome could not be confirmed");
+        return false;
+    }
+    set_state(to);
     return true;
 }
-bool VmRuntime::resume() {
-    if (state() != State::suspended) return false;
-    if (send_control("resume") != 0) return false;
-    set_state(State::running);
-    return true;
+bool VmRuntime::control(const std::string& command) {
+    if (command == "stop") return stop();
+    if (command == "suspend") return suspend();
+    if (command == "resume") return resume();
+    std::lock_guard lock(lock_);
+    if (!claim_action({}, {State::running, State::suspended})) return false;
+    return send_control(command) == 0;
 }
-bool VmRuntime::control(const std::string& command) { return send_control(command) == 0; }
 std::optional<VmRuntime::StreamInfo> VmRuntime::stream_info(const std::string& stream) const {
     std::lock_guard lock(state_mutex_);
     if (!logs_.contains(stream)) return {};
@@ -999,6 +1166,118 @@ bool VmRuntime::write(const std::string& stream, const std::string& data) {
         return true;
     }
     return false;
+}
+VmRuntime::ConsoleTarget VmRuntime::console_target() const {
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ConsoleBusy();
+    ConsoleTarget result{version_.observe(), {}};
+    if (retired_ || state_ != State::running) return result;
+    for (const auto& name : order_) {
+        if (name == "agent") continue;
+        for (const auto& serial : serials_)
+            if (serial.stream == name && serial.local_read.get() >= 0 && serial.local_write.get() >= 0) {
+                result.streams.push_back(name); break;
+            }
+    }
+    return result;
+}
+const VmRuntime::Serial& VmRuntime::console_serial(const std::string& stream, const Observation& expected) const {
+    version_.require(expected);
+    if (retired_ || state_ != State::running)
+        throw ServiceError(ErrorCode::conflict, "VM console requires the observed running instance");
+    if (stream != "agent" && logs_.contains(stream))
+        for (const auto& serial : serials_)
+            if (serial.stream == stream && serial.local_read.get() >= 0 && serial.local_write.get() >= 0) return serial;
+    throw ServiceError(ErrorCode::not_found, "Interactive serial console not found");
+}
+LogSlice VmRuntime::console_read(const std::string& stream, const Observation& expected,
+        const std::optional<LogCursor>& cursor, bool tail) const {
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ConsoleBusy();
+    (void)console_serial(stream, expected);
+    auto result = logs_.at(stream)->try_read(cursor, tail);
+    if (!result) throw ConsoleBusy();
+    return std::move(*result);
+}
+size_t VmRuntime::console_write(const std::string& stream, const Observation& expected, std::string_view data) {
+    if (data.empty() || data.size() > console_write_limit)
+        throw ServiceError(ErrorCode::invalid_argument, "Console input must contain 1 to 512 bytes");
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ServiceError(ErrorCode::unavailable, "VM console is busy");
+    const auto& serial = console_serial(stream, expected);
+    return bounded_console_write(serial.local_write.get(), data);
+}
+namespace {
+std::string display_endpoint_reason(const VncEndpoint& endpoint) {
+    if (!endpoint.unavailable_reason.empty()) return endpoint.unavailable_reason;
+    if (endpoint.port < 1 || endpoint.port > 65535) return "invalid-endpoint";
+    // Backend option lists use commas as separators. A legacy password that
+    // changes option parsing cannot be treated as an authoritative endpoint.
+    if (endpoint.password.size() > 255 || endpoint.password.find_first_of(",\\\"'") != std::string::npos ||
+        std::any_of(endpoint.password.begin(), endpoint.password.end(),
+            [](unsigned char byte) { return byte < 0x20 || byte == 0x7f; })) return "unsupported";
+    try { (void)local_vnc_address(endpoint.host); }
+    catch (const ServiceError&) { return "invalid-endpoint"; }
+    return {};
+}
+}
+VmRuntime::DisplayTarget VmRuntime::display_target() const {
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ConsoleBusy();
+    if (context_.private_console) throw ServiceError(ErrorCode::permission_denied, "Private display unavailable");
+    DisplayTarget result{version_.observe(), {}};
+    for (const auto& screen : command::screens_of(config_)) {
+        DisplayScreen item{screen.id, false, {}, false};
+        if (!screen.enabled()) item.reason = "disabled";
+        else if (retired_ || state_ != State::running || pid_.load() <= 0 || control_uncertain_) item.reason = "not-running";
+        else if (screen.exporter() != "VNC") item.reason = "not-vnc";
+        else {
+            const auto endpoint = std::find_if(vnc_endpoints_.begin(), vnc_endpoints_.end(),
+                [&](const auto& value) { return value.screen == screen.id; });
+            if (endpoint == vnc_endpoints_.end()) item.reason = "unsupported";
+            else {
+                item.reason = display_endpoint_reason(*endpoint);
+                item.available = item.reason.empty();
+                item.input_enabled = item.available && endpoint->input_enabled;
+            }
+        }
+        result.screens.push_back(std::move(item));
+    }
+    return result;
+}
+void VmRuntime::require_display(const Observation& expected) const {
+    version_.require(expected);
+    if (context_.private_console) throw ServiceError(ErrorCode::permission_denied, "Private display unavailable");
+    if (retired_ || state_ != State::running || pid_.load() <= 0 || control_uncertain_)
+        throw ServiceError(ErrorCode::conflict, "Display requires the observed running instance");
+}
+VmRuntime::OpenedDisplay VmRuntime::open_display(const std::string& screen, const Observation& expected) {
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ConsoleBusy();
+    require_display(expected);
+    const auto endpoint = std::find_if(vnc_endpoints_.begin(), vnc_endpoints_.end(),
+        [&](const auto& value) { return value.screen == screen; });
+    if (endpoint == vnc_endpoints_.end() || !display_endpoint_reason(*endpoint).empty())
+        throw ServiceError(ErrorCode::unavailable, "Display endpoint unavailable");
+    auto stream = std::make_shared<VncStream>(endpoint->host, endpoint->port,
+        [runtime = shared_from_this(), expected](const std::function<void()>& operation) {
+            std::unique_lock state(runtime->state_mutex_, std::try_to_lock);
+            if (!state.owns_lock()) throw ConsoleBusy();
+            runtime->require_display(expected);
+            operation(); // Nonblocking socket call while lifecycle is excluded.
+        });
+    return {std::move(stream), endpoint->password};
+}
+void VmRuntime::prepare_private_console_handoff(const Observation& expected) {
+    if (!context_.private_console)
+        throw ServiceError(ErrorCode::permission_denied, "Private VM ownership required");
+    std::unique_lock lock(state_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) throw ConsoleBusy();
+    (void)console_serial("uart", expected);
+    // The automation's SCRIPT:EXITED and SHELL:READY precede this boundary.
+    // No previous console bytes, including password prompts/input echoes, are
+    // addressable through old cursors after the history generations rotate.
+    for (auto& [stream, history] : logs_) history->clear();
 }
 void VmRuntime::shutdown(std::chrono::milliseconds timeout) {
     stop();

@@ -18,43 +18,26 @@ bool write_all(int fd, std::string_view data) {
 }
 }
 ConsoleLog::ConsoleLog(std::string path, uid_t owner, bool persistent) : path_(std::move(path)), owner_(owner), persistent_(persistent) {
+    if (path_.empty()) return;
     Fd file(open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
     if (file.get() < 0) return;
     char buffer[65536];
     for (;;) {
-        const auto count = read(file.get(), buffer, sizeof(buffer));
+        const auto count = ::read(file.get(), buffer, sizeof(buffer));
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) break;
-        push({buffer, static_cast<size_t>(count)});
+        history_.append({buffer, static_cast<size_t>(count)});
     }
-}
-void ConsoleLog::push(std::string_view data) {
-    if (data.size() >= capacity) { data = data.substr(data.size() - capacity); head_ = 0; size_ = 0; }
-    for (size_t offset = 0; offset < data.size();) {
-        const auto tail = (head_ + size_) % capacity;
-        const auto chunk = std::min(data.size() - offset, capacity - tail);
-        std::copy_n(data.data() + offset, chunk, ring_.begin() + static_cast<std::ptrdiff_t>(tail));
-        offset += chunk;
-        size_ += chunk;
-        if (size_ > capacity) { head_ = (head_ + size_ - capacity) % capacity; size_ = capacity; }
-    }
-}
-std::string ConsoleLog::contents_locked() const {
-    std::string result(size_, '\0');
-    const auto first = std::min(size_, capacity - head_);
-    std::copy_n(ring_.begin() + static_cast<std::ptrdiff_t>(head_), first, result.begin());
-    std::copy_n(ring_.begin(), size_ - first, result.begin() + static_cast<std::ptrdiff_t>(first));
-    return result;
 }
 void ConsoleLog::append(std::string_view data) {
     std::lock_guard lock(mutex_);
-    push(data);
+    history_.append(data);
     appended_ += data.size();
-    if (disable_save_ || !persistent_) return;
+    if (path_.empty() || disable_save_ || !persistent_) return;
     if (writer_.get() < 0) {
         // First write rewrites the copy from the whole buffer, as the legacy stream.
         Fd file(open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600));
-        if (file.get() < 0 || !write_all(file.get(), contents_locked()) || fchown(file.get(), owner_, owner_) != 0) {
+        if (file.get() < 0 || !write_all(file.get(), history_.contents()) || fchown(file.get(), owner_, owner_) != 0) {
             disable_save_ = true;
             return;
         }
@@ -65,10 +48,10 @@ void ConsoleLog::append(std::string_view data) {
 }
 void ConsoleLog::clear() {
     std::lock_guard lock(mutex_);
-    head_ = size_ = 0;
+    history_.clear();
     disable_save_ = false;
     writer_ = Fd();
-    unlink(path_.c_str());
+    if (!path_.empty()) unlink(path_.c_str());
 }
 void ConsoleLog::close() { std::lock_guard lock(mutex_); writer_ = Fd(); }
 void ConsoleLog::set_persistent(bool enabled) {
@@ -76,14 +59,20 @@ void ConsoleLog::set_persistent(bool enabled) {
     persistent_ = enabled;
     if (!enabled) writer_ = Fd();
 }
-std::string ConsoleLog::contents() const { std::lock_guard lock(mutex_); return contents_locked(); }
-size_t ConsoleLog::size() const { std::lock_guard lock(mutex_); return size_; }
+std::string ConsoleLog::contents() const { std::lock_guard lock(mutex_); return history_.contents(); }
+size_t ConsoleLog::size() const { std::lock_guard lock(mutex_); return history_.size(); }
+LogSlice ConsoleLog::read(const std::optional<LogCursor>& cursor, bool tail) const { std::lock_guard lock(mutex_); return history_.read(cursor, tail); }
+std::optional<LogSlice> ConsoleLog::try_read(const std::optional<LogCursor>& cursor, bool tail) const {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return {};
+    return history_.read(cursor, tail);
+}
 uint64_t ConsoleLog::mark() const { std::lock_guard lock(mutex_); return appended_; }
 std::string ConsoleLog::since(uint64_t mark) const {
     std::lock_guard lock(mutex_);
     if (appended_ <= mark) return {};
     const auto count = appended_ - mark;
-    auto all = contents_locked();
+    auto all = history_.contents();
     if (count >= all.size()) return all;
     return all.substr(all.size() - static_cast<size_t>(count));
 }

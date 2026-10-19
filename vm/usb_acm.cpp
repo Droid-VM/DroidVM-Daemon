@@ -5,6 +5,7 @@
 #include "vm/host_facts.h"
 #include "store/network_config.h"
 #include "common/fd.h"
+#include "services/context.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -16,6 +17,8 @@
 #include <optional>
 #include <thread>
 #include <vector>
+#include <filesystem>
+#include <set>
 
 namespace droidvm::vm {
 namespace {
@@ -42,16 +45,28 @@ std::optional<std::string> read_file(const std::string& path) {
 std::string read_trimmed(const std::string& path) { return trim(read_file(path).value_or("")); }
 bool exists(const std::string& path) { struct stat info{}; return stat(path.c_str(), &info) == 0; }
 bool is_directory(const std::string& path) { struct stat info{}; return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode); }
+bool real_directory(const std::string& path) { struct stat info{}; return lstat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode); }
+bool present(const std::string& path) { struct stat info{}; return lstat(path.c_str(), &info) == 0; }
+bool correct_link(const std::string& path, const std::string& expected) {
+    char target[4096]; const auto length = readlink(path.c_str(), target, sizeof(target));
+    if (length <= 0 || static_cast<size_t>(length) == sizeof(target)) return false;
+    auto actual = std::filesystem::path(std::string(target, static_cast<size_t>(length)));
+    if (!actual.is_absolute()) actual = std::filesystem::path(path).parent_path() / actual;
+    return actual.lexically_normal() == std::filesystem::path(expected).lexically_normal();
+}
 // File.list: null when the directory cannot be read; no dot entries.
 std::optional<std::vector<std::string>> list(const std::string& path) {
     DIR* dir = opendir(path.c_str());
     if (!dir) return std::nullopt;
     std::vector<std::string> names;
+    errno = 0;
     while (const auto* entry = readdir(dir)) {
         const std::string name = entry->d_name;
         if (name != "." && name != "..") names.push_back(name);
     }
+    const int error = errno;
     closedir(dir);
+    if (error) return std::nullopt;
     return names;
 }
 // Integer.parseInt; nullopt where it throws NumberFormatException.
@@ -79,6 +94,9 @@ int GadgetFs::write(const std::string& path, std::string_view text) {
 int GadgetFs::make_directory(const std::string& path) { return ::mkdir(path.c_str(), 0777) == 0 ? 0 : errno; }
 int GadgetFs::symlink(const std::string& target, const std::string& link) { return ::symlink(target.c_str(), link.c_str()) == 0 ? 0 : errno; }
 int GadgetFs::remove(const std::string& path) { return ::remove(path.c_str()) == 0 ? 0 : errno; }
+bool GadgetFs::tty_node(const std::string& path) const {
+    struct stat info{}; return lstat(path.c_str(), &info) == 0 && S_ISCHR(info.st_mode);
+}
 
 bool acm_enabled(const Json::Value& app_config) { return config::boolean(app_config, acm_enable_key, acm_default_enable); }
 int acm_ports(const Json::Value& app_config) {
@@ -97,21 +115,27 @@ AcmPool::AcmPool(AcmOptions options) : options_(std::move(options)) {
 }
 void AcmPool::apply_config(const Json::Value& app_config) {
     std::lock_guard lock(mutex_);
+    if (managed_) return; // Persistent owner is authoritative; stale App pushes never rebind.
     try { reconcile(acm_enabled(app_config) ? acm_ports(app_config) : 0); }
     catch (const std::exception& error) { log("WARN", std::string("USB ACM pool reconcile failed: ") + error.what()); }
 }
 std::string AcmPool::acquire(int slot, const std::string& owner, const Json::Value& app_config) {
     std::lock_guard lock(mutex_);
-    if (!acm_enabled(app_config))
+    if (managed_ && !desired_) throw AcmSlotUnavailable("USB serial configuration is uninitialized or its last operation is unconfirmed");
+    const bool enabled = managed_ ? desired_->enabled : acm_enabled(app_config);
+    if (!enabled)
         throw AcmSlotUnavailable("USB serial (ACM) is disabled; enable it in the app settings first");
-    const auto pool_size = acm_ports(app_config);
+    const auto pool_size = managed_ ? desired_->ports : acm_ports(app_config);
     if (slot < 0 || slot >= pool_size)
         throw AcmSlotUnavailable("USB serial slot " + std::to_string(slot) + " is outside the pool (size " + std::to_string(pool_size) +
                                  "); raise the USB serial ports setting or pick a lower slot");
     const auto instance = instance_prefix + std::to_string(slot);
     if (const auto holder = owners_.find(instance); holder != owners_.end())
         throw AcmSlotUnavailable("USB serial slot " + std::to_string(slot) + " is busy (held by " + holder->second + ")");
-    reconcile(pool_size);
+    if (managed_) {
+        if (!live_locked(*desired_)["applied"].asBool())
+            throw AcmSlotUnavailable("USB serial pool differs from its saved configuration; explicitly apply it before starting the VM");
+    } else reconcile(pool_size);
     const auto path = dev_path_of(instance);
     wait_for_node(path);
     owners_[instance] = owner;
@@ -126,8 +150,101 @@ std::map<std::string, std::string> AcmPool::owners() const {
     std::lock_guard lock(mutex_);
     return owners_;
 }
+class AcmPool::Transaction final : public AcmTransaction {
+public:
+    explicit Transaction(AcmPool& pool) : pool_(pool) {}
+    Json::Value live(const AcmDesired& desired) const override { return pool_.live_locked(desired); }
+    void admit(const AcmDesired& desired) const override { pool_.admit_locked(desired); }
+    void bind(std::optional<AcmDesired> desired) override { pool_.managed_ = true; pool_.desired_ = desired; }
+    void apply() override {
+        if (!pool_.desired_) throw ServiceError(ErrorCode::commit_uncertain, "USB ACM desired configuration is unavailable");
+        const auto desired = *pool_.desired_;
+        pool_.admit_locked(desired);
+        auto before = pool_.live_locked(desired);
+        if (!before["available"].asBool()) throw ServiceError(ErrorCode::unavailable, "USB gadget is unavailable");
+        const auto reason = before["reason"].isString() ? before["reason"].asString() : std::string();
+        if (reason == "unsafe-function" || reason == "unsafe-link" || reason == "invalid-port")
+            throw ServiceError(ErrorCode::conflict, "USB ACM function identity cannot be verified");
+        pool_.reconcile(desired.enabled ? desired.ports : 0);
+        // A correctly linked pool with a lost UDC/node still needs an explicit
+        // rebind. Never let a VM acquire silently repeat this management action.
+        if (desired.enabled && (reason == "udc-unbound" || reason == "tty-unavailable")) {
+            pool_.with_udc_unbound([] {});
+        }
+        if (desired.enabled) for (int slot = 0; slot < desired.ports; ++slot)
+            pool_.wait_for_node(pool_.dev_path_of(std::string(instance_prefix) + std::to_string(slot)));
+        if (!pool_.live_locked(desired)["applied"].asBool()) throw ServiceError(ErrorCode::unavailable, "USB ACM apply readback failed");
+    }
+private:
+    AcmPool& pool_;
+};
+void AcmPool::transaction(const std::function<void(AcmTransaction&)>& work) {
+    std::lock_guard lock(mutex_); Transaction transaction(*this); work(transaction);
+}
+Json::Value AcmPool::live_locked(const AcmDesired& desired) const {
+    Json::Value out; out["available"] = false; out["applied"] = false;
+    out["udcBound"] = Json::Value(); out["ports"] = Json::Value(); out["reason"] = "gadget-unavailable";
+    out["owners"] = Json::Value(Json::arrayValue);
+    for (const auto& [instance, owner] : owners_) {
+        const auto slot = java_int(instance.substr(std::strlen(instance_prefix)));
+        if (!slot || *slot < 0 || *slot >= acm_max_ports) continue;
+        Json::Value row; row["slot"] = *slot; row["vmId"] = owner.substr(0, owner.find('/')); out["owners"].append(row);
+    }
+    const auto functions = list(functions_), links = list(config_);
+    const auto udc = read_file(udc_);
+    if (!functions || !links || !udc || !real_directory(functions_) || !real_directory(config_)) return out;
+    out["available"] = true; out["udcBound"] = !trim(*udc).empty();
+    const auto prefix = std::string("acm.") + instance_prefix;
+    const int wanted = desired.enabled ? desired.ports : 0;
+    std::set<int> slots, ports;
+    std::string reason;
+    for (const auto& name : *functions) {
+        if (!name.starts_with(prefix)) continue;
+        const auto slot = java_int(name.substr(prefix.size()));
+        if (!slot || *slot < 0 || *slot >= acm_max_ports || name != prefix + std::to_string(*slot) || !real_directory(functions_ + "/" + name)) {
+            reason = "unsafe-function"; break;
+        }
+        slots.insert(*slot);
+        const auto number = read_file(functions_ + "/" + name + "/port_num");
+        const auto port = number ? java_int(trim(*number)) : std::nullopt;
+        if (!port || *port < 0 || *port > 255 || !ports.insert(*port).second) { reason = "invalid-port"; break; }
+        if (!correct_link(config_ + "/" + name, functions_ + "/" + name)) {
+            if (present(config_ + "/" + name)) { reason = "unsafe-link"; break; }
+            if (reason.empty() || reason == "tty-unavailable") reason = "missing-link";
+        } else if (!options_.fs->tty_node(options_.dev + "/ttyGS" + std::to_string(*port)) && reason.empty()) reason = "tty-unavailable";
+    }
+    for (const auto& name : *links) {
+        if (!name.starts_with(prefix)) continue;
+        const auto slot = java_int(name.substr(prefix.size()));
+        if (!slot || !slots.contains(*slot) || name != prefix + std::to_string(*slot) || !correct_link(config_ + "/" + name, functions_ + "/" + name)) {
+            reason = "unsafe-link"; break;
+        }
+    }
+    out["ports"] = static_cast<int>(slots.size());
+    if (reason.empty() || reason == "tty-unavailable" || reason == "missing-link") {
+        bool shape = slots.size() == static_cast<size_t>(wanted);
+        for (int slot = 0; slot < wanted; ++slot) shape = shape && slots.contains(slot);
+        if (!shape) reason = "pool-size-mismatch";
+        else if (reason != "missing-link" && desired.enabled && trim(*udc).empty()) reason = "udc-unbound";
+    }
+    if (reason == "unsafe-function" || reason == "unsafe-link" || reason == "invalid-port") {
+        out["available"] = false; out["ports"] = Json::Value();
+    }
+    const auto udc_after = read_file(udc_);
+    if (!udc_after || trim(*udc_after) != trim(*udc)) {
+        out["available"] = false; out["ports"] = Json::Value(); out["udcBound"] = Json::Value(); reason = "observation-changed";
+    }
+    out["applied"] = reason.empty(); out["reason"] = reason.empty() ? Json::Value() : Json::Value(reason);
+    return out;
+}
+void AcmPool::admit_locked(const AcmDesired& desired) const {
+    if (desired.ports < 1 || desired.ports > acm_max_ports) throw ServiceError(ErrorCode::invalid_argument, "USB ACM ports must be between 1 and 6");
+    if (!owners_.empty() && !live_locked(desired)["applied"].asBool())
+        throw ServiceError(ErrorCode::conflict, "USB ACM has active VM slots; stop their VMs before rebinding the gadget");
+}
 // Only acm.dvmpool* is ever touched; members a VM holds are never removed.
 void AcmPool::reconcile(int pool_size) {
+    if (managed_) admit_locked({pool_size != 0, pool_size == 0 ? acm_default_ports : pool_size});
     std::vector<std::string> to_remove;
     const auto name_prefix = std::string("acm.") + instance_prefix;
     if (const auto names = list(functions_)) for (const auto& name : *names) {
@@ -147,7 +264,8 @@ void AcmPool::reconcile(int pool_size) {
     }
     if (!missing_link && to_remove.empty()) return;
     std::optional<std::string> last_failure;
-    for (int attempt = 1; attempt <= options_.timing.udc_retries; ++attempt) {
+    const int attempts = managed_ ? 1 : options_.timing.udc_retries;
+    for (int attempt = 1; attempt <= attempts; ++attempt) {
         await_usb_settled();
         try {
             with_udc_unbound([&] {
@@ -158,15 +276,20 @@ void AcmPool::reconcile(int pool_size) {
                     if (const int error = options_.fs->symlink(functions_ + "/" + name, link)) throw std::runtime_error(failed("symlink failed", error));
                 }
                 for (const auto& func : to_remove) {
-                    options_.fs->remove(config_ + func.substr(functions_.size()));
-                    if (is_directory(func) && options_.fs->remove(func) != 0) log("WARN", "cannot remove " + func);
+                    const auto link = config_ + func.substr(functions_.size());
+                    if (const int error = options_.fs->remove(link); error && error != ENOENT && managed_) throw std::runtime_error(failed("cannot unlink ACM function", error));
+                    if (is_directory(func)) {
+                        const int error = options_.fs->remove(func);
+                        if (error && managed_) throw std::runtime_error(failed("cannot remove ACM function", error));
+                        if (error) log("WARN", "cannot remove " + func);
+                    }
                 }
             });
             last_failure.reset();
             break;
         } catch (const std::exception& error) {
             last_failure = error.what();
-            log("WARN", "gadget reconcile attempt " + std::to_string(attempt) + "/" + std::to_string(options_.timing.udc_retries) +
+            log("WARN", "gadget reconcile attempt " + std::to_string(attempt) + "/" + std::to_string(attempts) +
                 " lost the UDC race: " + error.what());
         }
     }
@@ -179,7 +302,7 @@ std::string AcmPool::dev_path_of(const std::string& instance) {
     const auto text = read_file(file);
     if (!text) throw std::runtime_error(file + " (" + std::strerror(errno) + ")"); // FileNotFoundException
     const auto port = java_int(trim(*text));
-    if (!port) throw std::runtime_error("cannot parse acm port_num");
+    if (!port || (managed_ && (*port < 0 || *port > 255))) throw std::runtime_error("cannot parse acm port_num");
     return options_.dev + "/ttyGS" + std::to_string(*port);
 }
 // The node only appears after the gadget binds.
@@ -209,11 +332,31 @@ void AcmPool::await_usb_settled() {
 // Unbind, edit, bind back-to-back; the bind always runs so a failed edit
 // never strands the gadget unbound.
 void AcmPool::with_udc_unbound(const std::function<void()>& op) {
+    if (managed_ && !owners_.empty()) throw ServiceError(ErrorCode::conflict, "Active USB ACM slots prevent UDC rebinding");
+    if (managed_ && !read_file(udc_)) throw std::runtime_error("UDC initial observation unavailable");
     auto udc = read_trimmed(udc_);
     if (udc.empty()) {
         const auto names = list(options_.udc_class);
         if (!names || names->empty()) throw std::runtime_error("no UDC available");
         udc = names->front();
+    }
+    if (managed_) {
+        // Even an error return may follow a successful write. From the first
+        // unbind attempt onwards, every exit attempts restoration and verifies it.
+        std::exception_ptr failure;
+        try {
+            const int error = options_.fs->write(udc_, "\n");
+            if (error) throw std::runtime_error(failed("UDC unbind failed", error));
+            const auto unbound = read_file(udc_);
+            if (!unbound || !trim(*unbound).empty()) throw std::runtime_error("UDC unbind readback unavailable or mismatched");
+            op();
+        } catch (...) { failure = std::current_exception(); }
+        const int bind_error = options_.fs->write(udc_, udc);
+        const auto restored = read_file(udc_);
+        if (!restored || trim(*restored) != udc)
+            throw std::runtime_error(bind_error ? failed("UDC restore failed", bind_error) : "UDC restore readback mismatch");
+        if (failure) std::rethrow_exception(failure);
+        return;
     }
     // A newline, not "": zero bytes never reach the UDC store, so the gadget stays bound.
     options_.fs->write(udc_, "\n");

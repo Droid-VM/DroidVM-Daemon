@@ -2,6 +2,8 @@
 // Host reads behind CrosvmBackendInstance: VMHypervisor, HostSocName,
 // AppGroups, CpuUtils, resolveSystemVulkanHal and friends.
 #include "host_facts.h"
+#include "cpu_topology.h"
+#include "host_devices.h"
 #include "build_metadata.h"
 #include "qcom_chips.h"
 #include "vm/command_common.h"
@@ -45,30 +47,7 @@ std::optional<int> java_int(const std::string& text) {
         return static_cast<int>(value);
     } catch (const std::invalid_argument&) { return {}; }
 }
-int64_t read_long(const std::string& path) {
-    const auto raw = read_text(path);
-    if (!raw) return 0;
-    const auto text = trim(*raw);
-    if (text.empty()) return 0;
-    try { return config::java_long(text); } catch (const std::invalid_argument&) { return 0; }
-}
 std::string remove_all(std::string text, char c) { text.erase(std::remove(text.begin(), text.end(), c), text.end()); return text; }
-std::optional<std::string> vulkan_hal() {
-    DIR* dir = opendir("/vendor/lib64/hw");
-    if (!dir) return {};
-    std::optional<std::string> result;
-    while (const auto* entry = readdir(dir)) {
-        const std::string name = entry->d_name;
-        if (!name.starts_with("vulkan.") || !name.ends_with(".so")) continue;
-        // Skip the software fallbacks; the GPU driver is wanted.
-        if (name.find("lvp") != std::string::npos || name.find("swiftshader") != std::string::npos ||
-            name.find("pastel") != std::string::npos) continue;
-        result = "/vendor/lib64/hw/" + name;
-        break;
-    }
-    closedir(dir);
-    return result;
-}
 std::optional<std::string> find_in_path(const std::string& name) {
     const char* path = getenv("PATH");
     if (!path) return {};
@@ -152,46 +131,17 @@ std::optional<std::vector<int>> app_groups(uid_t uid, const std::string& cache) 
     return gids;
 }
 std::vector<CpuCore> cpu_cores(const std::string& root) {
-    std::vector<int> indices;
-    if (DIR* dir = opendir(root.c_str())) {
-        static const std::regex pattern("cpu[0-9]+");
-        while (const auto* entry = readdir(dir)) {
-            const std::string name = entry->d_name;
-            struct stat info{};
-            if (!std::regex_match(name, pattern) || stat((root + "/" + name).c_str(), &info) != 0 || !S_ISDIR(info.st_mode)) continue;
-            if (const auto index = java_int(name.substr(3))) indices.push_back(*index);
-        }
-        closedir(dir);
-    }
-    if (indices.empty()) {
-        const auto count = std::max<long>(1, sysconf(_SC_NPROCESSORS_ONLN));
-        for (long i = 0; i < count; ++i) indices.push_back(static_cast<int>(i));
-    } else std::sort(indices.begin(), indices.end());
-    std::vector<int64_t> frequencies, capacities;
-    int64_t fastest = 0;
-    for (const auto index : indices) {
-        const auto cpu = root + "/cpu" + std::to_string(index);
-        auto frequency = read_long(cpu + "/cpufreq/cpuinfo_max_freq");
-        if (frequency <= 0) frequency = read_long(cpu + "/cpufreq/scaling_max_freq");
-        frequencies.push_back(frequency);
-        capacities.push_back(read_long(cpu + "/cpu_capacity"));
-        fastest = std::max(fastest, frequency);
-    }
     std::vector<CpuCore> result;
-    for (size_t i = 0; i < indices.size(); ++i) {
-        auto capacity = capacities[i];
-        // No cpu_capacity: the frequency ratio, as arm64 without DT capacities.
-        if (capacity <= 0 && frequencies[i] > 0 && fastest > 0)
-            capacity = std::max<int64_t>(1, std::llround(1024.0 * static_cast<double>(frequencies[i]) / static_cast<double>(fastest)));
-        result.push_back({indices[i], capacity});
-    }
+    const auto fallback = static_cast<int>(std::clamp<long>(sysconf(_SC_NPROCESSORS_ONLN), 1, 4096));
+    for (const auto& core : read_cpu_topology(root, fallback)) result.push_back({core.index, core.capacity});
     return result;
 }
 HostFacts probe_host(const HostProbe& probe) {
     HostFacts host;
-    host.has_kvm = exists("/dev/kvm");
-    host.has_gunyah = exists("/dev/gunyah");
-    host.has_gzvm = exists("/dev/gzvm");
+    const auto devices = probe_host_devices(data_dir);
+    host.has_kvm = devices.kvm.value_or(false);
+    host.has_gunyah = devices.gunyah.value_or(false);
+    host.has_gzvm = devices.geniezone.value_or(false);
     host.soc_name = host_soc_name();
     host.app_uid = static_cast<int>(probe.app_uid);
     if (host.app_uid > 0) host.app_gids = app_groups(probe.app_uid, probe.gid_cache);
@@ -202,8 +152,8 @@ HostFacts probe_host(const HostProbe& probe) {
     host.strace_prebuilt_exists = exists(data_dir + "/usr/bin/strace");
     host.strace_in_path = find_in_path("strace");
     host.optimize_sdcard = probe.optimize_sdcard;
-    host.turnip_exists = exists(data_dir + "/usr/lib/libvulkan_freedreno.so");
-    host.system_vulkan_hal = vulkan_hal();
+    host.turnip_exists = devices.turnip.value_or(false);
+    host.system_vulkan_hal = devices.system_vulkan_hal;
     host.viosnd_dump_exists = exists("/data/local/tmp/viosnd_dump");
     return host;
 }

@@ -7,6 +7,7 @@
 #include "usb/rules_file.h"
 #include "usb/watch.h"
 #include "usb/worker.h"
+#include "vm/observation.h"
 #include <json/json.h>
 #include <chrono>
 #include <functional>
@@ -28,6 +29,7 @@ struct UsbVm {
     // instance exists; nullopt for QEMU (its socket is QMP) and when stopped.
     std::optional<std::string> control_socket;
     Json::Value config; // the migrated item: its peripherals list the xHCI controllers
+    std::optional<vm::Observation> observed, expected;
 };
 class UsbVms {
 public:
@@ -66,6 +68,8 @@ struct UsbOptions {
     std::shared_ptr<SysfsWriter> writer;    // null = real writes
     std::function<void(const Json::Value& data)> publish; // LegacyEvents::publish
     std::function<void(const char* level, const std::string& message)> log;
+    // Optional fault observer for the existing JsonFile durable boundaries.
+    config::JsonFile::Observer rules_observer;
     UsbTiming timing;
 };
 
@@ -89,7 +93,26 @@ public:
     Json::Value usb_attach(const Json::Value& params);
     Json::Value usb_detach(const Json::Value& params);
     Json::Value usb_host_list(const Json::Value& params);
+    // Read-only Web catalogue: fresh inventory, no leftover recovery or writes.
+    Json::Value host_catalog();
+    // Validate the fresh native catalogue on the mutation worker immediately
+    // before applying a target. Internal adapters only; validation must be
+    // bounded, read-only and must throw to reject a stale observation.
+    Json::Value set_target_checked(const Json::Value& params,
+        std::function<void(const Json::Value&)> validate,
+        std::optional<vm::Observation> expected_vm = std::nullopt);
     Json::Value usb_rules_get(const Json::Value& params);
+    // Internal Web adapter boundary. Revision covers all accepted rule changes,
+    // including legacy App writes. A failed save may already be active: callers
+    // must read the snapshot after commit_uncertain, never retry blindly.
+    Json::Value rules_snapshot() const;
+    // Rule targets include stopped VMs. Only the first controller is supported
+    // by the current native control channel; this performs no device scan.
+    Json::Value rule_targets() const;
+    // Version-bound observation only: no scan_host/leftover recovery, worker
+    // scheduling, driver writes, attachment, or changes to engine flags.
+    Json::Value rules_preview(const std::string& expected_revision) const;
+    Json::Value set_rules_checked(const Json::Value& rules, const std::string& expected_revision);
     Json::Value usb_rules_set(const Json::Value& params);
     Json::Value usb_rules_test(const Json::Value& params);
     Json::Value usb_set_target(const Json::Value& params);
@@ -134,6 +157,10 @@ private:
     std::map<std::string, int> stop_epochs_;
     Leftovers leftovers_;
     RuleEngine engine_;
+    std::string rules_revision_;
+    enum class RulesPersistence { unpersisted, pending, persisted, uncertain };
+    RulesPersistence rules_persistence_ = RulesPersistence::unpersisted;
+    Json::Value rules_state_locked() const;
     Worker::Cancel pending_auto_;
     // UsbHostInventory
     std::mutex rescan_mutex_, watch_mutex_;
@@ -151,6 +178,8 @@ private:
     StateOf state_fn() const { return [this](const std::string& vm) { return state_of(vm); }; }
     HasController controller_fn() const { return [this](const std::string& vm, const std::optional<std::string>& c) { return vm_has_controller(vm, c); }; }
     Scheduler scheduler();
+    Json::Value mutate(std::function<Json::Value()> operation);
+    Json::Value target_request(const Json::Value& params, const std::optional<vm::Observation>& expected);
     void schedule(std::function<void()> task, std::chrono::milliseconds delay = std::chrono::milliseconds(0));
     // inventory
     std::vector<HostDevice> scan() const;
@@ -162,11 +191,11 @@ private:
     bool set_authorized(const std::string& sysfs);
     std::vector<std::string> authorize_what_an_older_build_hid();
     void await_interfaces(const std::vector<std::string>& devices);
-    Json::Value host_list();
+    Json::Value host_list(bool recover = true);
     Json::Value test_rules();
     Json::Value vm_list(const std::string& vm_id) const;
     std::optional<std::string> attached_controller(const std::string& sysfs) const;
-    int set_rules(const Json::Value& json);
+    int set_rules(const Json::Value& json, const std::optional<std::string>& expected_revision = std::nullopt);
     int attach(const UsbVm& vm, const std::string& sysfs);
     int attach(const UsbVm& vm, const std::string& sysfs, const std::optional<std::string>& wanted, const std::optional<Decision>& rule);
     HostDevice read_unlisted_device(const std::string& sysfs) const;

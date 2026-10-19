@@ -31,6 +31,9 @@ public:
     virtual void detach(const Json::Value&, const std::string&) {}
     virtual Json::Value forward_failures() const { return Json::Value(Json::objectValue); }
     virtual Json::Value tool_log(const std::string&) const { return {}; }
+    // Actual helper leases, never configured reservations. Worker-only I/O;
+    // null means unsupported/unavailable rather than an empty observed set.
+    virtual Json::Value dhcp_leases() const { return {}; }
     // network_info of a running network: the InfoHandler live lists and the
     // backend's appendInfo fields. Read failures leave a list empty.
     virtual void live_details(Json::Value& data) const {

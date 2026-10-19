@@ -83,6 +83,7 @@ std::shared_ptr<NetworkConfigService::State> NetworkConfigService::decode(Json::
     auto& rows = document["networks"];
     if (rows.size() > 1024) throw ServiceError(ErrorCode::resource_exhausted, "Network configuration limit exceeded");
     auto result = std::make_shared<State>();
+    result->revision = random_id(true);
     std::set<std::string> names;
     for (Json::ArrayIndex i = 0; i < rows.size(); ++i) {
         auto& row = rows[i];
@@ -138,13 +139,22 @@ Json::Value NetworkConfigService::list(const CallContext& caller) const {
     for (auto index : indices) result.append(current->document["networks"][index]);
     return result;
 }
+NetworkConfigService::Snapshot NetworkConfigService::snapshot(const CallContext& caller) const {
+    access(caller);
+    auto admission = ConfigurationGate::enter(gate_);
+    auto current = state();
+    return {current->active, current->revision};
+}
 Json::Value NetworkConfigService::get(const CallContext& caller, const std::string& id) const {
+    return get_with_revision(caller, id).config;
+}
+NetworkConfigService::Snapshot NetworkConfigService::get_with_revision(const CallContext& caller, const std::string& id) const {
     access(caller);
     auto admission = ConfigurationGate::enter(gate_);
     auto current = state();
     auto found = current->ids.find(identity(id));
     if (found == current->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
-    return current->document["networks"][found->second];
+    return {current->document["networks"][found->second], current->revision};
 }
 bool NetworkConfigService::exists(const CallContext& caller, const std::string& id) const {
     access(caller);
@@ -177,7 +187,8 @@ bool NetworkConfigService::remove(const CallContext& caller, const std::string& 
     install(decode(std::move(document), false));
     return true;
 }
-Json::Value NetworkConfigService::merge_if_matches(const CallContext& caller, const Json::Value& operations) {
+Json::Value NetworkConfigService::merge_if_matches(const CallContext& caller, const Json::Value& operations,
+        const std::string& expected_revision) {
     access(caller);
     auto admission = ConfigurationGate::enter(gate_);
     if (!operations.isArray() || operations.size() > 1024)
@@ -208,9 +219,11 @@ Json::Value NetworkConfigService::merge_if_matches(const CallContext& caller, co
         edits.push_back({std::move(id), std::move(value), &operation["expected"]});
     }
     Json::Value changed(Json::arrayValue);
-    if (edits.empty()) return changed;
     std::lock_guard writer(writer_mutex_);
     const auto previous = state();
+    if (!expected_revision.empty() && previous->revision != expected_revision)
+        throw ServiceError(ErrorCode::conflict, "Network configuration changed; preview the backup again");
+    if (edits.empty()) return changed;
     auto document = previous->document;
     auto& rows = document["networks"];
     std::vector<Json::ArrayIndex> changed_indices;
@@ -250,13 +263,15 @@ void NetworkConfigService::require_stopped(const std::string& id) const {
     if (runtime_->ids.contains(id)) throw ServiceError(ErrorCode::conflict, "Network configuration is reserved by runtime");
 }
 std::unique_ptr<NetworkRuntimeLease> NetworkConfigService::prepare_runtime(const CallContext& caller,
-        const std::string& input_id, const std::set<uint32_t>& occupied_tables) {
+        const std::string& input_id, const std::set<uint32_t>& occupied_tables, const std::string& expected_revision) {
     access(caller);
     auto admission = ConfigurationGate::enter(gate_);
     const auto id = identity(input_id);
     std::lock_guard writer(writer_mutex_);
     require_stopped(id);
     const auto previous = state();
+    if (!expected_revision.empty() && previous->revision != expected_revision)
+        throw ServiceError(ErrorCode::conflict, "Network configuration changed; reload before starting");
     const auto found = previous->ids.find(id);
     if (found == previous->ids.end()) throw ServiceError(ErrorCode::not_found, "Network not found");
     auto document = previous->document;

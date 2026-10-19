@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "vm/boot_plan.h"
+#include "vm/vnc_stream.h"
 #include <json/json.h>
 #include <cstdint>
 #include <map>
@@ -84,6 +85,7 @@ struct CrosvmLaunch {
     bool input_bridge = false; // isInputBridgeNeeded()
     std::vector<std::string> touch_screens, native_input_screens; // touchscreenScreens()/nativeInputScreens()
     std::vector<InputSocket> input_sockets; // every socket the input bridge pre-binds
+    std::vector<VncEndpoint> vnc_endpoints; // Exact listeners emitted by this launch.
 };
 // Expects droidvm::config::migrate_vm output. Throws std::runtime_error or
 // std::invalid_argument where the Java start would fail.

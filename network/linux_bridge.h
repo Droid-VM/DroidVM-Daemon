@@ -49,6 +49,7 @@ public:
     void detach(const Json::Value& nic, const std::string& tap) override;
     Json::Value forward_failures() const override;
     void live_details(Json::Value& data) const override;
+    Json::Value dhcp_leases() const override;
     bool pd_action(int vlan, bool release) override;
     bool manual_address(const std::string& cidr, bool add) override;
     bool manual_port(const std::string& name, bool add) override;

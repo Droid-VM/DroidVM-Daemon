@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "usb/service.h"
+#include "common/identity.h"
+#include "services/context.h"
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include <algorithm>
@@ -38,10 +40,11 @@ UsbService::UsbService(UsbOptions options)
     : options_(std::move(options)),
       devices_(strip(options_.sys_root) + "/bus/usb/devices"), drivers_(strip(options_.sys_root) + "/bus/usb/drivers"),
       probe_path_(strip(options_.sys_root) + "/bus/usb/drivers_probe"), autoprobe_path_(strip(options_.sys_root) + "/bus/usb/drivers_autoprobe"),
-      rules_file_(options_.files_dir, [this](const char* level, const std::string& message) { log(level, message); }),
+      rules_file_(options_.files_dir, [this](const char* level, const std::string& message) { log(level, message); }, options_.rules_observer),
       writer_(options_.writer ? options_.writer : std::make_shared<SysfsWriter>()),
       probe_(devices_, [this](const std::string& name) { drivers_probe(name); }, options_.timing.interfaces_timeout,
-             options_.timing.interfaces_poll, [this] { return worker_.interrupted(); }) {}
+             options_.timing.interfaces_poll, [this] { return worker_.interrupted(); }),
+      rules_revision_(random_id(false)) {}
 UsbService::~UsbService() {
     // Workers first: their tasks use every member below them.
     if (options_.watch) options_.watch->stop();
@@ -132,9 +135,13 @@ void UsbService::schedule_rescan(bool buses_moved) {
 
 // --- start / shutdown ---
 void UsbService::load_rules() {
-    auto rules = rules_file_.load();
+    bool persisted = false;
+    auto rules = rules_file_.load(&persisted);
+    auto revision = random_id(false);
     std::lock_guard lock(lock_);
     engine_.set_rules(std::move(rules));
+    rules_revision_ = std::move(revision);
+    rules_persistence_ = persisted ? RulesPersistence::persisted : RulesPersistence::unpersisted;
 }
 void UsbService::start() {
     try {
@@ -210,6 +217,10 @@ bool UsbService::set_authorized(const std::string& sysfs) {
     return false;
 }
 void UsbService::set_autoprobe(bool autoprobe) {
+    // A rule save already in flight may reach this after shutdown opened the
+    // gate. Serialize the write with shutdown's flag and never close it again.
+    std::lock_guard lock(lock_);
+    if (shut_down_) autoprobe = true;
     const auto error = writer_->write(autoprobe_path_, autoprobe ? "1" : "0");
     if (error.empty()) log("I", std::string("USB drivers_autoprobe = ") + (autoprobe ? "1" : "0"));
     else log("W", "Cannot write " + autoprobe_path_ + ": " + error);
@@ -248,10 +259,10 @@ Json::Value UsbService::test_row(const HostDevice& device, const Attachment* att
     obj["result"] = decision ? decision_json(*decision) : Json::Value();
     return obj;
 }
-Json::Value UsbService::host_list() {
+Json::Value UsbService::host_list(bool recover) {
     Json::Value array(Json::arrayValue);
     // A fresh scan: driver binds move no node, so the snapshot goes stale.
-    for (const auto& device : scan_host()) {
+    for (const auto& device : recover ? scan_host() : scan()) {
         if (device.is_hub()) continue;
         std::optional<Attachment> attachment;
         bool locked;
@@ -300,28 +311,52 @@ std::optional<std::string> UsbService::attached_controller(const std::string& sy
 }
 
 // --- rules ---
-int UsbService::set_rules(const Json::Value& json) {
+int UsbService::set_rules(const Json::Value& json, const std::optional<std::string>& expected_revision) {
     // A VM it knows about; the controller is not checked (see legacy targetExists).
     auto rules = Rules::from_json(json, [this](const std::string& vm, const std::optional<std::string>&) { return find_vm(vm).has_value(); });
+    auto active_rules = rules;
+    auto revision = random_id(false);
     SaveOwes owed;
     {
         std::lock_guard lock(lock_);
+        if (expected_revision) {
+            if (!started_ || shut_down_) throw ServiceError(ErrorCode::unavailable, "USB manager unavailable");
+            if (options_.files_dir.empty()) throw ServiceError(ErrorCode::unavailable, "USB rules persistence unavailable");
+            if (*expected_revision != rules_revision_) throw ServiceError(ErrorCode::conflict, "USB rules changed");
+        }
         owed = engine_.save_owes(rules);
-        engine_.set_rules(rules);
+        engine_.set_rules(std::move(active_rules));
+        rules_revision_ = std::move(revision);
+        rules_persistence_ = RulesPersistence::pending;
     }
-    try { rules_file_.save(rules); } catch (const std::exception& error) {
+    auto persistence = RulesPersistence::unpersisted;
+    try { if (rules_file_.save(rules)) persistence = RulesPersistence::persisted; }
+    catch (const config::CommitError& error) {
+        if (error.installed) persistence = RulesPersistence::uncertain;
+        log("W", "Failed to write " + rules_file_.path() + ": " + error.what());
+    } catch (const std::exception& error) {
         // The rules are in force regardless; only the copy for the next start is missing.
         log("W", "Failed to write " + rules_file_.path() + ": " + error.what());
     }
+    { std::lock_guard lock(lock_); rules_persistence_ = persistence; }
     log("I", std::string("USB rules set: enabled=") + (rules.enabled() ? "true" : "false") +
         " exact=" + std::to_string(rules.layer(Layer::exact).size()) + " port=" + std::to_string(rules.layer(Layer::port).size()) +
         " device=" + std::to_string(rules.layer(Layer::device).size()) + " any=" + std::to_string(rules.layer(Layer::any).size()));
-    set_autoprobe(!rules.enabled());
-    switch (owed) {
-    case SaveOwes::release: return release_everything_and_wait();
-    case SaveOwes::nothing: return 0;
-    default: return run_auto_attach_and_wait("rules");
+    int applied = 0;
+    try {
+        set_autoprobe(!rules.enabled());
+        switch (owed) {
+        case SaveOwes::release: applied = release_everything_and_wait(); break;
+        case SaveOwes::nothing: break;
+        default: applied = run_auto_attach_and_wait("rules"); break;
+        }
+    } catch (const std::exception&) {
+        if (expected_revision) throw ServiceError(ErrorCode::commit_uncertain, "USB rules changed but device application failed; read current state");
+        throw;
     }
+    if (expected_revision && persistence != RulesPersistence::persisted)
+        throw ServiceError(ErrorCode::commit_uncertain, "USB rules are active but persistence was not confirmed; read current state");
+    return applied;
 }
 
 // --- attach / detach ---
@@ -332,6 +367,8 @@ int UsbService::attach(const UsbVm& vm, const std::string& sysfs) {
 int UsbService::attach(const UsbVm& requested, const std::string& sysfs, const std::optional<std::string>& wanted, const std::optional<Decision>& rule) {
     // The legacy instance is live: read the VM as it is now.
     const auto live = find_vm(requested.id);
+    if (requested.expected && (!live || live->observed != requested.expected))
+        throw ServiceError(ErrorCode::conflict, "USB target VM changed");
     const UsbVm& vm = live ? *live : requested;
     if (vm.state != VmState::running) throw RequestError("VM is not running");
     const auto controller = find_controller(vm.config, wanted);
@@ -1035,7 +1072,26 @@ void UsbService::broadcast(const char* event, Json::Value data) {
 }
 
 // --- handlers (ipc/usb/*Handler) ---
+Json::Value UsbService::mutate(std::function<Json::Value()> operation) {
+    auto result = worker_.submit([this, operation = std::move(operation)] {
+        { std::lock_guard lock(lock_); if (shut_down_) throw RequestError("USB manager stopped"); }
+        return operation();
+    });
+    if (!result) throw RequestError("USB manager stopped");
+    return std::move(*result);
+}
+Json::Value UsbService::set_target_checked(const Json::Value& params,
+    std::function<void(const Json::Value&)> validate, std::optional<vm::Observation> expected_vm) {
+    if (!validate) throw std::invalid_argument("Missing USB observation validator");
+    return mutate([this, params, validate = std::move(validate), expected_vm] {
+        const auto catalogue = host_catalog();
+        if (!catalogue["available"].asBool()) throw RequestError("USB manager unavailable");
+        validate(catalogue);
+        return target_request(params, expected_vm);
+    });
+}
 Json::Value UsbService::usb_attach(const Json::Value& params) {
+    if (!worker_.on_worker()) return mutate([this, params] { return usb_attach(params); });
     const auto vm_id = opt_string(params, "vm_id", "");
     if (vm_id.empty()) throw RequestError("missing vm_id");
     const auto vm = find_vm(vm_id);
@@ -1051,6 +1107,7 @@ Json::Value UsbService::usb_attach(const Json::Value& params) {
     return res;
 }
 Json::Value UsbService::usb_detach(const Json::Value& params) {
+    if (!worker_.on_worker()) return mutate([this, params] { return usb_detach(params); });
     const auto vm_id = opt_string(params, "vm_id", "");
     if (vm_id.empty()) throw RequestError("missing vm_id");
     const auto vm = find_vm(vm_id);
@@ -1068,13 +1125,129 @@ Json::Value UsbService::usb_host_list(const Json::Value&) {
     res["devices"] = host_list();
     return res;
 }
+Json::Value UsbService::host_catalog() {
+    Json::Value result(Json::objectValue);
+    bool available;
+    { std::lock_guard lock(lock_); available = started_ && !shut_down_; }
+    available = available && is_directory(devices_);
+    result["available"] = available;
+    result["devices"] = available ? host_list(false) : Json::Value(Json::arrayValue);
+    result["targets"] = Json::Value(Json::arrayValue);
+    if (available && options_.vms) for (const auto& vm : options_.vms->list()) {
+        const auto controller = find_controller(vm.config, std::nullopt);
+        if (vm.state != VmState::running || !vm.control_socket || !controller || !vm.observed) continue;
+        Json::Value target;
+        target["vmId"] = vm.id; target["vmName"] = vm.name;
+        target["instanceId"] = vm.observed->instance;
+        target["revision"] = std::to_string(vm.observed->revision);
+        target["controllerId"] = *controller;
+        result["targets"].append(std::move(target));
+    }
+    return result;
+}
 Json::Value UsbService::usb_rules_get(const Json::Value&) {
     Json::Value res(Json::objectValue);
     std::lock_guard lock(lock_);
     res["rules"] = engine_.rules().to_json();
     return res;
 }
+Json::Value UsbService::rules_state_locked() const {
+    Json::Value result;
+    result["available"] = started_ && !shut_down_;
+    result["revision"] = rules_revision_;
+    switch (rules_persistence_) {
+    case RulesPersistence::persisted: result["persistence"] = "persisted"; break;
+    case RulesPersistence::pending: result["persistence"] = "pending"; break;
+    case RulesPersistence::uncertain: result["persistence"] = "uncertain"; break;
+    default: result["persistence"] = "unpersisted"; break;
+    }
+    return result;
+}
+Json::Value UsbService::rules_snapshot() const {
+    std::lock_guard lock(lock_);
+    auto result = rules_state_locked();
+    result["rules"] = engine_.rules().to_json();
+    return result;
+}
+Json::Value UsbService::rules_preview(const std::string& expected_revision) const {
+    RuleEngine engine;
+    std::map<std::string, Attachment> attachments;
+    Json::Value result;
+    {
+        std::lock_guard lock(lock_);
+        if (!started_ || shut_down_ || rules_persistence_ == RulesPersistence::pending)
+            throw ServiceError(ErrorCode::unavailable, "USB rules unavailable");
+        if (expected_revision != rules_revision_)
+            throw ServiceError(ErrorCode::conflict, "USB rules changed");
+        engine = engine_;
+        attachments = attachments_;
+        result = rules_state_locked();
+    }
+    if (!is_directory(devices_)) throw ServiceError(ErrorCode::unavailable, "USB inventory unavailable");
+    const auto devices = scan(); // Deliberately excludes notice_leftovers and the inventory worker.
+    size_t rules = 0;
+    for (auto layer : layers) rules += engine.rules().layer(layer).size();
+    if (devices.size() > 4096 || (rules && devices.size() > (4u << 20) / rules))
+        throw ServiceError(ErrorCode::resource_exhausted, "USB preview exceeds evaluation limit");
+    std::map<std::string, UsbVm> vms;
+    if (options_.vms) for (auto vm : options_.vms->list()) vms.emplace(vm.id, std::move(vm));
+    const StateOf states = [&](const std::string& vm) -> std::optional<VmState> {
+        const auto found = vms.find(vm);
+        return found == vms.end() ? std::nullopt : std::optional(found->second.state);
+    };
+    const HasController controllers = [&](const std::string& vm, const std::optional<std::string>& controller) {
+        const auto found = vms.find(vm);
+        return found != vms.end() && find_controller(found->second.config, controller).has_value();
+    };
+    result["enabled"] = engine.rules_enabled();
+    result["devices"] = Json::Value(Json::arrayValue);
+    for (const auto& device : devices) {
+        if (device.is_hub()) continue;
+        const auto found = attachments.find(device.sysfs);
+        auto row = host_row(device, found == attachments.end() ? nullptr : &found->second,
+            engine.is_locked(device.sysfs, device.devnum));
+        const auto subject = device.engine();
+        const auto decision = engine.decide(subject, states, controllers);
+        row["result"] = decision ? decision_json(*decision) : Json::Value();
+        row["eligible"] = engine.rules_enabled() && engine.is_candidate(subject);
+        result["devices"].append(std::move(row));
+    }
+    {
+        std::lock_guard lock(lock_);
+        if (!started_ || shut_down_ || rules_persistence_ == RulesPersistence::pending)
+            throw ServiceError(ErrorCode::unavailable, "USB manager unavailable");
+        if (rules_revision_ != expected_revision)
+            throw ServiceError(ErrorCode::conflict, "USB rules changed during preview");
+    }
+    return result;
+}
+Json::Value UsbService::set_rules_checked(const Json::Value& rules, const std::string& expected_revision) {
+    if (!rules.isObject() || expected_revision.empty() || expected_revision.size() > 128)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid USB rules or revision");
+    try {
+        return mutate([this, rules, expected_revision] {
+            int applied;
+            try { applied = set_rules(rules, expected_revision); }
+            catch (const RequestError&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid USB rules"); }
+            auto result = rules_snapshot();
+            result["applied"] = applied;
+            return result;
+        });
+    } catch (const RequestError&) { throw ServiceError(ErrorCode::unavailable, "USB manager stopped"); }
+}
+Json::Value UsbService::rule_targets() const {
+    { std::lock_guard lock(lock_); if (!started_ || shut_down_) throw ServiceError(ErrorCode::unavailable, "USB manager unavailable"); }
+    Json::Value rows(Json::arrayValue);
+    if (options_.vms) for (const auto& vm : options_.vms->list()) {
+        Json::Value row;
+        row["vmId"] = vm.id; row["vmName"] = vm.name;
+        row["controllerId"] = text_or_null(find_controller(vm.config, std::nullopt));
+        rows.append(std::move(row));
+    }
+    return rows;
+}
 Json::Value UsbService::usb_rules_set(const Json::Value& params) {
+    if (!worker_.on_worker()) return mutate([this, params] { return usb_rules_set(params); });
     if (!params.isObject() || !params["rules"].isObject()) throw RequestError("missing rules");
     const int applied = set_rules(params["rules"]);
     Json::Value res(Json::objectValue);
@@ -1088,16 +1261,22 @@ Json::Value UsbService::usb_rules_test(const Json::Value&) {
     return res;
 }
 Json::Value UsbService::usb_set_target(const Json::Value& params) {
+    if (!worker_.on_worker()) return mutate([this, params] { return usb_set_target(params); });
+    return target_request(params, std::nullopt);
+}
+Json::Value UsbService::target_request(const Json::Value& params, const std::optional<vm::Observation>& expected) {
     const auto device = opt_string(params, "device", "");
     if (device.empty()) throw RequestError("missing device");
     const auto wanted = opt_string(params, "target", "");
     const auto target = target_from_key(wanted);
     if (!target) throw RequestError("unknown target: " + wanted);
     const auto vm_id = opt_string(params, "vm_id", "");
-    const auto inst = vm_id.empty() ? std::nullopt : find_vm(vm_id);
+    auto inst = vm_id.empty() ? std::nullopt : find_vm(vm_id);
     if (*target == Target::vm) {
         if (vm_id.empty()) throw RequestError("missing vm_id");
         if (!inst) throw RequestError("VM not found: " + vm_id);
+        if (expected && inst->observed != expected) throw ServiceError(ErrorCode::conflict, "USB target VM changed");
+        inst->expected = expected;
     }
     const auto controller = opt_string(params, "controller", "");
     return set_target(device, *target, *target == Target::vm ? inst : std::nullopt, controller.empty() ? std::nullopt : std::optional(controller));
