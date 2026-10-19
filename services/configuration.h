@@ -5,6 +5,7 @@
 #include "vm_config.h"
 #include "store/config_transaction.h"
 #include "store/disk_file_leases.h"
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -34,17 +35,37 @@ public:
     VmConfigService::Snapshot remove_network(const CallContext& caller, const std::string& vm_revision,
         const Json::Value& expected_network, NetworkService* lifecycle = nullptr);
     struct VmDiskResult { VmConfigService::Snapshot vms; DiskConfigService::Snapshot disks; };
+    struct Snapshot {
+        VmConfigService::Snapshot vms;
+        DiskConfigService::Snapshot disks;
+        NetworkConfigService::Snapshot networks; // Complete document, including inactive rows.
+    };
+    // One coherent observation under the common gate and all domain writers.
+    Snapshot snapshot(const CallContext& caller) const;
+    // Short file-publication boundary only: drain VM admission and configuration
+    // writers, reject every saved reference to the target, then publish. The
+    // callback must not re-enter configuration services or perform a long copy.
+    void with_unreferenced_disk_path(const CallContext& caller, const std::string& path,
+        const std::function<void()>& publish);
+    // Available even while the gate rejects new configuration observations.
+    bool recovery_required() const;
     // Internal registry transaction: no image create/rebase/unlink is authorized.
     // File-operation callers must add header/file leases before exposing an API.
     VmDiskResult replace_vm_disks(const CallContext& caller, const std::string& vm_revision,
         const std::string& disk_revision, Json::Value vms, Json::Value disks);
+    // Append one imported VM, its new disk rows and newly prepared networks in
+    // the existing durable transaction. Callers retain/sync extracted files.
+    VmDiskResult import_vm_disks_networks(const CallContext& caller, const std::string& vm_revision,
+        const std::string& disk_revision, const std::string& network_revision,
+        Json::Value vm, Json::Value disks, Json::Value added_networks);
     // Disk file operations hold registry rows while their images change. Edits
     // must not change/remove a held row or add children to an exclusively held
     // one, except the owner's own commit. Admission is serialized with registry
     // writers and requires the exact observed disk revision.
     using DiskReservation = std::shared_ptr<const void>;
     DiskReservation reserve_disks(const std::string& disk_revision,
-        const std::set<std::string>& exclusive, const std::set<std::string>& shared);
+        const std::set<std::string>& exclusive, const std::set<std::string>& shared,
+        const std::string& vm_revision = {});
     VmDiskResult replace_vm_disks(const CallContext& caller, const std::string& vm_revision,
         const std::string& disk_revision, Json::Value vms, Json::Value disks, const DiskReservation& owner);
     // Only an administrator may retry durable redo; this does not resubmit a
@@ -63,16 +84,28 @@ private:
     std::shared_ptr<NetworkConfigService::State> pending_network_;
     std::shared_ptr<DiskConfigSnapshot> pending_disk_;
     struct Reserved { const void* writer = nullptr; std::map<const void*, size_t> readers; };
-    mutable std::mutex reservations_mutex_;
-    std::map<std::string, Reserved> reservations_;
+    struct ReservationState {
+        std::mutex mutex;
+        std::map<std::string, Reserved> rows;
+        // Web confirmations freeze saved attachment slots in this family.
+        std::map<const void*, std::set<std::string>> references;
+    };
+    // Reservation destruction may follow coordinator teardown after failed VM
+    // cleanup. It must never call a dangling ConfigurationService pointer.
+    std::shared_ptr<ReservationState> reservation_state_ = std::make_shared<ReservationState>();
+    void check_reference_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const;
     void check_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const;
     void publish_pending();
     void commit_pending(const std::vector<config::ConfigTransaction::Update>& updates,
         ConfigurationCommit& runtime, ConfigurationGate::Transaction& exclusive);
-    void validate_vm_networks(const Json::Value& before, const Json::Value& after) const;
+    VmDiskResult replace_vm_disks_impl(const CallContext& caller, const std::string& vm_revision,
+        const std::string& disk_revision, Json::Value vms, Json::Value disks, const DiskReservation& owner,
+        const std::string& network_revision, const Json::Value* added_networks);
+    void validate_vm_networks(const Json::Value& before, const Json::Value& after,
+        const NetworkConfigService::State* projected = nullptr) const;
     void validate_vm_disks(const Json::Value& before, const Json::Value& after) const;
     void validate_vm_disks(const Json::Value& before, const Json::Value& after,
-        const Json::Value& old_disks, const Json::Value& new_disks) const;
+        const Json::Value& old_disks, const Json::Value& new_disks, const void* owner = nullptr) const;
     void validate_disk_change(const Json::Value& before, const Json::Value& after) const;
 };
 }

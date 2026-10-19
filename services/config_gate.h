@@ -67,8 +67,12 @@ public:
         ready_.wait(lock, [&] { return active_ == 0; });
         return Transaction(std::move(self));
     }
+    bool recovery_required() const {
+        std::lock_guard lock(mutex_);
+        return failed_;
+    }
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable ready_;
     size_t active_ = 0;
     bool exclusive_ = false, failed_ = false;

@@ -36,14 +36,22 @@ struct TaskView {
     std::string message;
     std::chrono::steady_clock::time_point created;
     std::optional<std::chrono::steady_clock::time_point> finished;
+    std::string request_id; // Public caller-chosen correlation, never a credential.
+    // Metadata only: raw results remain in bounded storage and are never copied
+    // into event/snapshot summaries. Failed/cancelled work may retain a receipt.
+    bool result_available = false;
 };
 // Public state projection. Large immutable results remain available through get.
 Json::Value task_summary(const TaskView& task);
 struct TaskSpec {
+    static constexpr size_t max_signature_bytes = 32u << 10;
     std::string kind, resource;
     size_t result_bytes = 64u << 10;
     bool cancellable = true;
     bool background = false;
+    // Optional bounded deduplication within the existing record retention. No
+    // new registry: matching owner/id/signature reuses the original task.
+    std::string request_id = {}, request_signature = {};
 };
 struct TaskLimits {
     size_t workers = 2, queued = 64, records = 256;
@@ -58,9 +66,9 @@ struct TaskCompletion {
     ErrorCode error = ErrorCode::internal;
     std::string message;
     static TaskCompletion success(Json::Value value = Json::Value());
-    static TaskCompletion failure(ErrorCode code, std::string public_message);
+    static TaskCompletion failure(ErrorCode code, std::string public_message, Json::Value value = {});
     // Only return after this operation's owned resources have been cleaned up.
-    static TaskCompletion cancelled();
+    static TaskCompletion cancelled(Json::Value value = {});
 };
 namespace task_detail { struct Shared; struct Record; }
 class TaskControl {
@@ -99,6 +107,17 @@ public:
     // The caller must separately bound captured input and completion storage.
     void post(const CallContext& caller, std::function<void(bool)> work);
     TaskView get(const CallContext& caller, const TaskRef& ref);
+    std::optional<TaskView> find_request(const CallContext& caller, const std::string& request_id);
+    // Administrative recovery only; never changes ownership or replays work.
+    std::optional<TaskView> find_request_for_recovery(const CallContext& caller, const std::string& request_id);
+    using ReceiptObserver = std::function<void(const TaskView&)>;
+    // Called on workers, outside the task lock, before work and after completion.
+    // A failing pre-work observer prevents side effects; final failure leaves an
+    // explicitly uncertain historical receipt. Configure before accepting work.
+    void observe_receipts(ReceiptObserver observer, std::string host_id,
+        std::function<Json::Value(const CallContext&, const std::string&)> lookup);
+    std::string receipt_host_id() const;
+    Json::Value receipt(const CallContext& caller, const std::string& request_id);
     TaskView cancel(const CallContext& caller, const TaskRef& ref);
     SnapshotPage snapshot(const CallContext& caller, size_t max_bytes = 256u << 10);
     // Trusted domain publication only: immutable active configuration rows,
@@ -114,6 +133,9 @@ public:
     SnapshotPage snapshot_page(const CallContext& caller, const std::string& id, size_t offset, size_t max_bytes = 256u << 10);
     void release_snapshot(const CallContext& caller, const std::string& id);
     std::string subscribe(const CallContext& caller, const EventCursor& cursor);
+    EventCursor event_cursor(const CallContext& caller);
+    // Runtime callbacks publish invalidation only; never acquire a VM lock here.
+    void publish_vm_runtime(const std::string& id) noexcept;
     EventBatch poll(const CallContext& caller, const std::string& id, size_t max_events = 64, size_t max_bytes = 256u << 10);
     void unsubscribe(const CallContext& caller, const std::string& id);
     // Reject new work, cancel queued work, request cooperative cancellation of

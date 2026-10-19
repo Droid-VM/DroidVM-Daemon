@@ -16,4 +16,5 @@ std::string stringify(const Json::Value& value, bool pretty = false);
 std::string stringify_bounded(const Json::Value& value, size_t max_bytes);
 // Canonical RFC 4648 base64, no whitespace, partial quartets or nonzero pad bits.
 std::string decode_base64(std::string_view text, size_t max_bytes);
+std::string encode_base64(std::string_view bytes);
 }

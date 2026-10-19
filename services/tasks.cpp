@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tasks.h"
-#include "vm_config.h"
-#include "disk_config.h"
+#include "config_snapshot.h"
 #include "common/identity.h"
 #include "common/wire.h"
 #include <algorithm>
@@ -36,6 +35,7 @@ Json::Value task_summary(const TaskView& task) {
     value["kind"] = task.kind;
     value["owner"] = task.owner;
     value["resource"] = task.resource;
+    if (!task.request_id.empty()) value["request_id"] = task.request_id;
     value["state"] = task_state_name(task.state);
     value["cancellable"] = task.cancellable;
     value["phase"] = task.progress.phase;
@@ -44,7 +44,7 @@ Json::Value task_summary(const TaskView& task) {
     if (task.progress.total) value["total"] = std::to_string(*task.progress.total);
     value["created_monotonic_ms"] = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(task.created.time_since_epoch()).count());
     if (task.finished) value["finished_monotonic_ms"] = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(task.finished->time_since_epoch()).count());
-    value["result_available"] = task.state == TaskState::succeeded;
+    value["result_available"] = task.result_available || task.state == TaskState::succeeded;
     if (task.error) {
         value["error"]["code"] = error_code_name(*task.error);
         value["error"]["message"] = task.message;
@@ -54,10 +54,10 @@ Json::Value task_summary(const TaskView& task) {
 TaskCompletion TaskCompletion::success(Json::Value value) {
     return {TaskState::succeeded, std::move(value), ErrorCode::internal, {}};
 }
-TaskCompletion TaskCompletion::failure(ErrorCode code, std::string message) {
-    return {TaskState::failed, {}, code, std::move(message)};
+TaskCompletion TaskCompletion::failure(ErrorCode code, std::string message, Json::Value value) {
+    return {TaskState::failed, std::move(value), code, std::move(message)};
 }
-TaskCompletion TaskCompletion::cancelled() { return {TaskState::cancelled, {}, ErrorCode::internal, {}}; }
+TaskCompletion TaskCompletion::cancelled(Json::Value value) { return {TaskState::cancelled, std::move(value), ErrorCode::internal, {}}; }
 
 namespace task_detail {
 // A quota for bounded metadata + encoded result storage, not an RSS promise.
@@ -68,6 +68,7 @@ struct Record {
     std::string encoded;
     size_t result_limit = 0, reservation = 0;
     bool operation_cancellable = true;
+    std::string request_signature;
 };
 struct Job { std::shared_ptr<Record> record; TaskService::Work work; std::function<void(bool)> direct; TaskService::Discarded discarded; };
 struct Shared {
@@ -85,6 +86,9 @@ struct Shared {
     std::deque<Job> background_queue;
     size_t reserved = 0;
     bool stopping = false;
+    TaskService::ReceiptObserver receipt_observer;
+    std::string receipt_host;
+    std::function<Json::Value(const CallContext&, const std::string&)> receipt_lookup;
     Shared(TaskLimits limits, TaskService::Now now, EventLimits event_limits)
         : events(event_limits, now), epoch(events.epoch()), limits(limits), now(std::move(now)) {}
     void changed(Record& record) noexcept {
@@ -134,7 +138,7 @@ task_detail::Record& find(task_detail::Shared& shared, const CallContext& caller
 }
 TaskView view(const task_detail::Record& record) {
     auto result = record.view;
-    if (result.state == TaskState::succeeded) result.result = wire::parse(record.encoded);
+    if (!record.encoded.empty()) result.result = wire::parse(record.encoded);
     return result;
 }
 }
@@ -189,6 +193,8 @@ struct TaskService::Impl {
         auto& queue = background ? shared->background_queue : shared->queue;
         for (;;) {
             task_detail::Job job;
+            ReceiptObserver observer;
+            TaskView starting;
             {
                 std::unique_lock lock(shared->mutex);
                 shared->ready.wait(lock, [&] { return shared->stopping || !queue.empty(); });
@@ -199,6 +205,8 @@ struct TaskService::Impl {
                     job.record->view.state = TaskState::running;
                     job.record->view.cancellable = job.record->operation_cancellable;
                     shared->changed(*job.record);
+                    observer = shared->receipt_observer;
+                    if (observer) starting = job.record->view;
                 }
             }
             if (job.direct) { try { job.direct(false); } catch (...) {} continue; }
@@ -206,8 +214,9 @@ struct TaskService::Impl {
             TaskCompletion completion = TaskCompletion::failure(ErrorCode::internal, "Task failed");
             std::string encoded;
             try {
+                if (observer) observer(starting);
                 completion = job.work(control);
-                if (completion.state == TaskState::succeeded) {
+                if (task_terminal(completion.state) && (completion.state == TaskState::succeeded || !completion.result.isNull())) {
                     try { encoded = wire::stringify_bounded(completion.result, job.record->result_limit); }
                     catch (const std::length_error&) {
                         completion = TaskCompletion::failure(ErrorCode::resource_exhausted, "Task result exceeds its reserved size");
@@ -222,6 +231,7 @@ struct TaskService::Impl {
             // Destroy domain captures before making their completed record eligible
             // for expiry. A callback destructor never runs under the service lock.
             job.work = {};
+            TaskView completed;
             {
                 std::lock_guard lock(shared->mutex);
                 auto& record = *job.record;
@@ -229,14 +239,18 @@ struct TaskService::Impl {
                 if ((completion.state == TaskState::succeeded && cancelling) ||
                     (completion.state == TaskState::cancelled && !cancelling) || !task_terminal(completion.state)) {
                     completion = TaskCompletion::failure(ErrorCode::internal, "Task did not acknowledge its cancellation state");
+                    encoded.clear();
                 }
-                if (completion.state == TaskState::succeeded) record.encoded.assign(encoded);
+                record.encoded.assign(encoded);
+                record.view.result_available = !encoded.empty();
                 if (completion.state == TaskState::failed) {
                     record.view.error = completion.error;
                     record.view.message = completion.message.substr(0, 512);
                 }
                 shared->finish(record, completion.state);
+                if (observer) completed = view(record);
             }
+            if (observer) { try { observer(completed); } catch (...) {} }
         }
     }
     void shutdown() {
@@ -277,12 +291,19 @@ TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work,
     auto& shared = *impl_->shared;
     if (spec.kind.empty() || spec.kind.size() > 64 || spec.resource.size() > 256 || !work ||
         spec.result_bytes < 4 || spec.result_bytes > shared.limits.max_result_bytes ||
-        (spec.background && !shared.limits.background_workers))
+        (spec.background && !shared.limits.background_workers) || spec.request_id.size() > 128 ||
+        spec.request_signature.size() > TaskSpec::max_signature_bytes || (spec.request_id.empty() != spec.request_signature.empty()))
         throw ServiceError(ErrorCode::invalid_argument, "Invalid task specification");
     std::unique_lock lock(shared.mutex);
     if (shared.stopping) throw ServiceError(ErrorCode::unavailable, "Task service is stopping");
     shared.reap();
-    const size_t reservation = task_detail::metadata_reservation + spec.result_bytes;
+    if (!spec.request_id.empty()) for (const auto& [id, existing] : shared.records) {
+        if (existing->view.owner != caller.principal || existing->view.request_id != spec.request_id) continue;
+        if (existing->view.kind != spec.kind || existing->view.resource != spec.resource || existing->request_signature != spec.request_signature)
+            throw ServiceError(ErrorCode::conflict, "Request ID already belongs to another operation");
+        return existing->view.ref;
+    }
+    const size_t reservation = task_detail::metadata_reservation + spec.result_bytes + spec.request_signature.size();
     if (shared.queue.size() + shared.background_queue.size() >= shared.limits.queued || shared.records.size() >= shared.limits.records ||
         reservation > shared.limits.retained_bytes - shared.reserved)
         throw ServiceError(ErrorCode::resource_exhausted, "Task capacity exhausted");
@@ -291,6 +312,8 @@ TaskRef TaskService::submit(const CallContext& caller, TaskSpec spec, Work work,
     record->view.kind = std::move(spec.kind);
     record->view.resource = std::move(spec.resource);
     record->view.owner = caller.principal;
+    record->view.request_id = std::move(spec.request_id);
+    record->request_signature = std::move(spec.request_signature);
     record->view.created = shared.now();
     record->operation_cancellable = spec.cancellable;
     record->result_limit = spec.result_bytes;
@@ -325,6 +348,50 @@ TaskView TaskService::get(const CallContext& caller, const TaskRef& ref) {
     auto& shared = *impl_->shared;
     std::lock_guard lock(shared.mutex);
     return view(find(shared, caller, ref));
+}
+std::optional<TaskView> TaskService::find_request(const CallContext& caller, const std::string& request_id) {
+    require_access(caller);
+    if (request_id.empty() || request_id.size() > 128) throw ServiceError(ErrorCode::invalid_argument, "Invalid request ID");
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    for (const auto& [id, record] : shared.records)
+        if (record->view.owner == caller.principal && record->view.request_id == request_id) return view(*record);
+    return {}; // Missing/expired does not prove that an operation never ran.
+}
+std::optional<TaskView> TaskService::find_request_for_recovery(const CallContext& caller, const std::string& request_id) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Recovery permission required");
+    if (request_id.empty() || request_id.size() > 128) throw ServiceError(ErrorCode::invalid_argument, "Invalid request ID");
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    std::optional<TaskView> result;
+    for (const auto& [id, record] : shared.records) if (record->view.request_id == request_id) {
+        if (result) throw ServiceError(ErrorCode::conflict, "Ambiguous recovery request");
+        result = view(*record);
+    }
+    return result;
+}
+void TaskService::observe_receipts(ReceiptObserver observer, std::string host_id,
+        std::function<Json::Value(const CallContext&, const std::string&)> lookup) {
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.receipt_observer = std::move(observer);
+    shared.receipt_host = std::move(host_id);
+    shared.receipt_lookup = std::move(lookup);
+}
+std::string TaskService::receipt_host_id() const {
+    std::lock_guard lock(impl_->shared->mutex);
+    return impl_->shared->receipt_host;
+}
+Json::Value TaskService::receipt(const CallContext& caller, const std::string& request_id) {
+    require_access(caller);
+    if (!caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Recovery permission required");
+    std::function<Json::Value(const CallContext&, const std::string&)> lookup;
+    { std::lock_guard lock(impl_->shared->mutex); lookup = impl_->shared->receipt_lookup; }
+    if (!lookup) throw ServiceError(ErrorCode::unavailable, "Recovery receipts unavailable");
+    return lookup(caller, request_id);
 }
 TaskView TaskService::cancel(const CallContext& caller, const TaskRef& ref) {
     require_access(caller);
@@ -426,6 +493,7 @@ SnapshotPage TaskService::network_config_document(const CallContext& caller, siz
     catch (const std::length_error&) { throw ServiceError(ErrorCode::resource_exhausted, "Network configuration exceeds document limit"); }
     Json::Value metadata;
     metadata["type"] = "metadata"; metadata["encoding"] = "base64-json";
+    metadata["resource"] = "networks";
     metadata["bytes"] = Json::UInt64(encoded->size());
     const EventScope scope{caller.principal, caller.administrator};
     auto id = shared.events.snapshot_document(scope, std::move(encoded), wire::stringify(metadata));
@@ -489,6 +557,18 @@ void TaskService::release_snapshot(const CallContext& caller, const std::string&
     auto& shared = *impl_->shared;
     std::lock_guard lock(shared.mutex);
     shared.events.release_snapshot({caller.principal, caller.administrator}, id);
+}
+EventCursor TaskService::event_cursor(const CallContext& caller) {
+    require_access(caller);
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.reap();
+    return {shared.events.epoch(), shared.events.sequence()};
+}
+void TaskService::publish_vm_runtime(const std::string& id) noexcept {
+    auto& shared = *impl_->shared;
+    std::lock_guard lock(shared.mutex);
+    shared.events.publish("vm.runtime.invalidated", id, "local-admin", Json::Value(), true);
 }
 std::string TaskService::subscribe(const CallContext& caller, const EventCursor& cursor) {
     require_access(caller);

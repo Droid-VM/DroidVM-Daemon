@@ -8,6 +8,20 @@
 #include <algorithm>
 
 namespace droidvm::wire {
+std::string encode_base64(std::string_view bytes) {
+    constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    encoded.reserve((bytes.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t value = static_cast<unsigned char>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) value |= static_cast<unsigned char>(bytes[i + 1]) << 8;
+        if (i + 2 < bytes.size()) value |= static_cast<unsigned char>(bytes[i + 2]);
+        encoded += alphabet[(value >> 18) & 63]; encoded += alphabet[(value >> 12) & 63];
+        encoded += i + 1 < bytes.size() ? alphabet[(value >> 6) & 63] : '=';
+        encoded += i + 2 < bytes.size() ? alphabet[value & 63] : '=';
+    }
+    return encoded;
+}
 std::string decode_base64(std::string_view text, size_t max_bytes) {
     if (text.size() % 4) throw std::invalid_argument("Invalid base64 length");
     if (text.size() / 4 > max_bytes / 3 + 1) throw std::length_error("Base64 exceeds chunk limit");

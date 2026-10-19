@@ -598,6 +598,57 @@ void network_delete_staging() {
     error(ErrorCode::not_found, [&] { uploads.abort_delete(admin, malformed); });
     check(calls == 1, "malformed payload never invokes deletion");
 }
+void usb_rules_staging() {
+    Temporary temp;
+    VmConfigService vms(temp.directory.get(), getuid());
+    ConfigUploads uploads(vms);
+    std::string revision = "usb-first";
+    Json::Value saved;
+    int writes = 0;
+    uploads.bind_usb_rules([&](const CallContext&) {
+        Json::Value result; result["available"] = true; result["revision"] = revision; return result;
+    }, [&](const CallContext&, const std::string& expected, const Json::Value& rules) {
+        if (revision != expected) throw ServiceError(ErrorCode::conflict, "USB rules changed");
+        ++writes; saved = rules; revision = "usb-next";
+        Json::Value result; result["revision"] = revision; result["persistence"] = "persisted"; return result;
+    });
+    Json::Value rules; rules["version"] = 1; rules["enabled"] = false;
+    rules["device"] = Json::Value(Json::arrayValue);
+    for (int i = 0; i < 2000; ++i) {
+        Json::Value rule; rule["id"] = "1234:abcd:" + std::to_string(i); rule["target"] = "host";
+        rules["device"].append(std::move(rule));
+    }
+    const auto bytes = config::encode_json(rules);
+    check(bytes.size() > ConfigUploads::chunk_bytes, "rules span multiple chunks");
+    error(ErrorCode::invalid_argument, [&] { uploads.begin_usb_rules(admin, revision, ConfigUploads::max_usb_rules_bytes + 1); });
+    error(ErrorCode::conflict, [&] { uploads.begin_usb_rules(admin, "stale", bytes.size()); });
+    const auto id = uploads.begin_usb_rules(admin, revision, bytes.size());
+    error(ErrorCode::permission_denied, [&] { uploads.append_usb_rules({"other", true, true, true}, id, 0, "x"); });
+    error(ErrorCode::not_found, [&] { uploads.append(admin, id, 0, "x"); });
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_usb_rules(admin, id); });
+    std::vector<std::string> held;
+    for (size_t i = 1; i < ConfigUploads::max_uploads; ++i) held.push_back(uploads.begin(admin, vms.snapshot(admin)->revision, 2));
+    error(ErrorCode::resource_exhausted, [&] { uploads.begin_usb_rules(admin, revision, 2); });
+    for (const auto& pending : held) uploads.abort(admin, pending);
+    for (size_t offset = 0; offset < bytes.size(); offset += ConfigUploads::chunk_bytes) {
+        const auto chunk = std::string_view(bytes).substr(offset, ConfigUploads::chunk_bytes);
+        check(uploads.append_usb_rules(admin, id, offset, chunk) == offset + chunk.size(), "rules append contiguous chunk");
+        check(uploads.append_usb_rules(admin, id, offset, chunk) == offset + chunk.size(), "rules duplicate chunk idempotent");
+    }
+    const auto result = uploads.commit_usb_rules(admin, id);
+    check(result["revision"] == revision && result["persistence"] == "persisted" && saved == rules && writes == 1, "rules full document committed once");
+    error(ErrorCode::not_found, [&] { uploads.commit_usb_rules(admin, id); });
+    const auto stale = uploads.begin_usb_rules(admin, revision, 2);
+    uploads.append_usb_rules(admin, stale, 0, "{}");
+    revision = "usb-other-client";
+    error(ErrorCode::conflict, [&] { uploads.commit_usb_rules(admin, stale); });
+    error(ErrorCode::not_found, [&] { uploads.abort_usb_rules(admin, stale); });
+    const auto malformed = uploads.begin_usb_rules(admin, revision, 2);
+    uploads.append_usb_rules(admin, malformed, 0, "[]");
+    error(ErrorCode::invalid_argument, [&] { uploads.commit_usb_rules(admin, malformed); });
+    error(ErrorCode::not_found, [&] { uploads.abort_usb_rules(admin, malformed); });
+    check(writes == 1, "stale and malformed uploads do not write");
+}
 void strict_base64_chunks() {
     check(wire::decode_base64("Zg==", 1) == "f" && wire::decode_base64("Zm8=", 2) == "fo" && wire::decode_base64("Zm9v", 3) == "foo", "canonical base64 padding");
     check(wire::decode_base64("AP+A", 3) == std::string("\0\xff\x80", 3), "base64 binary bytes");
@@ -634,6 +685,7 @@ int main(int argc, char** argv) {
         {"upload_limits_scope_offsets", upload_limits_scope_and_offsets}, {"upload_strict_parse_stale_revision", upload_strict_parse_and_stale_revision},
         {"upload_commit_faults_inflight_budget", upload_commit_faults_and_inflight_budget}, {"strict_base64_chunks", strict_base64_chunks},
         {"shared_upload_limits_domains", shared_upload_limits_and_domains},
+        {"usb_rules_staging", usb_rules_staging},
         {"network_upload_full_capacity_conflict", network_upload_full_capacity_and_conflict},
         {"network_upload_inflight_reservation", network_upload_inflight_reservation},
         {"network_delete_full_capacity_shared_staging", network_delete_staging}});

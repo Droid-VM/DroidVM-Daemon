@@ -76,6 +76,26 @@ void roundtrip_backup_recovery() {
     try { file.save(value(4)); } catch (const std::exception&) { failed = true; }
     check(failed, "no silent empty reset when both copies corrupt");
 }
+void credentials_never_recover_backup() {
+    Temporary temp;
+    JsonFile strict(temp.directory.get(), "sessions.json", getuid(), {}, JsonFile::max_bytes, JsonSyntax::strict, false);
+    strict.save(value(1)); strict.save(value(2));
+    check(unlinkat(temp.directory.get(), "sessions.json", 0) == 0, "remove credential primary");
+    check(!strict.load(), "missing credential primary never restores old authorization");
+    JsonFile ordinary(temp.directory.get(), "sessions.json", getuid());
+    check(ordinary.load()->recovered && ordinary.load()->value == value(1), "default policy still recovers missing primary");
+    strict.save(value(3));
+    check(strict.load()->value == value(3) && !strict.load()->recovered, "new credential primary can be saved without recovery");
+    temp.raw("sessions.json", "{broken");
+    bool read_failed = false, write_failed = false;
+    try { strict.load(); } catch (const std::exception&) { read_failed = true; }
+    try { strict.save(value(4)); } catch (const std::exception&) { write_failed = true; }
+    check(read_failed && write_failed, "corrupt credential primary refuses both load and save");
+    Fd corrupt(openat(temp.directory.get(), "sessions.json", O_RDONLY | O_CLOEXEC));
+    char bytes[8]{};
+    check(read(corrupt.get(), bytes, sizeof(bytes)) == 7 && std::string_view(bytes, 7) == "{broken", "failed credential save preserves damaged primary");
+    check(ordinary.load()->recovered && ordinary.load()->value == value(1), "default policy still recovers corrupt primary");
+}
 void crash_boundaries() {
     for (const char* stage : {"value_synced", "backup_synced", "before_install", "installed"}) {
         Temporary temp;
@@ -300,6 +320,7 @@ void bounds_and_path_refusal() {
 }
 int main() {
     return run({{"json_unknown_int64_backup_recovery", roundtrip_backup_recovery},
+                {"credentials_never_recover_backup", credentials_never_recover_backup},
                 {"four_process_crash_boundaries", crash_boundaries},
                 {"write_failure_and_post_rename_result", failed_writes_and_uncertain_commit},
                 {"twelve_transaction_sigkill_boundaries", transaction_crash_boundaries},

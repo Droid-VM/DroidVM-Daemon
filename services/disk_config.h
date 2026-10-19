@@ -2,17 +2,12 @@
 #pragma once
 #include "config_gate.h"
 #include "config_commit.h"
+#include "config_snapshot.h"
 #include "store/json_file.h"
 #include <memory>
 
 namespace droidvm {
 class TaskService;
-struct DiskConfigSnapshot {
-    Json::Value document;
-    std::shared_ptr<const std::string> encoded;
-    std::string revision;
-    bool persisted = false, recovered = false, durability_uncertain = false;
-};
 // Registry persistence only. The caller holds Instance and must coordinate VM
 // references, runtime/file leases and qcow2 headers before exposing mutations.
 // Never interprets a registry removal as permission to unlink a disk image.

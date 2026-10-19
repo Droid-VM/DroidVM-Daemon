@@ -13,6 +13,53 @@ void access(const CallContext& caller) {
     if (caller.principal.size() > 128) throw ServiceError(ErrorCode::invalid_argument, "Invalid principal");
 }
 }
+std::string ConfigUploads::begin_backup(const CallContext& caller, size_t bytes) {
+    access(caller);
+    if (!backup_preview_ || !backup_commit_) throw ServiceError(ErrorCode::unavailable, "Configuration backup is unavailable");
+    if (!bytes || bytes > max_backup_bytes) throw ServiceError(ErrorCode::invalid_argument, "Invalid backup upload size");
+    return begin_impl(caller, "", bytes, Kind::backup);
+}
+size_t ConfigUploads::append_backup(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+    return append_impl(caller, id, offset, bytes, Kind::backup);
+}
+Json::Value ConfigUploads::preview_backup(const CallContext& caller, const std::string& id) {
+    access(caller);
+    std::shared_ptr<Upload> upload;
+    {
+        std::lock_guard lock(mutex_);
+        upload = find(caller, id, Kind::backup);
+        if (upload->preview.isObject()) return upload->preview;
+        if (upload->data.size() != upload->total) throw ServiceError(ErrorCode::invalid_argument, "Upload is incomplete");
+        upload->committing = true; // Reserve immutable bytes throughout parsing.
+    }
+    try {
+        auto preview = backup_preview_(caller, {upload->data.data(), upload->data.size()});
+        preview["previewToken"] = random_id(true);
+        std::lock_guard lock(mutex_);
+        upload->preview = std::move(preview); upload->committing = false;
+        return upload->preview;
+    } catch (...) {
+        std::lock_guard lock(mutex_); upload->committing = false; throw;
+    }
+}
+Json::Value ConfigUploads::commit_backup(const CallContext& caller, const std::string& id, const std::string& preview_token) {
+    access(caller);
+    std::shared_ptr<Upload> upload;
+    {
+        std::lock_guard lock(mutex_);
+        upload = find(caller, id, Kind::backup);
+        if (preview_token.empty() || !upload->preview.isObject() || upload->preview["previewToken"] != preview_token)
+            throw ServiceError(ErrorCode::conflict, "Backup preview confirmation changed or missing");
+        upload->committing = true;
+    }
+    try {
+        auto result = backup_commit_(caller, {upload->data.data(), upload->data.size()}, upload->preview);
+        upload.reset(); finish(id); return result;
+    } catch (...) { upload.reset(); finish(id); throw; }
+}
+void ConfigUploads::abort_backup(const CallContext& caller, const std::string& id) {
+    abort_impl(caller, id, Kind::backup);
+}
 void ConfigUploads::reap() {
     const auto now = now_();
     for (auto it = uploads_.begin(); it != uploads_.end();) {
@@ -39,6 +86,34 @@ std::string ConfigUploads::begin(const CallContext& caller, const std::string& r
     if (!store_) throw ServiceError(ErrorCode::unavailable, "VM configuration is unavailable");
     if (store_->snapshot(caller)->revision != revision) throw ServiceError(ErrorCode::conflict, "VM configuration changed; reload before saving");
     return begin_impl(caller, revision, bytes, Kind::vm);
+}
+std::string ConfigUploads::begin_usb_rules(const CallContext& caller, const std::string& revision, size_t bytes) {
+    access(caller);
+    if (!usb_rules_read_ || !usb_rules_replace_) throw ServiceError(ErrorCode::unavailable, "USB rules are unavailable");
+    if (revision.empty() || revision.size() > 128 || !bytes || bytes > max_usb_rules_bytes)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid USB rules revision or size");
+    const auto current = usb_rules_read_(caller);
+    if (!current["available"].isBool() || !current["available"].asBool())
+        throw ServiceError(ErrorCode::unavailable, "USB manager unavailable");
+    if (current["revision"] != revision) throw ServiceError(ErrorCode::conflict, "USB rules changed; reload before saving");
+    return begin_impl(caller, revision, bytes, Kind::usb_rules);
+}
+size_t ConfigUploads::append_usb_rules(const CallContext& caller, const std::string& id, size_t offset, std::string_view bytes) {
+    return append_impl(caller, id, offset, bytes, Kind::usb_rules);
+}
+Json::Value ConfigUploads::commit_usb_rules(const CallContext& caller, const std::string& id) {
+    Json::Value result;
+    consume(caller, id, Kind::usb_rules, [&](const std::string& revision, std::string_view bytes) {
+        Json::Value rules;
+        try { rules = config::parse_json(bytes); }
+        catch (const std::invalid_argument&) { throw ServiceError(ErrorCode::invalid_argument, "Invalid uploaded USB rules JSON"); }
+        if (!rules.isObject()) throw ServiceError(ErrorCode::invalid_argument, "USB rules object required");
+        result = usb_rules_replace_(caller, revision, rules);
+    });
+    return result;
+}
+void ConfigUploads::abort_usb_rules(const CallContext& caller, const std::string& id) {
+    abort_impl(caller, id, Kind::usb_rules);
 }
 std::string ConfigUploads::begin_network(const CallContext& caller, size_t bytes) {
     access(caller);
@@ -164,6 +239,7 @@ size_t ConfigUploads::append_impl(const CallContext& caller, const std::string& 
     if (bytes.empty() || bytes.size() > chunk_bytes) throw ServiceError(ErrorCode::invalid_argument, "Invalid upload chunk size");
     std::lock_guard lock(mutex_);
     auto upload = find(caller, id, kind);
+    if (upload->preview.isObject()) throw ServiceError(ErrorCode::conflict, "A previewed backup cannot be changed");
     if (offset > upload->total || bytes.size() > upload->total - offset)
         throw ServiceError(ErrorCode::invalid_argument, "Chunk exceeds declared document size");
     if (offset < upload->data.size()) {

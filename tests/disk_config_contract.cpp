@@ -203,6 +203,31 @@ void leased_file_io() {
     error(ErrorCode::conflict, [&] { writer->open_file(path, true); });
     error(ErrorCode::conflict, [&] { pool.acquire({{path, true}}); });
 }
+void leased_write_sync() {
+    Temporary temp;
+    temp.raw("image", "original");
+    temp.raw("base", "backing");
+    const auto path = temp.path + "/image", base = temp.path + "/base";
+    config::DiskFileLeases pool;
+    auto lease = pool.acquire({{path, true}, {base, false}});
+    {
+        auto output = lease->open_file(path, true);
+        check(pwrite(output.get(), "UPDATED!", 8, 0) == 8, "write admitted inode before synchronization");
+    }
+    lease->sync_writes(); // Must skip the base: its lease forbids open_file(..., true).
+    error(ErrorCode::conflict, [&] { pool.acquire({{path, true}}); });
+    char bytes[8];
+    check(pread(lease->read_fd(path), bytes, 8, 0) == 8 && std::string(bytes, 8) == "UPDATED!",
+        "synchronization preserves original data and the active writer reservation");
+    check(rename(path.c_str(), (temp.path + "/moved").c_str()) == 0, "replace disk pathname before synchronization");
+    temp.raw("image", "replacement");
+    error(ErrorCode::conflict, [&] { lease->sync_writes(); });
+    lease.reset();
+    auto read_only = pool.acquire({{base, false}});
+    read_only->sync_writes(); // A read-only lease performs identity verification only.
+    check(unlink(base.c_str()) == 0, "remove read-only backing path");
+    error(ErrorCode::conflict, [&] { read_only->sync_writes(); });
+}
 void historical_structure_repair() {
     auto historical = document(); historical["disks"][0]["parent"] = "broken";
     auto next = historical; next["root_extension"] = "unrelated";
@@ -540,6 +565,7 @@ int main() {
         {"disk_file_leases_alias_batch_release", disk_file_leases},
         {"disk_lease_read_descriptor", leased_read_descriptor},
         {"disk_lease_file_io_permissions_identity", leased_file_io},
+        {"disk_lease_sync_admitted_writes", leased_write_sync},
         {"disk_start_chain_leases", disk_start_chain_leases},
         {"disk_historical_structure_repair", historical_structure_repair},
         {"disk_structure_long_chain_cycle", long_structure_chain},

@@ -100,12 +100,49 @@ ConfigurationService::ConfigurationService(int directory, uid_t owner, std::shar
     };
     exclusive.recovered();
 }
+bool ConfigurationService::recovery_required() const {
+    return gate_->recovery_required() || networks_->state()->durability_uncertain;
+}
+ConfigurationService::Snapshot ConfigurationService::snapshot(const CallContext& caller) const {
+    access(caller);
+    if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk configuration is unavailable");
+    auto admission = ConfigurationGate::enter(gate_);
+    std::lock_guard vm_writer(vms_->writer_mutex_);
+    std::lock_guard network_writer(networks_->writer_mutex_);
+    std::lock_guard disk_writer(disks_->writer_mutex_);
+    const auto networks = networks_->state();
+    return {vms_->state(), disks_->state(), {networks->document, networks->revision}};
+}
+void ConfigurationService::with_unreferenced_disk_path(const CallContext& caller, const std::string& path,
+        const std::function<void()>& publish) {
+    access(caller);
+    if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk configuration is unavailable");
+    if (!publish || path.empty() || path.front() != '/' || path.size() > 4096 || path.find('\0') != std::string::npos)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid image publication target");
+    auto exclusive = gate_->transaction(); exclusive.require_available();
+    std::lock_guard vm_writer(vms_->writer_mutex_);
+    std::lock_guard disk_writer(disks_->writer_mutex_);
+    const auto target = pkg::canonical_path(path);
+    const auto reject_reference = [&](const std::string& reference) {
+        if (!reference.empty() && (reference == path || pkg::canonical_path(reference) == target))
+            throw ServiceError(ErrorCode::conflict, "Image target is already referenced by a disk or virtual machine");
+    };
+    const auto disks = disks_->state();
+    for (const auto& row : disks->document["disks"]) reject_reference(config::disk_path(row));
+    const auto vms = vms_->state();
+    for (const auto& vm : vms->document["vms"]) {
+        const auto& slots = config::member(vm, "disks");
+        if (slots.isArray()) for (const auto& slot : slots) reject_reference(config::string(slot, "path"));
+    }
+    publish();
+}
 void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after) const {
     const auto registry = disks_->state();
     validate_vm_disks(before, after, registry->document, registry->document);
 }
 void ConfigurationService::validate_vm_disks(const Json::Value& before, const Json::Value& after,
-        const Json::Value& old_disks, const Json::Value& new_disks) const {
+        const Json::Value& old_disks, const Json::Value& new_disks, const void* owner) const {
+    check_reference_reservations(before, after, owner);
     const auto old_paths = config::valid_disk_paths(old_disks), new_paths = config::valid_disk_paths(new_disks);
     const auto old_readonly = config::disk_references(before, old_disks), new_readonly = config::disk_references(after, new_disks);
     auto unresolved = [&](const Json::Value& slot, const auto& paths, const auto& readonly) {
@@ -205,11 +242,13 @@ void ConfigurationService::validate_disk_change(const Json::Value& before, const
             throw ServiceError(ErrorCode::conflict, "Changing ancestry or descendants of a referenced disk requires a coordinated update");
     }
 }
-void ConfigurationService::validate_vm_networks(const Json::Value& before, const Json::Value& after) const {
+void ConfigurationService::validate_vm_networks(const Json::Value& before, const Json::Value& after,
+        const NetworkConfigService::State* projected) const {
     // Caller holds VM writer + admission. Deletion must drain that admission;
     // all other network writes preserve existing IDs. Do not re-enter the gate
     // or take network writer/inventory locks here (a transaction may be draining).
-    const auto networks = networks_->state();
+    const auto observed = networks_->state();
+    const auto* networks = projected ? projected : observed.get();
     auto unresolved = [&](const Json::Value& nic) {
         const auto& value = config::member(nic, "network_id");
         if (value.isNull() || (value.isString() && value.asString().empty())) return false;
@@ -331,7 +370,8 @@ std::map<std::string, Json::Value> disk_rows(const Json::Value& document) {
 }
 }
 void ConfigurationService::check_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const {
-    std::lock_guard lock(reservations_mutex_);
+    std::lock_guard lock(reservation_state_->mutex);
+    const auto& reservations_ = reservation_state_->rows;
     if (reservations_.empty()) return;
     const auto old_rows = disk_rows(before), new_rows = disk_rows(after);
     for (const auto& [id, held] : reservations_) {
@@ -352,8 +392,27 @@ void ConfigurationService::check_reservations(const Json::Value& before, const J
             throw ServiceError(ErrorCode::conflict, "A disk operation is rewriting the parent disk; wait for it to finish");
     }
 }
+void ConfigurationService::check_reference_reservations(const Json::Value& before, const Json::Value& after, const void* owner) const {
+    const auto references = [](const Json::Value& document, const std::set<std::string>& paths) {
+        Json::Value result(Json::objectValue);
+        for (const auto& vm : document["vms"]) {
+            const auto& slots = config::member(vm, "disks");
+            if (!slots.isArray()) continue;
+            for (Json::ArrayIndex i = 0; i < slots.size(); ++i) {
+                if (!paths.contains(config::string(slots[i], "path"))) continue;
+                Json::Value entry; entry["index"] = i; entry["slot"] = slots[i];
+                result[config::uuid(vm)].append(std::move(entry));
+            }
+        }
+        return result;
+    };
+    std::lock_guard lock(reservation_state_->mutex);
+    for (const auto& [holder, paths] : reservation_state_->references)
+        if (holder != owner && references(before, paths) != references(after, paths))
+            throw ServiceError(ErrorCode::conflict, "A disk operation protects these VM attachments; wait for it to finish");
+}
 ConfigurationService::DiskReservation ConfigurationService::reserve_disks(const std::string& disk_revision,
-        const std::set<std::string>& exclusive, const std::set<std::string>& shared) {
+        const std::set<std::string>& exclusive, const std::set<std::string>& shared, const std::string& vm_revision) {
     if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
     // Exclusive admission orders this against registry commits: a reservation
     // either sees the committed revision or blocks the later edit.
@@ -361,29 +420,33 @@ ConfigurationService::DiskReservation ConfigurationService::reserve_disks(const 
     std::lock_guard disk_writer(disks_->writer_mutex_);
     if (disks_->state()->revision != disk_revision)
         throw ServiceError(ErrorCode::conflict, "Disk configuration changed; reload before starting the operation");
+    if (!vm_revision.empty() && vms_->state()->revision != vm_revision)
+        throw ServiceError(ErrorCode::conflict, "VM references changed; reload before starting the operation");
     struct Holder {
-        ConfigurationService* service;
+        std::shared_ptr<ReservationState> state;
         std::set<std::string> exclusive, shared;
         ~Holder() {
-            std::lock_guard lock(service->reservations_mutex_);
+            std::lock_guard lock(state->mutex);
+            state->references.erase(this);
             for (const auto& id : exclusive) {
-                auto found = service->reservations_.find(id);
-                if (found == service->reservations_.end()) continue;
-                found->second.writer = nullptr;
-                if (found->second.readers.empty()) service->reservations_.erase(found);
+                auto found = state->rows.find(id);
+                if (found == state->rows.end()) continue;
+                if (found->second.writer == this) found->second.writer = nullptr;
+                if (!found->second.writer && found->second.readers.empty()) state->rows.erase(found);
             }
             for (const auto& id : shared) {
-                auto found = service->reservations_.find(id);
-                if (found == service->reservations_.end()) continue;
+                auto found = state->rows.find(id);
+                if (found == state->rows.end()) continue;
                 auto reader = found->second.readers.find(this);
                 if (reader != found->second.readers.end() && !--reader->second) found->second.readers.erase(reader);
-                if (!found->second.writer && found->second.readers.empty()) service->reservations_.erase(found);
+                if (!found->second.writer && found->second.readers.empty()) state->rows.erase(found);
             }
         }
     };
     auto holder = std::make_shared<Holder>();
-    holder->service = this;
-    std::lock_guard lock(reservations_mutex_);
+    holder->state = reservation_state_;
+    std::lock_guard lock(reservation_state_->mutex);
+    auto& reservations_ = reservation_state_->rows;
     for (const auto& id : exclusive) {
         const auto found = reservations_.find(id);
         if (shared.contains(id) || (found != reservations_.end() && (found->second.writer || !found->second.readers.empty())))
@@ -400,6 +463,12 @@ ConfigurationService::DiskReservation ConfigurationService::reserve_disks(const 
     auto next = reservations_;
     for (const auto& id : exclusive) next[id].writer = holder.get();
     for (const auto& id : shared) ++next[id].readers[holder.get()];
+    if (!vm_revision.empty()) {
+        std::set<std::string> paths;
+        for (const auto& row : disks_->state()->document["disks"])
+            if (exclusive.contains(config::uuid(row)) || shared.contains(config::uuid(row))) paths.insert(config::disk_path(row));
+        reservation_state_->references.emplace(holder.get(), std::move(paths));
+    }
     reservations_.swap(next);
     return holder;
 }
@@ -410,12 +479,34 @@ ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const 
 ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const CallContext& caller,
         const std::string& vm_revision, const std::string& disk_revision, Json::Value vms, Json::Value disks,
         const DiskReservation& owner) {
+    return replace_vm_disks_impl(caller, vm_revision, disk_revision, std::move(vms), std::move(disks), owner, {}, nullptr);
+}
+ConfigurationService::VmDiskResult ConfigurationService::import_vm_disks_networks(const CallContext& caller,
+        const std::string& vm_revision, const std::string& disk_revision, const std::string& network_revision,
+        Json::Value vm, Json::Value disks, Json::Value added_networks) {
+    access(caller);
+    if (network_revision.empty() || network_revision.size() > 128 || !vm.isObject()
+        || !added_networks.isArray() || added_networks.size() > 1024)
+        throw ServiceError(ErrorCode::invalid_argument, "Invalid package configuration import");
+    auto current = vms_->snapshot(caller);
+    if (current->revision != vm_revision)
+        throw ServiceError(ErrorCode::conflict, "VM configuration changed before import");
+    auto document = current->document;
+    document["vms"].append(std::move(vm));
+    return replace_vm_disks_impl(caller, vm_revision, disk_revision, std::move(document), std::move(disks),
+        nullptr, network_revision, &added_networks);
+}
+ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks_impl(const CallContext& caller,
+        const std::string& vm_revision, const std::string& disk_revision, Json::Value vms, Json::Value disks,
+        const DiskReservation& owner, const std::string& network_revision, const Json::Value* added_networks) {
     access(caller);
     if (!disks_) throw ServiceError(ErrorCode::unavailable, "Disk coordination is not enabled");
     if (vm_revision.empty() || vm_revision.size() > 128 || disk_revision.empty() || disk_revision.size() > 128)
         throw ServiceError(ErrorCode::invalid_argument, "VM and disk revisions are required");
     auto exclusive = gate_->transaction(); exclusive.require_available();
     std::lock_guard vm_writer(vms_->writer_mutex_);
+    std::unique_lock<std::mutex> network_writer;
+    if (added_networks) network_writer = std::unique_lock(networks_->writer_mutex_);
     std::lock_guard disk_writer(disks_->writer_mutex_);
     const auto vm_before = vms_->state(); const auto disk_before = disks_->state();
     if (vm_before->revision != vm_revision || disk_before->revision != disk_revision)
@@ -424,11 +515,52 @@ ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const 
     auto disk_next = std::make_shared<DiskConfigSnapshot>();
     vm_next->document = VmConfigService::normalize(std::move(vms));
     disk_next->document = DiskConfigService::normalize(std::move(disks));
+    std::shared_ptr<NetworkConfigService::State> network_next;
+    if (added_networks) {
+        const auto network_before = networks_->state();
+        if (network_before->revision != network_revision)
+            throw ServiceError(ErrorCode::conflict, "Network configuration changed before import");
+        // This endpoint only adds package resources. Existing rows/extensions
+        // cannot be edited as a side effect of importing another VM.
+        auto retained = disk_next->document;
+        auto& rows = retained["disks"];
+        const auto& old_rows = disk_before->document["disks"];
+        if (rows.size() < old_rows.size())
+            throw ServiceError(ErrorCode::conflict, "Import cannot remove existing disks");
+        rows.resize(old_rows.size());
+        if (retained != disk_before->document)
+            throw ServiceError(ErrorCode::conflict, "Import cannot replace existing disks");
+        auto network_document = network_before->document;
+        std::set<std::string> ids, names;
+        for (const auto& row : network_document["networks"]) {
+            try { ids.insert(config::uuid(row)); } catch (const std::invalid_argument&) {}
+            names.insert(config::string(row, "name"));
+        }
+        for (auto row : *added_networks) {
+            try {
+                if (!row.isObject() || config::schema(row) != 2)
+                    throw std::invalid_argument("Expected network schema 2");
+                config::validate_network(row);
+                if (!ids.insert(config::uuid(row)).second || !names.insert(config::string(row, "name")).second)
+                    throw ServiceError(ErrorCode::conflict, "Imported network identity is already reserved");
+            } catch (const std::invalid_argument& error) {
+                throw ServiceError(ErrorCode::invalid_argument, error.what());
+            }
+            network_document["networks"].append(std::move(row));
+        }
+        if (!added_networks->empty()) {
+            network_next = networks_->decode(std::move(network_document), false);
+            try { config::encode_json(network_next->document, config::JsonFile::max_bytes); }
+            catch (const std::exception&) {
+                throw ServiceError(ErrorCode::resource_exhausted, "Imported network configuration storage limit exceeded");
+            }
+        }
+    }
     try { config::validate_disk_transition(disk_before->document, disk_next->document); }
     catch (const std::invalid_argument& error) { throw ServiceError(ErrorCode::conflict, error.what()); }
     check_reservations(disk_before->document, disk_next->document, owner.get());
-    validate_vm_networks(vm_before->document, vm_next->document);
-    validate_vm_disks(vm_before->document, vm_next->document, disk_before->document, disk_next->document);
+    validate_vm_networks(vm_before->document, vm_next->document, network_next.get());
+    validate_vm_disks(vm_before->document, vm_next->document, disk_before->document, disk_next->document, owner.get());
     if (vm_next->document == vm_before->document && disk_next->document == disk_before->document
             && vm_before->persisted && disk_before->persisted && !vm_before->recovered && !disk_before->recovered
             && !vm_before->durability_uncertain && !disk_before->durability_uncertain)
@@ -451,9 +583,10 @@ ConfigurationService::VmDiskResult ConfigurationService::replace_vm_disks(const 
     // Even unchanged VM definitions must admit stopped replacement when their
     // disk family changes. Unrelated runtime handles remain untouched.
     auto runtime = inventory_.prepare_config(vm_next->document, freeze);
-    const std::vector<config::ConfigTransaction::Update> updates{
+    std::vector<config::ConfigTransaction::Update> updates{
         {"vms.json", vm_next->document}, {"disks.json", disk_next->document}};
-    pending_vm_ = vm_next; pending_disk_ = disk_next;
+    if (network_next) updates.push_back({"networks.json", network_next->document});
+    pending_vm_ = vm_next; pending_disk_ = disk_next; pending_network_ = network_next;
     commit_pending(updates, *runtime, exclusive);
     return {vm_next, disk_next};
 }

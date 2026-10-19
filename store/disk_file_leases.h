@@ -28,6 +28,11 @@ public:
         // requires a write lease; no create/truncate. Keep this Lease alive for
         // the entire IO lifetime, including children inheriting the returned FD.
         Fd open_file(const std::string& path, bool write = false) const;
+        // After the caller has stopped all writers, fsync each admitted writable
+        // inode through its retained descriptor. Read-only backing files are
+        // only verified. Throws on changed paths or failed synchronization; this
+        // does not replace guest filesystem unmount/sync or writer shutdown.
+        void sync_writes() const;
     private:
         friend class DiskFileLeases;
         struct File { std::string path; Fd fd; bool write = false; };

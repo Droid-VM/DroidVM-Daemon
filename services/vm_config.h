@@ -3,6 +3,7 @@
 #include "context.h"
 #include "config_gate.h"
 #include "config_commit.h"
+#include "config_snapshot.h"
 #include "store/json_file.h"
 #include <memory>
 #include <functional>
@@ -10,16 +11,6 @@
 
 namespace droidvm {
 class TaskService;
-struct VmConfigSnapshot {
-    Json::Value document;
-    std::shared_ptr<const std::string> encoded;
-    // Opaque, process-local optimistic concurrency token, never a JSON number.
-    // Reopening a store invalidates every previously issued token.
-    std::string revision;
-    bool persisted = false;
-    bool recovered = false;
-    bool durability_uncertain = false;
-};
 
 // Persistence layer for the single-writer VM migration. The owner must hold
 // the daemon Instance lock and coordinate runtime edits before replacing the

@@ -55,8 +55,8 @@ std::string encode_json(const Json::Value& value, size_t max_bytes) {
     normalize_numbers(normalized);
     return wire::stringify_bounded(normalized, max_bytes);
 }
-JsonFile::JsonFile(int directory, std::string name, uid_t owner, Observer observer, size_t byte_limit, JsonSyntax syntax)
-    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), name_(std::move(name)), owner_(owner), observer_(std::move(observer)), byte_limit_(byte_limit), syntax_(syntax) {
+JsonFile::JsonFile(int directory, std::string name, uid_t owner, Observer observer, size_t byte_limit, JsonSyntax syntax, bool recover_backup)
+    : directory_(fcntl(directory, F_DUPFD_CLOEXEC, 3)), name_(std::move(name)), owner_(owner), observer_(std::move(observer)), byte_limit_(byte_limit), syntax_(syntax), recover_backup_(recover_backup) {
     if (!byte_limit_ || byte_limit_ > (16u << 20)) throw std::invalid_argument("Invalid configuration file byte limit");
     require(directory_.get() >= 0, "duplicate configuration directory");
     if (name_.empty() || name_.size() > 128 || name_.front() == '.' || name_.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_.-") != std::string::npos)
@@ -116,6 +116,11 @@ std::optional<LoadedJson> JsonFile::load_unlocked(Read* primary) {
             if (primary) *primary = std::move(current);
             return LoadedJson{std::move(value), false};
         } catch (const std::invalid_argument&) { current.corrupt = true; }
+    }
+    if (!recover_backup_) {
+        if (primary) *primary = current;
+        if (current.corrupt) throw std::runtime_error("configuration is unavailable; backup recovery is disabled");
+        return std::nullopt;
     }
     auto backup = read(name_ + ".bak");
     if (primary) *primary = current;

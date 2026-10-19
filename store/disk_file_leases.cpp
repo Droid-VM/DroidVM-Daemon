@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "disk_file_leases.h"
 #include "services/context.h"
+#include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -59,6 +60,19 @@ Fd DiskFileLeases::Lease::open_file(const std::string& path, bool write) const {
         return result;
     }
     throw ServiceError(ErrorCode::invalid_argument, "Disk path is not held by this lease");
+}
+void DiskFileLeases::Lease::sync_writes() const {
+    verify();
+    for (const auto& file : files_) {
+        if (!file.write) continue;
+        // Reopen /proc/self/fd through the existing lease: never reacquire a
+        // conflicting reservation or open a possibly replaced pathname.
+        auto output = open_file(file.path, true);
+        int result;
+        do { result = fsync(output.get()); } while (result < 0 && errno == EINTR);
+        if (result != 0) throw ServiceError(ErrorCode::io_error, "Cannot synchronize leased disk inode");
+    }
+    verify();
 }
 std::shared_ptr<DiskFileLeases::Lease> DiskFileLeases::acquire(const std::vector<Request>& requests) {
     std::map<std::string, bool> paths, keys, inodes;

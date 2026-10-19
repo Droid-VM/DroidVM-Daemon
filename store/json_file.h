@@ -39,8 +39,10 @@ public:
     using Observer = std::function<void(const char* stage)>;
     // VM inventory historically allows 16 MiB; other stores keep the 8 MiB
     // default. This changes file capacity, never a transport frame limit.
+    // Disable backup recovery for revocable credentials: an older snapshot
+    // must never restore an authorization that the primary already revoked.
     JsonFile(int directory, std::string name, uid_t owner, Observer observer = {}, size_t byte_limit = max_bytes,
-        JsonSyntax syntax = JsonSyntax::compatible);
+        JsonSyntax syntax = JsonSyntax::compatible, bool recover_backup = true);
     std::optional<LoadedJson> load();
     void save(const Json::Value& value);
 private:
@@ -51,6 +53,7 @@ private:
     Observer observer_;
     size_t byte_limit_;
     JsonSyntax syntax_;
+    bool recover_backup_;
     std::mutex mutex_;
     Read read(const std::string& name);
     std::optional<LoadedJson> load_unlocked(Read* primary = nullptr);
