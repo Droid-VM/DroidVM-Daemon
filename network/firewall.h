@@ -35,11 +35,13 @@ public:
     // in caller order. No chain declarations, policy changes, flush or shell.
     void replace(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier = -1) const;
     bool at_head(const std::vector<TaggedRule>& rules) const;
+    bool in_order(const std::vector<TaggedRule>& rules) const;
 private:
     std::array<std::string, 2> executable_, restore_;
     ChildOutput run(const FirewallRule& rule, const std::string& operation, const std::string& tag = {}, int barrier = -1) const;
     ChildOutput transaction(const std::vector<TaggedRule>& before, const std::vector<TaggedRule>& after, int barrier, bool check_only) const;
     std::vector<std::vector<std::string>> snapshot(const FirewallRule& rule) const;
+    bool ordered(const std::vector<TaggedRule>& rules, bool require_head) const;
 };
 // Durable rule ownership and single-table revision, not a policy planner.
 // Caller holds the daemon instance lock and serializes intersecting policies.
@@ -54,12 +56,14 @@ public:
     void put(const std::string& owner, const std::string& key, const FirewallRule& rule);
     struct Rule { std::string key; FirewallRule rule; };
     // Reconcile this owner's entire family/table slice. Other owners/tables are
-    // preserved. Desired rules are ordered at each hook's head. Journal both
+    // preserved. Updates insert at each hook's head, but unchanged rules may
+    // follow/interleave foreign rules while retaining their own relative order.
+    // require_head is reserved for transient cross-table protection. Journal both
     // generations before the atomic kernel update; retry/recovery handles either.
-    void replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired);
+    void replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head = false);
     // Read-only convergence check, including rule identity, hook order and
     // confirmed journal durability. Ownership conflicts still throw.
-    bool matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const;
+    bool matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head = false) const;
     void remove(const std::string& owner, const std::string& key);
     Json::Value cleanup(const std::string& owner);
     Json::Value recover_all(); // startup, after helpers and before link cleanup
@@ -78,7 +82,7 @@ private:
         std::map<std::string, size_t> tags;
         bool matched;
     };
-    TableState inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const;
+    TableState inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head) const;
     void save(Json::Value next);
     Fd barrier() const;
     void remove_at(Json::ArrayIndex index, int barrier);

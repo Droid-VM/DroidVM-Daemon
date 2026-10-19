@@ -251,17 +251,26 @@ bool Iptables::contains_all(const std::vector<TaggedRule>& rules) const {
     success(result); return true;
 }
 bool Iptables::at_head(const std::vector<TaggedRule>& rules) const {
+    return ordered(rules, true);
+}
+bool Iptables::in_order(const std::vector<TaggedRule>& rules) const {
+    return ordered(rules, false);
+}
+bool Iptables::ordered(const std::vector<TaggedRule>& rules, bool require_head) const {
     if (rules.empty()) return true;
     std::map<std::string, std::vector<std::string>> wanted, actual;
+    std::set<std::string> selected;
     for (const auto& row : rules) {
         row.rule.arguments(); tag_valid(row.tag);
         if (!same_table(row.rule, rules.front().rule)) invalid("firewall order query crosses table or family");
         wanted[row.rule.chain].push_back(row.tag);
+        selected.insert(row.tag);
     }
     for (const auto& tokens : snapshot(rules.front().rule)) {
         if (tokens[0] != "-A" || !wanted.contains(tokens[1]) || actual[tokens[1]].size() >= wanted[tokens[1]].size()) continue;
         std::string tag;
         for (size_t i = 2; i + 1 < tokens.size(); ++i) if (tokens[i] == "--comment") tag = tokens[++i];
+        if (!require_head && !selected.contains(tag)) continue;
         actual[tokens[1]].push_back(tag);
     }
     return actual == wanted;
@@ -342,7 +351,7 @@ void OwnedFirewall::put(const std::string& owner, const std::string& key, const 
         auto next = document_; next["rules"][index]["stage"] = "owned"; save(std::move(next)); point("firewall_identity_saved");
     } else if (uncertain_) save(document_);
 }
-OwnedFirewall::TableState OwnedFirewall::inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const {
+OwnedFirewall::TableState OwnedFirewall::inspect_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head) const {
     key_valid(owner); const auto scope_rule = table_scope(ipv6, table);
     if (desired.size() > 4096) throw ServiceError(ErrorCode::resource_exhausted, "firewall table plan exceeds rule budget");
     std::set<std::string> keys;
@@ -382,15 +391,16 @@ OwnedFirewall::TableState OwnedFirewall::inspect_table(const std::string& owner,
             it->second["rule"]["chain"] != row.rule.chain) { unchanged = false; continue; }
         ordered.push_back({row.rule, it->second["tag"].asString()});
     }
-    return {std::move(retained), std::move(present), std::move(before), tags, unchanged && iptables_.at_head(ordered)};
+    return {std::move(retained), std::move(present), std::move(before), tags,
+        unchanged && (require_head ? iptables_.at_head(ordered) : iptables_.in_order(ordered))};
 }
-bool OwnedFirewall::matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) const {
+bool OwnedFirewall::matches_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head) const {
     std::lock_guard lock(mutex_); const auto operation = barrier();
-    return inspect_table(owner, ipv6, table, desired).matched && !uncertain_;
+    return inspect_table(owner, ipv6, table, desired, require_head).matched && !uncertain_;
 }
-void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired) {
+void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std::string& table, const std::vector<Rule>& desired, bool require_head) {
     std::lock_guard lock(mutex_); const auto operation = barrier();
-    const auto state = inspect_table(owner, ipv6, table, desired);
+    const auto state = inspect_table(owner, ipv6, table, desired, require_head);
     if (state.matched) { if (uncertain_) save(document_); return; }
     const auto& retained = state.retained;
     const auto& present = state.present;
@@ -422,7 +432,7 @@ void OwnedFirewall::replace_table(const std::string& owner, bool ipv6, const std
     for (const auto& row : after) if (!installed_tags.contains(row.tag) || installed_tags.at(row.tag) != 1)
         conflict("firewall table update did not converge");
     if (!iptables_.contains_all(after)) conflict("firewall table update did not converge");
-    if (!iptables_.at_head(after)) conflict("firewall table update lost required ordering");
+    if (!(require_head ? iptables_.at_head(after) : iptables_.in_order(after))) conflict("firewall table update lost required ordering");
     save(std::move(installed)); point("firewall_batch_identity_saved");
 }
 void OwnedFirewall::remove_at(Json::ArrayIndex index, int barrier) {

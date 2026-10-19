@@ -222,10 +222,30 @@ void durable_table_updates() {
         const auto accept_tag = tag(owned, "accept"), drop_tag = tag(owned, "drop");
         const auto desired = policy(ipv6, true);
         check(test.iptables.at_head({{desired[0].rule, accept_tag}, {desired[1].rule, drop_tag}}), "durable update installs caller order");
+        auto external = rule(ipv6); external.target = "RETURN";
+        const auto external_tag = "droidvm:" + random_id(false);
+        test.iptables.insert(external, external_tag);
+        ChildOptions noop;
+        noop.argv = {ipv6 ? "/system/bin/ip6tables" : "/system/bin/iptables", "-w", "2", "-I", "FORWARD", "3", "-i", "lo"};
+        check(Child(noop).communicate().exit_code == 0, "insert untagged targetless rule between owned rules");
+        const auto displaced = owned.inventory();
+        for (int i = 0; i < 3; ++i) {
+            check(owned.matches_table("test", ipv6, "filter", desired), "foreign head and interleaved rules do not invalidate policy");
+            owned.replace_table("test", ipv6, "filter", desired);
+        }
+        check(owned.inventory() == displaced && test.iptables.at_head({{external, external_tag}}),
+            "repeated reconciliation preserves foreign priority and durable identities");
+        check(!owned.matches_table("test", ipv6, "filter", desired, true), "temporary protection still requires the hook head");
+        owned.replace_table("test", ipv6, "filter", desired, true);
+        check(owned.matches_table("test", ipv6, "filter", desired, true), "explicit protection can still acquire head ordering");
+        test.iptables.erase(external, external_tag);
+        noop.argv = {ipv6 ? "/system/bin/ip6tables" : "/system/bin/iptables", "-w", "2", "-D", "FORWARD", "-i", "lo"};
+        check(Child(noop).communicate().exit_code == 0, "external targetless rule retained until explicit removal");
         // Order drift and a missing member each require a fresh atomic revision.
-        test.iptables.erase(desired[1].rule, drop_tag); test.iptables.insert(desired[1].rule, drop_tag);
+        const auto reordered_tag = tag(owned, "drop");
+        test.iptables.erase(desired[1].rule, reordered_tag); test.iptables.insert(desired[1].rule, reordered_tag);
         owned.replace_table("test", ipv6, "filter", desired);
-        check(tag(owned, "drop") != drop_tag, "head order drift repairs with a new revision");
+        check(tag(owned, "drop") != reordered_tag, "owned relative order drift repairs with a new revision");
         test.iptables.erase(desired[0].rule, tag(owned, "accept"));
         owned.replace_table("test", ipv6, "filter", desired);
         check(test.iptables.contains(desired[0].rule, tag(owned, "accept")), "missing policy rule repaired");
@@ -433,6 +453,26 @@ void shared_coordinator_lifecycle() {
     const auto inventory = owned.inventory(); const auto before = transitions;
     coordinator.refresh(); coordinator.set(first);
     check(coordinator.ready() && before == transitions && owned.inventory() == inventory, "unchanged refresh preserves tags and performs no publication");
+    std::vector<Iptables::TaggedRule> external;
+    for (const auto& [ipv6, table] : {std::pair{false, "mangle"}, {false, "filter"}, {true, "filter"}}) {
+        FirewallRule proxy; proxy.ipv6 = ipv6; proxy.table = table;
+        proxy.chain = proxy.table == "mangle" ? "PREROUTING" : "FORWARD";
+        proxy.input = "brfirst"; proxy.input_prefix = true; proxy.target = "RETURN";
+        external.push_back({proxy, "droidvm:" + random_id(false)});
+        test.iptables.insert(proxy, external.back().tag);
+    }
+    ChildOptions noop; noop.argv = {"/system/bin/iptables", "-w", "2", "-t", "mangle", "-I", "PREROUTING", "1", "-i", "brfirst+"};
+    const auto inserted = Child(noop).communicate();
+    check(inserted.exit_code == 0, ("external targetless mangle head installed: " + inserted.error).c_str());
+    for (int i = 0; i < 3; ++i) { coordinator.refresh(); coordinator.set(first); }
+    check(coordinator.ready() && before == transitions && owned.inventory() == inventory,
+        "external mangle/filter priority changes do not republish any table or rotate tags");
+    noop.argv = {"/system/bin/iptables", "-w", "2", "-t", "mangle", "-D", "PREROUTING", "-i", "brfirst+"};
+    check(Child(noop).communicate().exit_code == 0, "targetless mangle rule survives refresh");
+    for (const auto& row : external) {
+        check(test.iptables.at_head({row}), "external proxy rule stays ahead of owned ACCEPT after refresh");
+        test.iptables.erase(row.rule, row.tag);
+    }
     error(ErrorCode::conflict, [&] { LinuxFirewall duplicate(owned); });
     Json::Value displaced;
     for (const auto& row : inventory["rules"]) if (row["owner"] == LinuxFirewall::owner_key && row["rule"]["chain"] == "OUTPUT") { displaced = row; break; }

@@ -228,10 +228,10 @@ void LinuxFirewall::refresh_locked() {
         }
         for (const bool ipv6 : {false, true}) {
             auto& rows = guarded[ipv6]; rows.insert(rows.end(), plan.filter[ipv6].begin(), plan.filter[ipv6].end());
-            firewall_.replace_table(owner_key, ipv6, "filter", rows);
+            firewall_.replace_table(owner_key, ipv6, "filter", rows, true);
             point(ipv6 ? "linux_firewall_guard6" : "linux_firewall_guard4");
         }
-        for (const bool ipv6 : {false, true}) if (!firewall_.matches_table(owner_key, ipv6, "filter", guarded[ipv6]))
+        for (const bool ipv6 : {false, true}) if (!firewall_.matches_table(owner_key, ipv6, "filter", guarded[ipv6], true))
             throw ServiceError(ErrorCode::conflict, "Linux firewall protection changed before dependency update");
         firewall_.replace_table(owner_key, false, "nat", plan.nat4); point("linux_firewall_nat4");
         firewall_.replace_table(owner_key, false, "mangle", plan.mangle4); point("linux_firewall_mangle4");
