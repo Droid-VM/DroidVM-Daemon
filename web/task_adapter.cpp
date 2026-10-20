@@ -12,6 +12,7 @@
 #include "hugepage_processes.h"
 #include "host_preferences.h"
 #include "usb_acm.h"
+#include "android_display.h"
 #include "common/wire.h"
 
 namespace droidvm::web {
@@ -72,6 +73,10 @@ Json::Value task_view(const TaskView& task) {
     if (task.kind == "usb_acm" && task_terminal(task.state)) {
         auto projected = project_usb_acm_result(task.result, task.state == TaskState::cancelled);
         if (!projected.isNull()) result["usbAcmResult"] = std::move(projected);
+    }
+    if (task.kind == "android_display" && task_terminal(task.state)) {
+        auto projected = project_android_display_result(task.result, task.state == TaskState::cancelled);
+        if (!projected.isNull()) result["androidDisplayResult"] = std::move(projected);
     }
     if (task.kind == "host_preferences" && task_terminal(task.state)) {
         auto projected = project_host_preference_result(task.result, task.state == TaskState::cancelled);

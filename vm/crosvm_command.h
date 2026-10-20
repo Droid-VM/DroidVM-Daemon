@@ -72,6 +72,9 @@ struct CrosvmRun {
     std::optional<std::string> gpu_cgroup_path; // gpuCgroupPath after prepareGpuCgroup()
     std::vector<SerialRun> serials; // resolvedSerials, index-aligned with serial_ports; missing = unresolved
     std::map<std::string, VncRun> vnc; // per screen id, overrides screens.<id>.vnc
+    // KMS exporter: the host touch node crosvm grabs directly (evdev). Resolved
+    // by the launcher; absent means the screen gets no touch input at all.
+    std::optional<std::string> kms_touch_device;
 };
 // NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3.
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
@@ -86,7 +89,15 @@ struct CrosvmLaunch {
     std::vector<std::string> touch_screens, native_input_screens; // touchscreenScreens()/nativeInputScreens()
     std::vector<InputSocket> input_sockets; // every socket the input bridge pre-binds
     std::vector<VncEndpoint> vnc_endpoints; // Exact listeners emitted by this launch.
+    // Set when a screen is exported straight to the panel (--kms-display). The
+    // launcher must own the Android display before spawning this command.
+    bool kms = false;
 };
+// The gpu-0 screen is exported to the panel over DRM/KMS. Throws
+// std::invalid_argument for combinations crosvm would refuse.
+bool crosvm_kms_screen(const Json::Value& config);
+// Screen keys of the KMS exporter; absent fields keep these defaults.
+inline constexpr const char* kms_card_default = "/dev/dri/card0";
 // Expects droidvm::config::migrate_vm output. Throws std::runtime_error or
 // std::invalid_argument where the Java start would fail.
 CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, const BootPlan& boot, const HostFacts& host);

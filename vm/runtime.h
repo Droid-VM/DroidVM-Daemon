@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "vm/android_display_control.h"
 #include "vm/boot_plan.h"
 #include "vm/console.h"
 #include "vm/input_bridge.h"
@@ -53,6 +54,7 @@ struct RuntimeContext {
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;
     AcmPool* acm = nullptr; // null: USB_ACM ports degrade to a sink
+    AndroidDisplayControl* android_display = nullptr; // null: KMS-exported screens cannot start
     HugepagePool hugepages;
     uid_t owner = 0; // app uid owning logs and data
     std::string data_dir; // HostFacts.data_dir; empty = compile-time /data/data/<package>
@@ -189,6 +191,7 @@ private:
     std::vector<std::string> sockets_; // QEMU chardev sockets removed at cleanup
     std::vector<Serial> serials_;
     std::vector<std::string> acm_owners_; // ResolvedSerial.acmDevPath holders
+    std::unique_ptr<AndroidDisplayLease> android_display_; // state_mutex_; held while crosvm owns the panel
     InputBridge input_;
     network::SwitchRuntime::Allocation identity_;
     std::atomic<bool> stopped_by_user_{false}, reboot_requested_{false}, reading_{true};

@@ -7,6 +7,7 @@
 #include "services/system.h"
 #include "services/system_blit_probe.h"
 #include "services/hugepage.h"
+#include "services/android_display.h"
 #include "services/host_preferences_store.h"
 #include "services/usb_acm_store.h"
 #include "services/hugepage_processes.h"
@@ -61,6 +62,7 @@
 #include "web/vm_operations.h"
 #include "web/host_preferences.h"
 #include "web/usb_acm.h"
+#include "web/android_display.h"
 #include "web/vm_logs.h"
 #include "web/vm_configuration.h"
 #include "web/resource_catalog.h"
@@ -317,9 +319,11 @@ private:
 
 int main(int argc, char** argv) {
     try {
-        // Internal self-exec helper: before locks, services or persistence.
+        // Internal self-exec helpers: before locks, services or persistence.
         if (argc == 2 && std::string_view(argv[1]) == "--probe-vulkan-blit")
             return droidvm::SystemBlitProbe::child_main();
+        if (argc == 2 && std::string_view(argv[1]) == "--android-display-sentinel")
+            return droidvm::android_display_sentinel_main();
         std::string directory, data_directory, apk;
         bool force = false;
         bool configuration_owner = false;
@@ -458,6 +462,9 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::HostPreferencesService> host_preferences;
             std::unique_ptr<droidvm::HostPreferencesService> disk_defaults;
             std::unique_ptr<droidvm::UsbAcmService> usb_acm;
+            // Declared before the worker shutdown guard: VMs release the panel
+            // first, then this owner hands any manual session to its sentinel.
+            std::unique_ptr<droidvm::AndroidDisplayService> android_display;
             std::unique_ptr<droidvm::VmService> vms;
             droidvm::LegacyEvents legacy_events;
             droidvm::TaskLimits task_limits;
@@ -538,6 +545,12 @@ int main(int argc, char** argv) {
                 context.lbx = (data / "bin/lbx").string();
                 context.configuration_gate = configuration_gate;
                 tool_data_dir = context.data_dir;
+                // The Android panel is global host state as well; one owner per device.
+                if (same) {
+                    android_display = std::make_unique<droidvm::AndroidDisplayService>(tasks,
+                        droidvm::android_display_real_io("/proc/self/exe", context.run_dir));
+                    context.android_display = android_display.get();
+                }
                 // The USB gadget is global host state: only the app's own data directory owns the pool.
                 if (same) {
                     droidvm::vm::AcmOptions options;
@@ -719,6 +732,7 @@ int main(int argc, char** argv) {
             if (host_preferences) dispatcher.set_host_preferences(host_preferences.get());
             if (disk_defaults) dispatcher.set_disk_defaults(disk_defaults.get());
             if (usb_acm) dispatcher.set_usb_acm(usb_acm.get());
+            if (android_display) dispatcher.set_android_display(android_display.get());
             if (configuration) dispatcher.set_configuration(configuration.get());
             if (usb && dispatcher.config_uploads()) dispatcher.config_uploads()->bind_usb_rules(
                 [&](const droidvm::CallContext&) { return usb->rules_snapshot(); },
@@ -1114,6 +1128,11 @@ int main(int argc, char** argv) {
                             [&](const droidvm::CallContext& caller, const Json::Value& request) { return disk_defaults->start(caller, request); },
                             [&](const droidvm::CallContext& caller, const std::string& request) { return disk_defaults->status(caller, request); }
                         }, droidvm::HostPreferenceDomain::disk_operations) : droidvm::web::WebServiceOperations{}
+                        , android_display ? droidvm::web::android_display_operations({
+                            [&](const droidvm::CallContext& caller) { return android_display->snapshot(caller); },
+                            [&](const droidvm::CallContext& caller, const Json::Value& request) { return android_display->start(caller, request); },
+                            [&](const droidvm::CallContext& caller, const std::string& request) { return android_display->status(caller, request); }
+                        }) : droidvm::web::WebServiceOperations{}
                         , [&](const droidvm::CallContext& caller, const std::string& id) {
                             const auto detail = disk_inspection->read(caller, id, true);
                             const auto references = droidvm::config::disk_references(detail.vms.document, detail.disks.document);

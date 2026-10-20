@@ -533,6 +533,21 @@ void VmRuntime::run() {
     }
     if (aborted()) { finish_stopped(0); return; }
     if (!ready) { stdio("Huge-page reserve is not ready; VM start cancelled.\n"); finish_stopped(-1); return; }
+    // The panel is handed over before crosvm exists, so freed Android memory
+    // precedes guest allocation and crosvm's preflight finds no DRM master.
+    try {
+        if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "QEMU" && crosvm_kms_screen(config)) {
+            if (!context_.android_display) throw std::runtime_error("Android display takeover is not available in this daemon");
+            auto lease = context_.android_display->acquire(id_, config::string(config, "name"));
+            std::lock_guard lock(state_mutex_);
+            android_display_ = std::move(lease);
+        }
+    } catch (const std::exception& error) {
+        stdio(std::string("Android display takeover failed: ") + error.what() + "\n");
+        context_.warn("VM " + id_ + ": Android display takeover failed: " + error.what());
+        finish_stopped(-1);
+        return;
+    }
     std::string failure;
     bool launched = false;
     reading_ = true;
@@ -733,6 +748,13 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     std::string cgroup_warning;
     run.gpu_cgroup_path = prepare_gpu_cgroup(config, cgroup_warning);
     if (!cgroup_warning.empty()) context_.warn("VM " + id_ + ": " + cgroup_warning);
+    {
+        std::lock_guard lock(state_mutex_);
+        if (android_display_) {
+            run.kms_touch_device = host_touchscreen();
+            if (!run.kms_touch_device) context_.warn("VM " + id_ + ": no host touchscreen found; the KMS screen starts without touch");
+        }
+    }
     const auto command = crosvm_command(config, run, plan, host);
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.
@@ -749,7 +771,11 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         globfree(&matches);
     }
     if (!spawn(command.argv, command.env, command.strace_dir, "crosvm", failure, command.preserve_fds)) return false;
-    { std::lock_guard lock(state_mutex_); vnc_endpoints_ = command.vnc_endpoints; }
+    {
+        std::lock_guard lock(state_mutex_);
+        vnc_endpoints_ = command.vnc_endpoints;
+        if (android_display_ && pid_ > 0) android_display_->watch(static_cast<int>(pid_));
+    }
     return true;
 }
 bool VmRuntime::launch_qemu(const Json::Value& config, const BootPlan& plan, std::string& failure) {
@@ -949,7 +975,11 @@ void VmRuntime::reap_and_cleanup() {
 void VmRuntime::cleanup_backend() {
     input_.release();
     std::vector<std::string> acm;
-    { std::lock_guard lock(state_mutex_); acm.swap(acm_owners_); }
+    std::unique_ptr<AndroidDisplayLease> panel;
+    { std::lock_guard lock(state_mutex_); acm.swap(acm_owners_); panel = std::move(android_display_); }
+    // Runs after reap_and_cleanup: crosvm has released DRM master by now, so
+    // the sentinel can bring the Android display HAL back.
+    panel.reset();
     for (const auto& owner : acm) context_.acm->release(owner);
     std::lock_guard lock(state_mutex_);
     if (control_socket_) { unlink(control_socket_->c_str()); control_socket_.reset(); }

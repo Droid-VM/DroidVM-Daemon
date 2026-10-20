@@ -241,6 +241,8 @@ Json::Value HttpApi::server_json() const {
         value["capabilities"].append("host.usb-acm.v1");
     if (resources_.disk_defaults.read && resources_.disk_defaults.tasks.submit && resources_.disk_defaults.tasks.find)
         value["capabilities"].append("host.disk-defaults.v1");
+    if (resources_.android_display.read && resources_.android_display.tasks.submit && resources_.android_display.tasks.find)
+        value["capabilities"].append("host.android-display.v1");
     if (resources_.usb) value["capabilities"].append("usb.list.v1");
     if (resources_.usb && usb_.submit && usb_.find) value["capabilities"].append("usb.target.v1");
     if (usb_rules_.invoke) value["capabilities"].append("usb.rules.v1");
@@ -451,14 +453,14 @@ HttpResponse HttpApi::handle(const HttpRequest& request) {
             auto result = resources_.web_service.read(session.caller); result["context"] = context_json(session);
             return json(200, result);
         }
-        if (request.path == "/api/v1/host/preferences" || request.path == "/api/v1/host/usb-acm" || request.path == "/api/v1/host/disk-defaults") {
+        if (request.path == "/api/v1/host/preferences" || request.path == "/api/v1/host/usb-acm" || request.path == "/api/v1/host/disk-defaults" || request.path == "/api/v1/host/android-display") {
             if (request.method != "GET") {
                 auto response = problem(405, "method_not_allowed"); response.headers.emplace_back("Allow", "GET"); return response;
             }
             if (!request.body.empty()) invalid();
             const auto session = sessions_.authenticate(cookie(request), std::nullopt, true, request.trusted_lan);
             if (!session.caller.administrator) throw ServiceError(ErrorCode::permission_denied, "Host preference permission required");
-            const auto& operations = request.path == "/api/v1/host/disk-defaults" ? resources_.disk_defaults : request.path == "/api/v1/host/usb-acm" ? resources_.usb_acm : resources_.host_preferences;
+            const auto& operations = request.path == "/api/v1/host/disk-defaults" ? resources_.disk_defaults : request.path == "/api/v1/host/usb-acm" ? resources_.usb_acm : request.path == "/api/v1/host/android-display" ? resources_.android_display : resources_.host_preferences;
             if (!operations.read) return problem(501, "unsupported");
             auto result = operations.read(session.caller);
             result["context"] = context_json(session); return json(200, result);
@@ -706,6 +708,7 @@ HttpResponse HttpApi::handle(const HttpRequest& request) {
             request.path == "/api/v1/usb-acm-operations" || request.path.starts_with("/api/v1/usb-acm-operations/") ||
             request.path == "/api/v1/host-preference-operations" || request.path.starts_with("/api/v1/host-preference-operations/") ||
             request.path == "/api/v1/disk-default-operations" || request.path.starts_with("/api/v1/disk-default-operations/") ||
+            request.path == "/api/v1/android-display-operations" || request.path.starts_with("/api/v1/android-display-operations/") ||
             request.path == "/api/v1/hugepage-process-operations" || request.path.starts_with("/api/v1/hugepage-process-operations/") ||
             request.path == "/api/v1/hugepage-operations" || request.path.starts_with("/api/v1/hugepage-operations/") ||
             request.path == "/api/v1/agent-operations" || request.path.starts_with("/api/v1/agent-operations/") ||
@@ -737,8 +740,9 @@ HttpResponse HttpApi::handle(const HttpRequest& request) {
             const bool usb_acm = request.path.starts_with("/api/v1/usb-acm-operations");
             const bool host_preference = request.path.starts_with("/api/v1/host-preference-operations");
             const bool disk_default = request.path.starts_with("/api/v1/disk-default-operations");
-            const std::string base = disk_default ? "/api/v1/disk-default-operations" : usb_acm ? "/api/v1/usb-acm-operations" : host_preference ? "/api/v1/host-preference-operations" : hugepage_process ? "/api/v1/hugepage-process-operations" : hugepage ? "/api/v1/hugepage-operations" : image_install ? "/api/v1/image-installs" : image_plan ? "/api/v1/image-import-plans" : image_import ? "/api/v1/image-imports" : web_service ? "/api/v1/web-service/operations" : import_plan ? "/api/v1/package-import-plans" : package_import ? "/api/v1/package-imports" : package ? "/api/v1/package-exports" : rescue ? "/api/v1/agent-rescue-operations" : agent ? "/api/v1/agent-operations" : agent_recovery ? "/api/v1/agent-recovery" : config_recovery ? "/api/v1/configuration-recovery" : network ? "/api/v1/network-operations" : recovery ? "/api/v1/disk-recovery" : disk ? "/api/v1/disk-operations" : usb ? "/api/v1/usb-operations" : "/api/v1/vm-operations";
-            const auto& operations = disk_default ? resources_.disk_defaults.tasks : usb_acm ? resources_.usb_acm.tasks : host_preference ? resources_.host_preferences.tasks : hugepage_process ? resources_.hugepage_processes.tasks : hugepage ? resources_.hugepages.tasks : image_install ? resources_.image_uploads.installs : image_plan ? resources_.image_imports.plans : image_import ? resources_.image_imports.tasks : web_service ? resources_.web_service.tasks : import_plan ? resources_.package_imports.plans : package_import ? resources_.package_imports.tasks : package ? resources_.package_exports.tasks : rescue ? resources_.agent_rescue.close : agent ? resources_.agent_actions : agent_recovery ? resources_.agent_recovery.tasks : config_recovery ? resources_.configuration_recovery : network ? resources_.network_actions : recovery ? resources_.disk_recovery.tasks : disk ? resources_.disk_actions : usb ? usb_ : vms_;
+            const bool android_display = request.path.starts_with("/api/v1/android-display-operations");
+            const std::string base = android_display ? "/api/v1/android-display-operations" : disk_default ? "/api/v1/disk-default-operations" : usb_acm ? "/api/v1/usb-acm-operations" : host_preference ? "/api/v1/host-preference-operations" : hugepage_process ? "/api/v1/hugepage-process-operations" : hugepage ? "/api/v1/hugepage-operations" : image_install ? "/api/v1/image-installs" : image_plan ? "/api/v1/image-import-plans" : image_import ? "/api/v1/image-imports" : web_service ? "/api/v1/web-service/operations" : import_plan ? "/api/v1/package-import-plans" : package_import ? "/api/v1/package-imports" : package ? "/api/v1/package-exports" : rescue ? "/api/v1/agent-rescue-operations" : agent ? "/api/v1/agent-operations" : agent_recovery ? "/api/v1/agent-recovery" : config_recovery ? "/api/v1/configuration-recovery" : network ? "/api/v1/network-operations" : recovery ? "/api/v1/disk-recovery" : disk ? "/api/v1/disk-operations" : usb ? "/api/v1/usb-operations" : "/api/v1/vm-operations";
+            const auto& operations = android_display ? resources_.android_display.tasks : disk_default ? resources_.disk_defaults.tasks : usb_acm ? resources_.usb_acm.tasks : host_preference ? resources_.host_preferences.tasks : hugepage_process ? resources_.hugepage_processes.tasks : hugepage ? resources_.hugepages.tasks : image_install ? resources_.image_uploads.installs : image_plan ? resources_.image_imports.plans : image_import ? resources_.image_imports.tasks : web_service ? resources_.web_service.tasks : import_plan ? resources_.package_imports.plans : package_import ? resources_.package_imports.tasks : package ? resources_.package_exports.tasks : rescue ? resources_.agent_rescue.close : agent ? resources_.agent_actions : agent_recovery ? resources_.agent_recovery.tasks : config_recovery ? resources_.configuration_recovery : network ? resources_.network_actions : recovery ? resources_.disk_recovery.tasks : disk ? resources_.disk_actions : usb ? usb_ : vms_;
             const bool submit = request.path == base;
             if (request.method != (submit ? "POST" : "GET")) {
                 auto response = problem(405, "method_not_allowed"); response.headers.emplace_back("Allow", (recovery || agent_recovery) && submit ? "GET, POST" : submit ? "POST" : "GET"); return response;
@@ -751,7 +755,7 @@ HttpResponse HttpApi::handle(const HttpRequest& request) {
             if (submit) {
                 auto input = parse_object(request);
                 ParsedSecretGuard secret{agent ? &input : nullptr};
-                const auto expected_size = (hugepage || hugepage_process || host_preference || usb_acm || disk_default) ? 4u : image_install ? 5u : (import_plan || image_plan || image_import) ? 3u : package_import ? 4u : package ? 7u : rescue ? 3u : (recovery || config_recovery || agent_recovery) ? 2u : 5u;
+                const auto expected_size = (hugepage || hugepage_process || host_preference || usb_acm || disk_default || android_display) ? 4u : image_install ? 5u : (import_plan || image_plan || image_import) ? 3u : package_import ? 4u : package ? 7u : rescue ? 3u : (recovery || config_recovery || agent_recovery) ? 2u : 5u;
                 if (input.size() != expected_size + (agent && input.isMember("rescue") ? 1u : 0u)
                     || (agent && input.isMember("rescue") && !input["rescue"].isBool())
                     || !input["context"].isObject() || input["context"].size() != 2 ||

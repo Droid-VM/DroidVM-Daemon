@@ -55,6 +55,41 @@ void vnc_launch_metadata() {
     crosvm = vm::crosvm_command(config, {}, {}, host);
     check(crosvm.vnc_endpoints[0].unavailable_reason == "unsupported", "external crosvm config invalidates generated metadata");
 }
+void kms_launch_arguments() {
+    Json::Value config;
+    config["id"] = random_id(true); config["name"] = "kms-contract";
+    config["gpu_backend"] = "GPU_VIRGLRENDERER";
+    auto& screen = config["screens"]["gpu-0"];
+    screen["enabled"] = true; screen["exporter"] = "KMS"; screen["input_enabled"] = true;
+    screen["kms_touch_width_mm"] = 73; screen["kms_touch_height_mm"] = 158;
+    config["screens"]["simplefb"]["enabled"] = false;
+    vm::HostFacts host; host.has_gunyah = true;
+    check(vm::crosvm_kms_screen(config), "KMS on gpu-0 is recognised");
+    vm::CrosvmRun run; run.kms_touch_device = "/dev/input/event7";
+    auto launch = vm::crosvm_command(config, run, {}, host);
+    auto has = [&](const std::string& flag, const std::string& value) {
+        for (size_t i = 0; i + 1 < launch.argv.size(); ++i) if (launch.argv[i] == flag && launch.argv[i + 1] == value) return true;
+        return false;
+    };
+    check(has("--kms-display", "card=/dev/dri/card0,screen=gpu-0,takeover=external,planes=split"), "KMS display argument");
+    check(has("--input", "evdev[path=/dev/input/event7,width-mm=73,height-mm=158]"), "host digitizer passed through with its physical size");
+    check(launch.kms && !launch.input_bridge && launch.input_sockets.empty() && launch.vnc_endpoints.empty(), "no UI input bridge or VNC listener beside KMS");
+    bool keepalive = false;
+    for (const auto& [key, value] : launch.env) keepalive = keepalive || (key == "CROSVM_TOUCH_KEEPALIVE" && value == "1");
+    check(keepalive, "touch keepalive enabled for the grabbed digitizer");
+    for (const auto& arg : launch.argv) check(arg.find("android-display-service") == std::string::npos && arg.find("multi-touch") == std::string::npos, "no socket-fed devices");
+    run.kms_touch_device.reset();
+    launch = vm::crosvm_command(config, run, {}, host);
+    for (const auto& arg : launch.argv) check(!arg.starts_with("evdev["), "no touch node means no evdev device");
+    screen["kms_planes"] = "single"; screen["kms_card"] = "/dev/dri/card1";
+    launch = vm::crosvm_command(config, run, {}, host);
+    check(has("--kms-display", "card=/dev/dri/card1,screen=gpu-0,takeover=external,planes=single"), "plane split and card are configurable");
+    // crosvm replaces its whole display backend list with KMS: a second exporter would lose its frames.
+    config["screens"]["simplefb"]["enabled"] = true; config["screens"]["simplefb"]["exporter"] = "VNC";
+    try { vm::crosvm_kms_screen(config); throw std::runtime_error("combined exporters accepted"); } catch (const std::invalid_argument&) {}
+    config["screens"]["simplefb"]["exporter"] = "KMS"; screen["exporter"] = "NONE";
+    try { vm::crosvm_kms_screen(config); throw std::runtime_error("KMS on simplefb accepted"); } catch (const std::invalid_argument&) {}
+}
 void crosvm_disk_capability_process() {
     const auto directory = std::filesystem::temp_directory_path() / ("crosvm-probe-" + random_id(true));
     std::filesystem::create_directory(directory);
@@ -1945,6 +1980,7 @@ int main() {
     return run({{"guarded_lifecycle_observations", guarded_lifecycle_observations},
         {"crosvm_disk_capabilities", crosvm_disk_capabilities},
         {"vnc_launch_metadata", vnc_launch_metadata},
+        {"kms_launch_arguments", kms_launch_arguments},
         {"crosvm_disk_capability_process", crosvm_disk_capability_process},
         {"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
         {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},

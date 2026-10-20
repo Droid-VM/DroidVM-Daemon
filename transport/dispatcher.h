@@ -5,6 +5,7 @@
 #include "services/hugepage.h"
 #include "services/host_preferences.h"
 #include "services/usb_acm.h"
+#include "services/android_display.h"
 #include "services/network_config.h"
 #include "services/network_host.h"
 #include "services/network.h"
@@ -61,6 +62,7 @@ public:
     void set_host_preferences(HostPreferencesService* service) { host_preferences_ = service; }
     void set_disk_defaults(HostPreferencesService* service) { disk_defaults_ = service; }
     void set_usb_acm(UsbAcmService* service) { usb_acm_ = service; }
+    void set_android_display(AndroidDisplayService* service) { android_display_ = service; }
     void set_disk_config(DiskConfigService* service) {
         if (!service || service->events() != &tasks_ || (disk_config_ && disk_config_ != service))
             throw std::invalid_argument("Disk registry adapter participants do not match");
@@ -132,6 +134,7 @@ private:
     HostPreferencesService* host_preferences_ = nullptr;
     HostPreferencesService* disk_defaults_ = nullptr;
     UsbAcmService* usb_acm_ = nullptr;
+    AndroidDisplayService* android_display_ = nullptr;
     VmConfigService* vm_config_ = nullptr;
     DiskConfigService* disk_config_ = nullptr;
     ConfigurationService* configuration_ = nullptr;

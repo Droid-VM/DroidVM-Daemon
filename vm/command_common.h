@@ -21,7 +21,7 @@ using Names = std::vector<const char*>;
 inline const Names hypervisors{"AUTO", "SOFT", "KVM", "GUNYAH", "GENIEZONE"};
 inline const Names protections{"PROTECTED_NORMAL", "PROTECTED_PROTECTED", "PROTECTED_WITHOUT_FIRMWARE", "PSEUDO_UNPROTECTED"};
 inline const Names gpu_backends{"NONE", "GPU_2D", "GPU_GFXSTREAM", "GPU_VIRGLRENDERER"};
-inline const Names exporters{"NATIVE", "VNC", "NONE"};
+inline const Names exporters{"NATIVE", "VNC", "KMS", "NONE"};
 inline const Names disk_buses{"VIRTIO", "SCSI", "PMEM", "PFLASH", "CDROM"};
 inline const Names dir_caches{"NEVER", "AUTO", "ALWAYS"};
 inline const Names peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB"};

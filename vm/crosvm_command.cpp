@@ -21,6 +21,7 @@ const Names sound_buffers{"LOW", "NORMAL", "SAFE"};
 const Names sound_underruns{"SILENCE", "REPEAT", "WSOLA", "LPC"};
 const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
+const Names kms_planes{"SPLIT", "SINGLE"};
 // Guards loops that Java would only finish by exhausting its heap.
 constexpr int64_t max_cpu_entries = 1 << 20;
 
@@ -435,10 +436,18 @@ struct Builder {
         return arg;
     }
     void exporters_args(CrosvmLaunch& launch) {
+        launch.kms = crosvm_kms_screen(item);
         for (const auto& screen : screens_of(item)) {
             if (!screen.enabled()) continue;
             const auto exporter = screen.exporter();
-            if (exporter == "NATIVE") {
+            if (exporter == "KMS") {
+                // takeover=external: the daemon already owns the panel; crosvm only
+                // verifies DRM master and never touches Android services itself.
+                const auto card = string(*screen.item, "kms_card", kms_card_default);
+                const auto planes = lower(java_enum(*screen.item, "kms_planes", "SPLIT", kms_planes));
+                args.push_back("--kms-display");
+                args.push_back("card=" + crosvm_option_value(card) + ",screen=" + screen.id + ",takeover=external,planes=" + planes);
+            } else if (exporter == "NATIVE") {
                 args.push_back("--android-display-service");
                 args.push_back("name=droidvm_disp_" + vm_id() + "_" + screen.id + ",screen=" + screen.id + transport_cap_arg(screen));
             } else if (exporter == "VNC") {
@@ -459,9 +468,20 @@ struct Builder {
             throw std::invalid_argument("unix socket path is " + decimal(static_cast<int64_t>(path.size())) + " bytes, over the 107 sun_path allows: " + path);
         return path;
     }
+    // The KMS screen's touch is the host digitizer itself: crosvm grabs the evdev
+    // node (EVIOCGRAB) because Android's input stack is frozen while it owns the
+    // panel. No socket exists for it, so the UI bridge has nothing to feed.
+    void kms_inputs(const Screen& screen) {
+        if (!screen.input_enabled() || !run.kms_touch_device) return;
+        auto arg = "evdev[path=" + crosvm_option_value(*run.kms_touch_device);
+        const auto width = integer(*screen.item, "kms_touch_width_mm", 0), height = integer(*screen.item, "kms_touch_height_mm", 0);
+        if (width > 0 && height > 0) arg += ",width-mm=" + decimal(width) + ",height-mm=" + decimal(height);
+        args.push_back("--input");
+        args.push_back(arg + "]");
+    }
     void inputs(CrosvmLaunch& launch) {
         for (const auto& screen : screens_of(item)) {
-            if (!screen.enabled() || screen.exporter() == "NONE" || !screen.input_enabled()) continue;
+            if (!screen.enabled() || screen.exporter() == "NONE" || screen.exporter() == "KMS" || !screen.input_enabled()) continue;
             launch.touch_screens.push_back(screen.id);
             if (screen.exporter() == "NATIVE") launch.native_input_screens.push_back(screen.id);
         }
@@ -648,7 +668,11 @@ struct Builder {
         shared_dirs();
         gpu(*hypervisor == "GUNYAH");
         exporters_args(launch);
-        for (const auto& screen : screens_of(item)) launch.input_bridge = launch.input_bridge || (screen.enabled() && screen.exporter() != "NONE");
+        for (const auto& screen : screens_of(item)) {
+            const auto exporter = screen.exporter();
+            if (screen.enabled() && exporter == "KMS") kms_inputs(screen);
+            else launch.input_bridge = launch.input_bridge || (screen.enabled() && exporter != "NONE");
+        }
         if (launch.input_bridge) inputs(launch);
         peripherals();
         serials();
@@ -693,6 +717,9 @@ struct Builder {
             const auto prio = string(item, "gpu_rt_prio", "");
             if (!prio.empty() && run.gpu_cgroup_path) env.emplace_back("CROSVM_GPU_RT_PRIO", prio);
         }
+        // Held touch contacts need the 40 ms SYN_REPORT keepalive for Windows
+        // long-press (crosvm 0863c89); it is opt-in on the crosvm side.
+        if (launch.kms && run.kms_touch_device) env.emplace_back("CROSVM_TOUCH_KEEPALIVE", "1");
     }
 };
 }
@@ -720,6 +747,21 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
     }
     builder.environment(launch);
     return launch;
+}
+bool crosvm_kms_screen(const Json::Value& config) {
+    bool kms = false, other = false;
+    for (const auto& screen : screens_of(config)) {
+        if (!screen.enabled()) continue;
+        const auto exporter = screen.exporter();
+        if (exporter == "KMS") {
+            // crosvm's gpu.rs replaces the whole display backend list with KMS, so
+            // a second exporter on any screen would silently lose its frames.
+            if (screen.id != gpu0) throw std::invalid_argument("KMS export is only available on the gpu-0 screen");
+            kms = true;
+        } else if (exporter != "NONE") other = true;
+    }
+    if (kms && other) throw std::invalid_argument("KMS export cannot be combined with another exporter on this VM");
+    return kms;
 }
 bool resolves_to_gunyah(const Json::Value& item, const HostFacts& host) {
     // VMHypervisor.resolveConfigured with optEnum (unknown names are AUTO);

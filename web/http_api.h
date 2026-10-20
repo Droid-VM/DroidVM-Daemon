@@ -126,6 +126,7 @@ struct ResourceCatalogs {
     WebServiceOperations host_preferences{};
     WebServiceOperations usb_acm{};
     WebServiceOperations disk_defaults{};
+    WebServiceOperations android_display{};
     std::function<Json::Value(const CallContext&, const std::string&)> disk_compression{};
     bool disk_clone_directory = false;
 };

@@ -17,10 +17,12 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <linux/input.h>
 #include <map>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -135,6 +137,32 @@ std::vector<CpuCore> cpu_cores(const std::string& root) {
     const auto fallback = static_cast<int>(std::clamp<long>(sysconf(_SC_NPROCESSORS_ONLN), 1, 4096));
     for (const auto& core : read_cpu_topology(root, fallback)) result.push_back({core.index, core.capacity});
     return result;
+}
+std::optional<std::string> host_touchscreen(const std::string& directory) {
+    std::vector<std::string> names;
+    if (DIR* dir = opendir(directory.c_str())) {
+        while (auto* entry = readdir(dir)) names.emplace_back(entry->d_name);
+        closedir(dir);
+    } else return std::nullopt;
+    // "event10" must not sort before "event2": compare the numeric suffix.
+    std::sort(names.begin(), names.end(), [](const std::string& a, const std::string& b) {
+        const auto number = [](const std::string& name) { return name.size() > 5 ? java_int(name.substr(5)).value_or(INT_MAX) : INT_MAX; };
+        return number(a) < number(b);
+    });
+    for (const auto& node : names) {
+        if (!node.starts_with("event")) continue;
+        const auto path = directory + "/" + node;
+        const int raw = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (raw < 0) continue;
+        unsigned long events[(EV_MAX + sizeof(long) * 8) / (sizeof(long) * 8)] = {};
+        unsigned long axes[(ABS_MAX + sizeof(long) * 8) / (sizeof(long) * 8)] = {};
+        const auto bit = [](const unsigned long* bits, unsigned index) { return (bits[index / (sizeof(long) * 8)] >> (index % (sizeof(long) * 8))) & 1u; };
+        const bool touch = ioctl(raw, EVIOCGBIT(0, sizeof(events)), events) >= 0 && bit(events, EV_ABS) &&
+            ioctl(raw, EVIOCGBIT(EV_ABS, sizeof(axes)), axes) >= 0 && bit(axes, ABS_MT_POSITION_X) && bit(axes, ABS_MT_POSITION_Y);
+        close(raw);
+        if (touch) return path;
+    }
+    return std::nullopt;
 }
 HostFacts probe_host(const HostProbe& probe) {
     HostFacts host;

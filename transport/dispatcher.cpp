@@ -22,6 +22,8 @@ constexpr std::array disk_defaults_commands{"disk_defaults_snapshot", "disk_defa
 bool disk_defaults_command(const std::string& command) { return std::find(disk_defaults_commands.begin(), disk_defaults_commands.end(), command) != disk_defaults_commands.end(); }
 constexpr std::array usb_acm_commands{"usb_acm_snapshot", "usb_acm_operation_start", "usb_acm_operation_status"};
 bool usb_acm_command(const std::string& command) { return std::find(usb_acm_commands.begin(), usb_acm_commands.end(), command) != usb_acm_commands.end(); }
+constexpr std::array android_display_commands{"android_display_snapshot", "android_display_operation_start", "android_display_operation_status"};
+bool android_display_command(const std::string& command) { return std::find(android_display_commands.begin(), android_display_commands.end(), command) != android_display_commands.end(); }
 bool host_preferences_command(const std::string& command) { return std::find(host_preferences_commands.begin(), host_preferences_commands.end(), command) != host_preferences_commands.end(); }
 bool hugepage_command(const std::string& command) { return std::find(hugepage_commands.begin(), hugepage_commands.end(), command) != hugepage_commands.end(); }
 bool web_command(const std::string& command) { return std::find(web_commands.begin(), web_commands.end(), command) != web_commands.end(); }
@@ -189,6 +191,7 @@ std::string legacy_id(const Json::Value& request, const char* key = "network_id"
 bool RequestDispatcher::background(const std::string& command) const {
     if (disk_defaults_ && disk_defaults_command(command)) return true;
     if (usb_acm_ && usb_acm_command(command)) return true;
+    if (android_display_ && android_display_command(command)) return true;
     if (host_preferences_ && host_preferences_command(command)) return true;
     if (hugepages_ && hugepage_command(command)) return true;
     if (web_execute_ && web_command(command)) return true;
@@ -223,6 +226,29 @@ Json::Value RequestDispatcher::execute_background(const CallContext& caller, con
             result["success"] = true; return result;
         } catch (const ServiceError& error) { return failure(error); }
         catch (...) { return failure(ServiceError(ErrorCode::internal, "USB ACM operation outcome unknown")); }
+    }
+    if (android_display_ && android_display_command(command)) {
+        try {
+            if (!request.isObject()) throw ServiceError(ErrorCode::invalid_argument, "Invalid Android display request");
+            Json::Value body(Json::objectValue);
+            for (const auto& key : request.getMemberNames()) {
+                if (key == "type" || key == "command" || key == "request_id") continue;
+                if (command == "android_display_snapshot" || (command == "android_display_operation_status" && key != "requestId") ||
+                    (command == "android_display_operation_start" && key != "requestId" && key != "expected" && key != "operation"))
+                    throw ServiceError(ErrorCode::invalid_argument, "Unexpected Android display request field");
+                body[key] = request[key];
+            }
+            Json::Value result(Json::objectValue);
+            if (command == "android_display_snapshot") result["snapshot"] = android_display_->snapshot(caller);
+            else {
+                const auto task = command == "android_display_operation_start" ? android_display_->start(caller, body) : android_display_->status(caller, string_field(body, "requestId"));
+                result["epoch"] = task.ref.epoch; result["task_id"] = task.ref.id;
+                result["task"] = task_summary(task);
+                if (task_terminal(task.state) && task.result.isObject()) result["task"]["result"] = task.result;
+            }
+            result["success"] = true; return result;
+        } catch (const ServiceError& error) { return failure(error); }
+        catch (...) { return failure(ServiceError(ErrorCode::internal, "Android display operation outcome unknown")); }
     }
     const bool disk_defaults = disk_defaults_ && disk_defaults_command(command);
     auto* preferences = disk_defaults ? disk_defaults_ : host_preferences_ && host_preferences_command(command) ? host_preferences_ : nullptr;
@@ -779,6 +805,7 @@ Json::Value RequestDispatcher::execute_keyboard(const CallContext& caller, const
 Json::Value RequestDispatcher::execute(ClientSession& session, const std::string& command, const Json::Value& request) {
     if (disk_defaults_ && disk_defaults_command(command)) return execute_background(context(session), command, request);
     if (usb_acm_ && usb_acm_command(command)) return execute_background(context(session), command, request);
+    if (android_display_ && android_display_command(command)) return execute_background(context(session), command, request);
     if (host_preferences_ && host_preferences_command(command)) return execute_background(context(session), command, request);
     if (hugepages_ && hugepage_command(command)) return execute_background(context(session), command, request);
     if (web_execute_ && web_command(command)) return execute_background(context(session), command, request);
@@ -794,6 +821,10 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
             if (usb_acm_) {
                 for (const auto* name : usb_acm_commands) result["commands"].append(name);
                 result["usb_acm"] = UsbAcmService::capability;
+            }
+            if (android_display_) {
+                for (const auto* name : android_display_commands) result["commands"].append(name);
+                result["android_display"] = AndroidDisplayService::capability;
             }
             if (host_preferences_) {
                 for (const auto* name : host_preferences_commands) result["commands"].append(name);
