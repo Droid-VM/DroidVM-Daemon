@@ -353,7 +353,20 @@ struct HugepageService::Impl {
         receipt["applied"] = true;
         if (verify) {
             const auto actual = read(key);
-            require(actual && (*actual == value || (rounded && value > 0 && *actual >= value)), ErrorCode::commit_uncertain, "Module control readback is unknown or differs");
+            require(actual.has_value(), ErrorCode::commit_uncertain, "Module control readback is unknown");
+            // A pool knob is sized in whole pageblock units, so the module may
+            // legitimately round a request by a pageblock or two (observed: pool_want
+            // 4505 asked, 4504 built). A small rounded readback is a completed resize,
+            // not an uncertain commit -- treating it as uncertain is what stranded the
+            // App behind a reconciliation dialog it could not resolve. Anything further
+            // from the request still stops here.
+            constexpr int64_t pageblock_pages = 8;
+            const bool exact = *actual == value;
+            const bool rounded_up = rounded && value > 0 && *actual >= value;
+            const bool rounded_down = rounded && value > 0 && *actual > 0 && value - *actual <= pageblock_pages;
+            require(exact || rounded_up || rounded_down,
+                ErrorCode::commit_uncertain, "Module control readback is unknown or differs");
+            if (!exact) receipt["degraded"] = true;
         }
         receipt["uncertain"] = false;
     }
@@ -697,7 +710,15 @@ TaskView HugepageService::start(const CallContext& caller, const Json::Value& re
 TaskView HugepageService::status(const CallContext& caller, const std::string& request_id) {
     access(caller); require(!request_id.empty() && request_id.size() <= 128, ErrorCode::invalid_argument, "Invalid operation request ID");
     auto task = impl_->tasks.find_request(caller, request_id);
-    require(task && task->kind == "hugepage_operation" && task->resource == "hugepages", ErrorCode::task_not_found, "Hugepage operation is not retained");
+    if (!task || task->kind != "hugepage_operation" || task->resource != "hugepages") {
+        // The record is gone (daemon restart or retention) while the App still holds
+        // the business UUID. Say so once: the App now settles it from the module's
+        // own state instead of blocking huge-page editing forever, and this line is
+        // the author-visible half of that reconciliation.
+        if (impl_->io.log) impl_->io.log("WARN",
+            "reconcile: op " + request_id + " resolved as unknown (task record not retained; the App settles it from module state)");
+        throw ServiceError(ErrorCode::task_not_found, "Hugepage operation is not retained");
+    }
     return with_cancellation_receipt(impl_->tasks.get(caller, task->ref));
 }
 }

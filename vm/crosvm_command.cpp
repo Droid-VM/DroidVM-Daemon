@@ -254,6 +254,26 @@ int64_t boot_guest_pool_mb(const Json::Value& item) {
     return 0;
 }
 
+// VpuConfig: one App switch for both the decoder and the encoder, plus the
+// host pool they allocate from. Configs written before the keys existed keep
+// the App's own defaults (off, 256 MiB); the system properties, when set,
+// override both for this launch only.
+constexpr int64_t default_vpu_host_pool_mb = 256; // VpuConfig.DEFAULT_HOST_POOL_MB
+constexpr int64_t max_vpu_host_pool_mb = 65536; // checkInputField(etMediaHostPoolMb, false, 0, 65536)
+struct VpuPlan {
+    bool enabled = false;
+    int64_t host_pool_mb = default_vpu_host_pool_mb;
+};
+VpuPlan vpu_plan(const Json::Value& item, const HostFacts& host) {
+    VpuPlan plan;
+    plan.enabled = boolean(item, "vpu_enabled", false);
+    const auto pool = integer(item, "vpu_host_pool_mb", default_vpu_host_pool_mb);
+    plan.host_pool_mb = pool > 0 && pool <= max_vpu_host_pool_mb ? pool : default_vpu_host_pool_mb;
+    if (host.virtio_media_override) plan.enabled = *host.virtio_media_override;
+    if (host.virtio_media_host_mb_override) plan.host_pool_mb = *host.virtio_media_host_mb_override;
+    return plan;
+}
+
 struct Builder {
     const Json::Value& item;
     const CrosvmRun& run;
@@ -277,26 +297,34 @@ struct Builder {
         const bool venus = has_gpu && backend == "GPU_VIRGLRENDERER" && gpu_mode(item) == "VULKAN";
         args.push_back("gunyah");
         const auto guest_pool = boot_guest_pool_mb(item);
+        // One --pre-alloc for the whole VM: argh rejects a repeated option.
+        std::string pre_alloc;
         if (gfxstream) {
             const bool udmabuf = boolean(item, "gpu_udmabuf", true);
             const auto host_pool = integer(item, "gpu_host_pool_mb", 0);
             if (host_pool > 0 || udmabuf) {
-                auto pre_alloc = "gfx-host-mb=" + decimal(host_pool);
+                pre_alloc = "gfx-host-mb=" + decimal(host_pool);
                 if (udmabuf) guest_pool_options(pre_alloc, item, guest_pool);
-                args.push_back("--pre-alloc");
-                args.push_back(pre_alloc);
             }
         }
         const auto pool_args = [&](const char* key, int64_t pool) {
-            std::string pre_alloc;
-            if (pool > 0) pre_alloc += std::string(key) + "=" + decimal(pool);
+            if (pool > 0) {
+                if (!pre_alloc.empty()) pre_alloc += ',';
+                pre_alloc += std::string(key) + "=" + decimal(pool);
+            }
             guest_pool_options(pre_alloc, item, guest_pool);
-            if (pre_alloc.empty()) return;
-            args.push_back("--pre-alloc");
-            args.push_back(pre_alloc);
         };
         if (drm2kgsl) pool_args("drm-host-mb", integer(item, "gpu_drm2kgsl_pool_mb", 0));
         if (venus) pool_args("venus-host-mb", integer(item, "gpu_venus_pool_mb", 256));
+        // P1: gunyah refuses a virtio-media device without this pool key.
+        if (const auto vpu = vpu_plan(item, host); vpu.enabled) {
+            if (!pre_alloc.empty()) pre_alloc += ',';
+            pre_alloc += "media-host-mb=" + decimal(vpu.host_pool_mb);
+        }
+        if (!pre_alloc.empty()) {
+            args.push_back("--pre-alloc");
+            args.push_back(pre_alloc);
+        }
         def_protected = "PROTECTED_WITHOUT_FIRMWARE";
     }
     void disks() {
@@ -535,6 +563,14 @@ struct Builder {
             args.push_back(sound_config(endpoints, peripheral));
         }
     }
+    // P1: one decoder and one encoder adapter, both in helpers under the app uid.
+    void virtio_media() {
+        if (!vpu_plan(item, host).enabled || host.app_uid <= 0) return;
+        for (const char* kind : {"decoder", "encoder"}) {
+            args.push_back("--virtio-media");
+            args.push_back(std::string("kind=") + kind + ",uid=" + decimal(host.app_uid));
+        }
+    }
     void serials() {
         const auto& ports = member(item, "serial_ports");
         if (!ports.isArray()) return;
@@ -651,6 +687,7 @@ struct Builder {
         for (const auto& screen : screens_of(item)) launch.input_bridge = launch.input_bridge || (screen.enabled() && screen.exporter() != "NONE");
         if (launch.input_bridge) inputs(launch);
         peripherals();
+        virtio_media();
         serials();
         extra_options(item, args);
         if (boot.uefi) {

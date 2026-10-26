@@ -10,6 +10,7 @@
 #include "store/network_config.h"
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -155,6 +156,16 @@ HostFacts probe_host(const HostProbe& probe) {
     host.turnip_exists = devices.turnip.value_or(false);
     host.system_vulkan_hal = devices.system_vulkan_hal;
     host.viosnd_dump_exists = exists("/data/local/tmp/viosnd_dump");
+    // P1: the properties override the VM's own VpuConfig choice when set; an
+    // absent property leaves the persisted per-VM vpu_* keys in charge.
+    const auto media = trim(system_property("droidvm.virtiomedia"));
+    if (!media.empty()) {
+        auto lower = media;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        host.virtio_media_override = !(lower == "0" || lower == "false" || lower == "off");
+    }
+    const auto media_mb = java_int(trim(system_property("droidvm.virtiomedia.hostmb")));
+    if (media_mb && *media_mb > 0 && *media_mb <= 65536) host.virtio_media_host_mb_override = *media_mb;
     return host;
 }
 }

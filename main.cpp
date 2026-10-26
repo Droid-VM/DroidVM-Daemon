@@ -523,6 +523,7 @@ int main(int argc, char** argv) {
                 // exposes manual administration, as with the USB gadget owner.
                 if (same) {
                     droidvm::HugepageOptions options;
+                    options.log = [&](const char* level, const std::string& text) { if (log) log->write(level, "Hugepage: " + text); };
                     options.manual_changed = [&](int64_t baseline) {
                         auto actual = hugepages.read("pool_want");
                         if (!actual && !hugepages.has("pool_want")) actual = hugepages.read("pool_target");

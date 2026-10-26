@@ -78,6 +78,8 @@ droidvm::vm::HostFacts crosvm_host(const Json::Value& value) {
     set(value, "turnip_exists", host.turnip_exists);
     host.system_vulkan_hal = text(value, "system_vulkan_hal");
     set(value, "viosnd_dump_exists", host.viosnd_dump_exists);
+    if (value.isObject() && value["virtio_media_override"].isBool()) host.virtio_media_override = value["virtio_media_override"].asBool();
+    if (value.isObject() && value["virtio_media_host_mb_override"].isIntegral()) host.virtio_media_host_mb_override = value["virtio_media_host_mb_override"].asInt64();
     return host;
 }
 }

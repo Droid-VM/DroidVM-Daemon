@@ -876,6 +876,15 @@ bool VmRuntime::spawn(const std::vector<std::string>& argv, const std::vector<st
     ChildOptions options;
     options.preserve_fds = preserve_fds;
     options.argv = argv;
+    {
+        // One line with the exact argv, so a launch can be reproduced from the log.
+        std::string line;
+        for (const auto& arg : argv) {
+            if (!line.empty()) line += ' ';
+            line += arg;
+        }
+        context_.info("Executing: " + line);
+    }
     options.environment = merged_environment(env);
     options.limits = {{RLIMIT_NOFILE, 65536, 65536}, {RLIMIT_MEMLOCK, RLIM_INFINITY, RLIM_INFINITY}};
     if (context_.private_console) options.limits.push_back({RLIMIT_CORE, 0, 0});
