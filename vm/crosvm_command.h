@@ -50,6 +50,12 @@ struct HostFacts {
     bool turnip_exists = false; // new File(DATA_DIR/usr/lib/libvulkan_freedreno.so).exists()
     std::optional<std::string> system_vulkan_hal; // resolveSystemVulkanHal()
     bool viosnd_dump_exists = false; // new File("/data/local/tmp/viosnd_dump").exists()
+    // droidvm.virtiomedia / droidvm.virtiomedia.hostmb: a host-side override on
+    // top of a VM's own vpu_enabled / vpu_host_pool_mb (VpuConfig). The
+    // properties are runtime-only and die with the tablet, so they can only
+    // override, never replace, the persisted per-VM choice.
+    std::optional<bool> virtio_media_override; // absent = follow the VM config
+    std::optional<int64_t> virtio_media_host_mb_override; // 1..65536 MiB
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}

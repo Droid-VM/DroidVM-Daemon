@@ -29,6 +29,8 @@ struct HugepageOptions {
     std::function<void(const std::string&, bool)> marker;
     std::function<HugepageCommandResult(const std::vector<std::string>&)> run;
     std::function<void(int64_t)> manual_changed;
+    // Optional lifecycle line for the daemon log (droidvmd.log); null in tests.
+    std::function<void(const char*, const std::string&)> log;
 };
 // One typed owner shared by local IPC and HTTP adapters. PoolReservations is
 // also used by every Gunyah runtime; no transport-specific mutation mutex.
