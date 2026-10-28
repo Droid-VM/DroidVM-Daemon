@@ -548,9 +548,27 @@ struct Builder {
         const auto& list = member(item, "peripherals");
         if (!list.isArray()) return;
         static const Json::Value empty_object(Json::objectValue);
+        int camera_seen = 0;
         for (const auto& peripheral : list) {
+            const auto type = java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types);
+            // One emulated USB (UVC) camera per row. A row left on "follow the
+            // system" hands over its position instead of an id, which is what
+            // makes two default rows land on two different cameras rather than
+            // both on the back one.
+            if (type == "VIRTIO_CAMERA") {
+                std::string key;
+                if (present(peripheral, "host_device")) {
+                    const auto& value = peripheral["host_device"];
+                    if (!value.isString()) throw std::runtime_error("Expected type STRING");
+                    key = value.asString();
+                }
+                args.push_back("--uvc-camera");
+                args.push_back(key.empty() ? decimal(camera_seen) : key);
+                ++camera_seen;
+                continue;
+            }
             // XHCI_USB and the unbacked types only log.
-            if (java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) != "VIRTIO_SOUND") continue;
+            if (type != "VIRTIO_SOUND") continue;
             if (host.app_uid <= 0) continue;
             std::vector<const Json::Value*> endpoints;
             const auto& rows = member(peripheral, "endpoints");
