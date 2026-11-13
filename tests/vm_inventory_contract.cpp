@@ -55,6 +55,32 @@ void vnc_launch_metadata() {
     crosvm = vm::crosvm_command(config, {}, {}, host);
     check(crosvm.vnc_endpoints[0].unavailable_reason == "unsupported", "external crosvm config invalidates generated metadata");
 }
+void webrtc_launch_arguments() {
+    Json::Value config;
+    config["id"] = random_id(true); config["name"] = "webrtc-contract";
+    config["gpu_backend"] = "GPU_2D";
+    auto& screen = config["screens"]["gpu-0"];
+    screen["enabled"] = true; screen["exporter"] = "webrtc"; screen["input_enabled"] = true;
+    screen["transport_cap"] = "cpu";
+    screen["webrtc"]["port"] = 8090; screen["webrtc"]["token"] = "abc-123";
+    screen["webrtc"]["codec"] = "h264"; screen["webrtc"]["bitrate"] = 1500; screen["webrtc"]["adapt"] = false;
+    vm::HostFacts host; host.has_kvm = true;
+    auto launch = vm::crosvm_command(config, {}, {}, host);
+    auto has = [&](const std::string& flag, const std::string& value) {
+        for (size_t i = 0; i + 1 < launch.argv.size(); ++i) if (launch.argv[i] == flag && launch.argv[i + 1] == value) return true;
+        return false;
+    };
+    check(has("--webrtc-server", "port=8090,token=abc-123,view-only=false,screen=gpu-0,codec=h264,bitrate=1500,adapt=false,transport-cap=cpu"),
+        "WebRTC listener argument");
+    check(launch.webrtc_endpoints.size() == 1 && launch.webrtc_endpoints[0].port == 8090 &&
+        launch.webrtc_endpoints[0].token == "abc-123" && launch.vnc_endpoints.empty(), "WebRTC endpoint recorded");
+    check(!launch.input_bridge && launch.input_sockets.empty(), "WebRTC input stays inside crosvm");
+    screen["webrtc"]["token_auth"] = false; screen["transport_cap"] = "gpu-hw"; screen["webrtc"]["bitrate"] = 0;
+    launch = vm::crosvm_command(config, {}, {}, host);
+    check(has("--webrtc-server", "port=8090,view-only=false,screen=gpu-0,codec=h264,adapt=false"), "token off and top transport emit nothing");
+    screen["webrtc"]["token_auth"] = true; screen["webrtc"]["token"] = "bad token";
+    try { (void)vm::crosvm_command(config, {}, {}, host); throw std::runtime_error("unsafe token accepted"); } catch (const std::invalid_argument&) {}
+}
 void kms_launch_arguments() {
     Json::Value config;
     config["id"] = random_id(true); config["name"] = "kms-contract";
@@ -1981,6 +2007,7 @@ int main() {
         {"crosvm_disk_capabilities", crosvm_disk_capabilities},
         {"vnc_launch_metadata", vnc_launch_metadata},
         {"kms_launch_arguments", kms_launch_arguments},
+        {"webrtc_launch_arguments", webrtc_launch_arguments},
         {"crosvm_disk_capability_process", crosvm_disk_capability_process},
         {"crosvm_retained_disk_attachment", crosvm_retained_disk_attachment},
         {"qemu_retained_disk_attachment", qemu_retained_disk_attachment},

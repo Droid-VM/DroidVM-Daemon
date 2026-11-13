@@ -10,6 +10,11 @@ namespace droidvm::web {
 // environment, agent settings, console credentials, etc.) to a list request.
 using VmLeaseLookup = std::function<Json::Value(const std::string& network)>;
 using VmCurrentObservation = std::function<bool(const std::string& id, const std::string& instance, const std::string& revision)>;
+// Cumulative counters for a running VM process; null when unreadable.
+using VmUsageLookup = std::function<Json::Value(int64_t pid)>;
 Json::Value vm_snapshot(const Json::Value& inventory, const VmConfigSnapshot* configuration = nullptr,
-    VmLeaseLookup leases = {}, VmCurrentObservation current = {});
+    VmLeaseLookup leases = {}, VmCurrentObservation current = {}, VmUsageLookup usage = {});
+// /proc counters: CPU time and IO summed over the process tree, RSS of the
+// main process (device processes map the same guest memory).
+Json::Value vm_process_usage(int64_t pid);
 }

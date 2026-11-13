@@ -8,6 +8,13 @@
 #include <chrono>
 #include <cctype>
 #include <map>
+#include <optional>
+#include <vector>
+#include <dirent.h>
+#include <fstream>
+#include <sstream>
+#include <ctime>
+#include <unistd.h>
 
 namespace droidvm::web {
 namespace {
@@ -21,8 +28,77 @@ Json::Value configured_quantity(const Json::Value& row, const char* key) {
     if (number == 0 || number > 9007199254740991ULL) return {};
     return value;
 }
+struct ProcessStat { int64_t parent = 0; uint64_t ticks = 0; };
+std::optional<ProcessStat> process_stat(const std::string& pid) {
+    std::ifstream input("/proc/" + pid + "/stat");
+    std::string line;
+    if (!std::getline(input, line)) return {};
+    const auto end = line.rfind(')');
+    if (end == std::string::npos) return {};
+    std::istringstream fields(line.substr(end + 1));
+    std::string state;
+    ProcessStat result;
+    uint64_t skip = 0, user = 0, system = 0;
+    fields >> state >> result.parent;
+    for (int i = 0; i < 9; ++i) fields >> skip;
+    fields >> user >> system;
+    if (!fields) return {};
+    result.ticks = user + system;
+    return result;
 }
-Json::Value vm_snapshot(const Json::Value& inventory, const VmConfigSnapshot* configuration, VmLeaseLookup leases, VmCurrentObservation current) {
+std::pair<uint64_t, uint64_t> process_io(const std::string& pid) {
+    std::ifstream input("/proc/" + pid + "/io");
+    std::string key;
+    uint64_t value = 0, read = 0, write = 0;
+    while (input >> key >> value) {
+        if (key == "read_bytes:") read = value;
+        else if (key == "write_bytes:") write = value;
+    }
+    return {read, write};
+}
+}
+Json::Value vm_process_usage(int64_t pid) {
+    if (pid <= 0) return {};
+    const auto root = std::to_string(pid);
+    const auto main = process_stat(root);
+    if (!main) return {};
+    std::map<int64_t, std::vector<std::string>> children;
+    if (auto* directory = opendir("/proc")) {
+        while (auto* entry = readdir(directory)) {
+            const std::string name = entry->d_name;
+            if (name.empty() || !std::all_of(name.begin(), name.end(), [](char c) { return c >= '0' && c <= '9'; })) continue;
+            if (const auto stat = process_stat(name)) children[stat->parent].push_back(name);
+        }
+        closedir(directory);
+    }
+    uint64_t ticks = 0, read = 0, write = 0;
+    std::vector<std::string> pending{root};
+    std::set<std::string> seen;
+    while (!pending.empty() && seen.size() < 4096) {
+        const auto current = pending.back(); pending.pop_back();
+        if (!seen.insert(current).second) continue;
+        const auto stat = current == root ? main : process_stat(current);
+        if (!stat) continue;
+        ticks += stat->ticks;
+        const auto [r, w] = process_io(current);
+        read += r; write += w;
+        for (const auto& child : children[std::stoll(current)]) pending.push_back(child);
+    }
+    uint64_t pages = 0, resident = 0;
+    { std::ifstream statm("/proc/" + root + "/statm"); statm >> pages >> resident; }
+    const auto hz = sysconf(_SC_CLK_TCK);
+    const auto page = sysconf(_SC_PAGESIZE);
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    Json::Value result;
+    result["cpuTimeMs"] = std::to_string(hz > 0 ? ticks * 1000 / static_cast<uint64_t>(hz) : 0);
+    result["rssBytes"] = std::to_string(resident * static_cast<uint64_t>(page > 0 ? page : 4096));
+    result["readBytes"] = std::to_string(read);
+    result["writeBytes"] = std::to_string(write);
+    result["sampledAtMs"] = std::to_string(static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1000000);
+    return result;
+}
+Json::Value vm_snapshot(const Json::Value& inventory, const VmConfigSnapshot* configuration, VmLeaseLookup leases, VmCurrentObservation current, VmUsageLookup usage) {
     if (!inventory.isArray()) invalid_inventory();
     constexpr std::array<std::string_view, 6> states{"STOPPED", "STARTING", "RUNNING", "SUSPENDED", "STOPPING", "REBOOTING"};
     Json::Value result(Json::objectValue);
@@ -47,6 +123,11 @@ Json::Value vm_snapshot(const Json::Value& inventory, const VmConfigSnapshot* co
             const auto text = row["runtime_uptime_ms"].asString();
             if (!text.empty() && text.size() <= 19 && std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; }))
                 view["uptimeMs"] = text;
+        }
+        if (usage && state == "RUNNING" && row["pid"].isInt64() && row["pid"].asInt64() > 0) {
+            Json::Value counters;
+            try { counters = usage(row["pid"].asInt64()); } catch (const std::exception&) {}
+            if (counters.isObject()) view["usage"] = std::move(counters);
         }
         view["ipAddresses"] = Json::Value();
         if (state == "RUNNING" && leases && current && row["runtime_instance"].isString() && row["runtime_revision"].isString() &&
@@ -100,7 +181,8 @@ Json::Value vm_snapshot(const Json::Value& inventory, const VmConfigSnapshot* co
             }
             auto& actions = control["actions"] = Json::Value(Json::arrayValue);
             for (const auto& action : row["runtime_actions"]) {
-                if (action != "start" && action != "stop" && action != "reboot" && action != "suspend" && action != "resume") invalid_inventory();
+                if (action != "start" && action != "stop" && action != "reboot" && action != "suspend" && action != "resume" &&
+                    action != "powerbtn" && action != "sleepbtn") invalid_inventory();
                 if (action == "start" && control["configRevision"].isNull()) continue;
                 actions.append(action);
             }
