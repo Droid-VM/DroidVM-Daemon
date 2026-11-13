@@ -22,10 +22,12 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/klog.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef __ANDROID__
+#include "runtime/child.h"
 #include <sys/system_properties.h>
 #endif
 #endif
@@ -49,6 +51,7 @@ constexpr const char* system_suspend = "system_suspend";
 constexpr const char* wake_lock_name = "droidvm_android_display";
 constexpr const char* brightness_path = "/sys/class/backlight/panel0-backlight/brightness";
 constexpr const char* stability_keys[] = {"scout", "nativehang", "nativehangII", "qcom_hang_task"};
+constexpr const char* network_dependencies[] = {"netd", "wificond", "vendor.ipacm"};
 constexpr unsigned watchdog_kick_seconds = 120;
 constexpr int auto_restore_min = 60, auto_restore_max = 86400, auto_restore_default = 1800;
 constexpr auto restore_wait = 180s;
@@ -103,11 +106,62 @@ Json::Value network_json(const AndroidDisplayIo& io, const std::string& interfac
 }
 }
 
+AndroidWatchdogStatus android_display_probe_watchdog(const std::function<bool(const std::string&)>& exists,
+                                                    const std::function<std::string()>& verify_hangdetect) {
+    try {
+        for (const char* path : {"/dev/Monitor_Hang", "/sys/class/misc/Monitor_Hang", "/sys/module/hangdetect"})
+            if (exists(path)) return {true, verify_hangdetect()};
+        return {false, {}};
+    } catch (const std::exception& error) {
+        return {true, std::string("watchdog probe: ") + error.what()};
+    }
+}
+
+std::unique_ptr<AndroidWatchdog> android_display_arm_watchdog(const AndroidDisplayIo& io, const AndroidDisplayPlan& plan) {
+    const auto status = io.watchdog_status();
+    if (!status.reason.empty()) throw std::runtime_error(status.reason);
+    if (status.required != plan.watchdog_required) throw std::runtime_error("watchdog presence changed before sentinel startup");
+    if (!status.required) return {};
+    auto watchdog = io.open_watchdog();
+    if (!watchdog) throw std::runtime_error("watchdog adapter unavailable");
+    watchdog->kick(watchdog_kick_seconds);
+    return watchdog;
+}
+
+std::optional<AndroidDisplayNetwork> android_display_network(const std::string& dump) {
+    std::istringstream lines(dump);
+    std::string id;
+    for (std::string line; std::getline(lines, line);) {
+        line = trim(line);
+        constexpr std::string_view prefix = "Active default network: ";
+        if (line.starts_with(prefix)) { id = trim(line.substr(prefix.size())); break; }
+    }
+    if (id == "none") return AndroidDisplayNetwork{};
+    if (id.empty() || id.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+    lines.clear(); lines.seekg(0);
+    for (std::string line; std::getline(lines, line);) {
+        line = trim(line);
+        if (!line.starts_with("NetworkAgentInfo{network{" + id + "}")) continue;
+        const auto begin = line.find("Capabilities: ");
+        if (begin == std::string::npos) return std::nullopt;
+        const auto caps = line.substr(begin + 14, line.find(' ', begin + 14) - (begin + 14));
+        return AndroidDisplayNetwork{true, ("&" + caps + "&").find("&VALIDATED&") != std::string::npos};
+    }
+    return std::nullopt;
+}
+
 Json::Value AndroidDisplayPlan::json() const {
     Json::Value out;
     out["daemon_pid"] = daemon_pid; out["daemon_start"] = daemon_start;
     out["server_pid"] = server_pid; out["server_start"] = server_start;
     out["suspend_running"] = suspend_running; out["secondary_running"] = secondary_running;
+    out["zygote_running"] = zygote_running; out["stop_zygote"] = stop_zygote;
+    out["watchdog_required"] = watchdog_required;
+    out["rescue_adapter"] = rescue_adapter;
+    out["network_services"] = Json::Value(Json::arrayValue);
+    for (const auto& name : network_services) out["network_services"].append(name);
+    out["network_default"] = network_default; out["network_validated"] = network_validated;
+    out["wifi"] = wifi;
     out["stability"] = Json::Value(Json::arrayValue);
     for (const auto& [key, value] : stability) { Json::Value row; row.append(key); row.append(value); out["stability"].append(row); }
     out["lock_directory"] = lock_directory; out["network_interface"] = network_interface;
@@ -121,6 +175,17 @@ AndroidDisplayPlan AndroidDisplayPlan::parse(const Json::Value& value) {
     plan.daemon_pid = value["daemon_pid"].asInt(); plan.daemon_start = value["daemon_start"].asString();
     plan.server_pid = value["server_pid"].asInt(); plan.server_start = value["server_start"].asString();
     plan.suspend_running = value["suspend_running"].asBool(); plan.secondary_running = value["secondary_running"].asBool();
+    plan.zygote_running = value.get("zygote_running", true).asBool(); plan.stop_zygote = value.get("stop_zygote", false).asBool();
+    plan.watchdog_required = value.get("watchdog_required", true).asBool();
+    plan.rescue_adapter = value.get("rescue_adapter", "").asString();
+    for (const auto& name : value["network_services"]) {
+        if (!name.isString() || std::find(std::begin(network_dependencies), std::end(network_dependencies), name.asString()) == std::end(network_dependencies))
+            throw std::runtime_error("invalid network service in display plan");
+        plan.network_services.push_back(name.asString());
+    }
+    plan.network_default = value.get("network_default", false).asBool();
+    plan.network_validated = value.get("network_validated", false).asBool();
+    plan.wifi = value["wifi"];
     for (const auto& row : value["stability"]) {
         if (!row.isArray() || row.size() != 2) throw std::runtime_error("invalid display plan");
         plan.stability.emplace_back(row[0].asString(), row[1].asString());
@@ -131,10 +196,17 @@ AndroidDisplayPlan AndroidDisplayPlan::parse(const Json::Value& value) {
 }
 
 void android_display_restore(const AndroidDisplayIo& io, const AndroidDisplayPlan& plan, AndroidWatchdog* watchdog,
-                             const std::function<void(const std::string&)>& progress) {
+                             const std::function<void(const std::string&)>& progress, AndroidWifiSession* wifi) {
+    AndroidRescueRestart rescue(io, plan.rescue_adapter);
+    // A second supplicant must never compete for the interface during boot.
+    if (wifi) { progress("stop independent Wi-Fi"); wifi->stop(); }
     std::vector<std::string> failures;
     auto attempt = [&](const char* label, const std::function<void()>& work) {
         progress(label);
+        if (watchdog) {
+            try { watchdog->kick(watchdog_kick_seconds); }
+            catch (const std::exception& error) { failures.push_back(std::string("watchdog: ") + error.what()); }
+        }
         try { work(); } catch (const std::exception& error) { failures.push_back(std::string(label) + ": " + error.what()); }
     };
     // SurfaceFlinger cannot reuse the frozen framework's layer handles (it
@@ -150,28 +222,51 @@ void android_display_restore(const AndroidDisplayIo& io, const AndroidDisplayPla
             throw;
         }
     });
+    bool framework_exited = false;
     if (stopped) attempt("old framework exit", [&] {
         const auto until = io.wall_ms() + 8000;
         while (io.start_ticks(plan.server_pid).value_or("") == plan.server_start) {
             if (io.wall_ms() >= until) throw std::runtime_error("old system_server did not exit");
             io.sleep(50ms);
         }
+        framework_exited = true;
     });
+    // ctl.stop/start does not run zygote's onrestart dependency actions.
+    // Reset netd's old network IDs before the new ConnectivityService starts.
+    // Never ctl.restart netd: its onrestart would restart zygote in turn.
+    if (framework_exited) {
+        for (auto it = plan.network_services.rbegin(); it != plan.network_services.rend(); ++it)
+            attempt(("stop " + *it).c_str(), [&] { service(io, *it, false); });
+        for (const auto& name : plan.network_services)
+            attempt(("start " + name).c_str(), [&] { service(io, name, true); });
+    }
     attempt("start composer", [&] { service(io, composer, true); });
     attempt("start surfaceflinger", [&] { service(io, surfaceflinger, true); });
-    attempt("start zygote", [&] { service(io, "zygote", true); });
+    if (plan.zygote_running) attempt("start zygote", [&] {
+        // Never alter boot accounting while the old framework may still write it.
+        if (framework_exited) rescue.arm();
+        try { service(io, "zygote", true); }
+        catch (...) { rescue.cancel(); throw; }
+    });
     if (plan.secondary_running) attempt("start zygote_secondary", [&] { service(io, "zygote_secondary", true); });
     attempt("wake unlock", [&] { io.write("/sys/power/wake_unlock", wake_lock_name); });
     if (plan.suspend_running) attempt("start system_suspend", [&] { service(io, system_suspend, true); });
     for (const auto& [key, value] : plan.stability) attempt(key.c_str(), [&] { io.set_property(key, value); });
+    // SystemServer startup itself needs suspend/secondary services. Waiting for
+    // noteBoot before restoring those dependencies would stall its registration.
+    attempt("verify controlled framework restart", [&] { rescue.finish(plan.server_pid, plan.server_start); });
     // "running" only means init forked a process: require the compositor boot
     // handshake and ten seconds without a display/framework restart.
-    if (failures.empty()) attempt("verify framework", [&] {
+    // Even if accounting or another step reported an error, keep feeding the
+    // hardware watchdog while the restored framework boots. Earlier failures
+    // still fail the receipt; they must not skip recovery/readiness work.
+    attempt("verify framework", [&] {
         const auto sf_pid = io.property("init.svc_debug_pid." + std::string(surfaceflinger));
         const auto composer_pid = io.property("init.svc_debug_pid." + std::string(composer));
         if (sf_pid.empty() || composer_pid.empty()) throw std::runtime_error("missing restored service PID");
         const auto deadline = io.wall_ms() + 90000;
         std::optional<std::tuple<int, std::string, uint64_t>> stable;
+        bool network_ready = false;
         for (;;) {
             if (watchdog) watchdog->kick(watchdog_kick_seconds);
             if (io.property(svc(surfaceflinger)) != "running" || io.property(svc(composer)) != "running" ||
@@ -189,10 +284,18 @@ void android_display_restore(const AndroidDisplayIo& io, const AndroidDisplayPla
                 if (stable) {
                     const auto& [pid, start, since] = *stable;
                     if (pid != server->first || start != server->second || !ready) throw std::runtime_error("Android framework became unstable after boot");
-                    if (io.wall_ms() - since >= 10000) return;
+                    if (io.wall_ms() - since >= 10000) {
+                        progress("verify network");
+                        std::optional<AndroidDisplayNetwork> network;
+                        try { network = io.network_status(); } catch (const std::exception&) {}
+                        network_ready = network && (!plan.network_default || network->default_present) &&
+                            (!plan.network_validated || network->validated);
+                        if (network_ready) return;
+                    }
                 } else if (ready) stable = std::tuple{server->first, server->second, io.wall_ms()};
             } else if (stable) throw std::runtime_error("Android framework exited after boot");
-            if (io.wall_ms() >= deadline) throw std::runtime_error("Android framework boot did not complete within 90 seconds");
+            if (io.wall_ms() >= deadline) throw std::runtime_error(stable && !network_ready ?
+                "Android default network/validation did not recover within 90 seconds" : "Android framework boot did not complete within 90 seconds");
             io.sleep(1s);
         }
     });
@@ -216,10 +319,13 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
     Json::Value last_restore;
     std::shared_ptr<AndroidSentinel> sentinel;
     std::thread reader;
-    std::optional<std::pair<uint64_t, std::string>> watchdog_cache; // observed at, status
+    std::optional<std::pair<uint64_t, AndroidWatchdogStatus>> watchdog_cache; // observed at, status
+    // The ABI check cannot see the driver's caller check; only the sentinel's
+    // first kick, made before any mutation, proves this daemon may feed it.
+    std::string watchdog_kick = "unproven", kick_rejection;
     Impl(TaskService& service, AndroidDisplayIo options) : tasks(service), io(std::move(options)) {
         if (io.android) require(io.property && io.set_property && io.read && io.write && io.processes && io.self_pid && io.start_ticks &&
-            io.stopped && io.signal && io.sleep && io.wall_ms && io.default_interface && io.watchdog_status && io.spawn_sentinel,
+            io.stopped && io.signal && io.sleep && io.wall_ms && io.uptime_ms && io.default_interface && io.network_status && io.wifi_plan && io.prepare_wifi && io.watchdog_status && io.rescue_status && io.open_watchdog && io.spawn_sentinel,
             ErrorCode::unavailable, "Android display IO is incomplete");
         if (!io.wall_ms) io.wall_ms = [] {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -239,10 +345,18 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             default: return "android";
         }
     }
-    std::string watchdog_status_cached() {
+    AndroidWatchdogStatus watchdog_status_cached() {
         const auto now = io.wall_ms();
-        if (!watchdog_cache || now - watchdog_cache->first > 30000) watchdog_cache = std::pair{now, io.watchdog_status()};
+        if (!watchdog_cache || now - watchdog_cache->first > 30000) {
+            const auto status = io.watchdog_status();
+            if (watchdog_cache && watchdog_cache->second.required != status.required) watchdog_kick = "unproven";
+            watchdog_cache = std::pair{now, status};
+        }
         return watchdog_cache->second;
+    }
+    AndroidWatchdogStatus watchdog_status() {
+        if (watchdog_kick == "rejected") return {true, "hangdetect rejected DroidVM's kick: " + kick_rejection};
+        return watchdog_status_cached();
     }
     void join_reader_locked() { if (reader.joinable() && phase == Phase::idle) reader.join(); }
     Json::Value snapshot_locked() {
@@ -264,16 +378,17 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
         out["lastRestore"] = last_restore;
         if (!io.android) {
             out["network"] = Json::Value(); out["panelLit"] = Json::Value();
-            out["watchdog"]["verified"] = false; out["watchdog"]["reason"] = "unsupported-host";
+            out["watchdog"]["verified"] = false; out["watchdog"]["reason"] = "unsupported-host"; out["watchdog"]["kick"] = "unproven";
             out["services"]["surfaceflinger"] = ""; out["services"]["composer"] = "";
             return out;
         }
         out["network"] = network_json(io, phase == Phase::idle ? io.default_interface() : network_interface);
         const auto brightness = panel_brightness(io);
         out["panelLit"] = brightness ? Json::Value(*brightness > 0) : Json::Value();
-        const auto watchdog = phase == Phase::idle ? watchdog_status_cached() : std::string();
-        out["watchdog"]["verified"] = watchdog.empty();
-        out["watchdog"]["reason"] = watchdog.empty() ? Json::Value() : Json::Value(watchdog);
+        const auto watchdog = phase == Phase::idle ? watchdog_status() : AndroidWatchdogStatus{watchdog_kick != "not-required", {}};
+        out["watchdog"]["verified"] = watchdog.reason.empty();
+        out["watchdog"]["reason"] = watchdog.reason.empty() ? Json::Value() : Json::Value(watchdog.reason);
+        out["watchdog"]["kick"] = watchdog.required ? watchdog_kick : "not-required";
         out["services"]["surfaceflinger"] = io.property(svc(surfaceflinger));
         out["services"]["composer"] = io.property(svc(composer));
         return out;
@@ -304,7 +419,7 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
     }
     // The stop sequence. Restoration is armed (sentinel ready) before the first
     // mutation; a partial failure hands the partial state to the sentinel.
-    void begin(const std::string& kind, const std::string& vm_id, const std::string& vm_name, int auto_restore, bool network_loss) {
+    void begin(const std::string& kind, const std::string& vm_id, const std::string& vm_name, int auto_restore, bool network_loss, bool stop_zygote = false) {
         AndroidDisplayPlan plan;
         std::shared_ptr<AndroidSentinel> handle;
         {
@@ -319,8 +434,12 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             require(!io.stopped(servers[0]), ErrorCode::unavailable, "system_server is already frozen");
             const auto brightness = panel_brightness(io);
             require(brightness && *brightness > 0, ErrorCode::unavailable, "the Android panel is dark; wake the screen first");
-            const auto watchdog = watchdog_status_cached();
-            require(watchdog.empty(), ErrorCode::unavailable, "hangdetect watchdog unverified: " + watchdog);
+            const auto watchdog = watchdog_status();
+            require(watchdog.reason.empty(), ErrorCode::unavailable, "Android watchdog unavailable: " + watchdog.reason);
+            plan.watchdog_required = watchdog.required;
+            const auto rescue = io.rescue_status();
+            require(rescue.reason.empty(), ErrorCode::unavailable, rescue.reason);
+            plan.rescue_adapter = rescue.adapter;
             plan.daemon_pid = io.self_pid();
             plan.daemon_start = io.start_ticks(plan.daemon_pid).value_or("");
             plan.server_pid = servers[0];
@@ -328,8 +447,20 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             require(!plan.server_start.empty(), ErrorCode::unavailable, "system_server identity unavailable");
             plan.suspend_running = io.property(svc(system_suspend)) == "running";
             plan.secondary_running = io.property(svc("zygote_secondary")) == "running";
+            plan.zygote_running = io.property(svc("zygote")) == "running";
+            require(plan.zygote_running, ErrorCode::unavailable, "zygote is not running");
+            plan.stop_zygote = stop_zygote;
+            for (const char* name : network_dependencies)
+                if (io.property(svc(name)) == "running") plan.network_services.emplace_back(name);
+            const auto network = io.network_status();
+            require(network.has_value(), ErrorCode::unavailable, "Android default network status unavailable");
+            plan.network_default = network->default_present; plan.network_validated = network->validated;
             for (const char* name : stability_keys) plan.stability.emplace_back(stability_key(name), io.property(stability_key(name)));
             plan.network_interface = io.default_interface();
+            if (plan.stop_zygote) {
+                plan.wifi = io.wifi_plan();
+                if (!plan.wifi.isNull()) plan.network_interface = plan.wifi["interface"].asString();
+            }
             plan.auto_restore_seconds = auto_restore;
             plan.restore_on_network_loss = network_loss && !plan.network_interface.empty();
             phase = Phase::stopping; owner_kind = kind; owner_vm = vm_id; owner_name = vm_name;
@@ -358,8 +489,14 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             if (!ready || *ready != "ready") {
                 std::string reason = ready && ready->starts_with("failed ") ? ready->substr(7) : "sentinel did not become ready";
                 handle->close();
+                if (reason.starts_with("hangdetect kick: ")) {
+                    std::lock_guard lock(mutex);
+                    watchdog_kick = "rejected"; kick_rejection = reason.substr(17);
+                }
                 fail("Android display sentinel: " + reason, false);
             }
+            std::lock_guard lock(mutex);
+            watchdog_kick = plan.watchdog_required ? "accepted" : "not-required";
         } catch (const ServiceError&) { throw; }
         catch (const std::exception& error) { fail(std::string("Android display sentinel: ") + error.what(), false); }
         try {
@@ -378,6 +515,24 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             io.sleep(2s);
             set_progress("stop composer");
             service(io, composer, false);
+            if (plan.stop_zygote) {
+                set_progress("stop zygote_secondary");
+                if (plan.secondary_running) service(io, "zygote_secondary", false);
+                set_progress("stop zygote");
+                service(io, "zygote", false);
+                const auto until = io.wall_ms() + 8000;
+                while (io.start_ticks(plan.server_pid).value_or("") == plan.server_start) {
+                    if (io.wall_ms() >= until) throw std::runtime_error("system_server did not exit after stopping zygote");
+                    io.sleep(50ms);
+                }
+                if (!plan.wifi.isNull()) {
+                    set_progress("connect independent Wi-Fi");
+                    handle->send("start-wifi");
+                    const auto ready = handle->read_line(65s);
+                    if (!ready || *ready != "wifi-ready") throw std::runtime_error(
+                        ready && ready->starts_with("wifi-failed ") ? ready->substr(12) : "independent Wi-Fi did not become ready");
+                }
+            }
         } catch (const std::exception& error) { fail(std::string("Android display stop failed, restoring: ") + error.what(), true); }
         std::lock_guard lock(mutex);
         phase = Phase::stopped; progress = "stopped";
@@ -419,7 +574,7 @@ struct AndroidDisplayService::Impl : std::enable_shared_from_this<Impl> {
             if (!control.enter_commit()) return TaskCompletion::cancelled(result);
             if (kind == "stop") {
                 const int auto_restore = operation.get("autoRestoreSeconds", auto_restore_default).asInt();
-                begin("manual", "", "", auto_restore, operation.get("restoreOnNetworkLoss", true).asBool());
+                begin("manual", "", "", auto_restore, operation.get("restoreOnNetworkLoss", true).asBool(), operation.get("tier", "display") == "zygote");
                 std::lock_guard lock(mutex);
                 result["state"] = phase_name(phase); result["stopped"] = true;
                 result["revision"] = std::to_string(revision); result["network"] = network_json(io, network_interface);
@@ -473,7 +628,10 @@ void validate(const Json::Value& request) {
     const auto kind = operation["kind"].asString();
     if (kind == "stop") {
         for (const auto& key : operation.getMemberNames())
-            require(key == "kind" || key == "autoRestoreSeconds" || key == "restoreOnNetworkLoss", ErrorCode::invalid_argument, "Unexpected stop field");
+            require(key == "kind" || key == "tier" || key == "autoRestoreSeconds" || key == "restoreOnNetworkLoss", ErrorCode::invalid_argument, "Unexpected stop field");
+        if (operation.isMember("tier"))
+            require(operation["tier"].isString() && (operation["tier"] == "display" || operation["tier"] == "zygote"),
+                ErrorCode::invalid_argument, "tier must be display or zygote");
         if (operation.isMember("autoRestoreSeconds"))
             require(operation["autoRestoreSeconds"].isInt() && operation["autoRestoreSeconds"].asInt() >= auto_restore_min &&
                 operation["autoRestoreSeconds"].asInt() <= auto_restore_max, ErrorCode::invalid_argument, "autoRestoreSeconds must be 60 to 86400");
@@ -515,8 +673,8 @@ TaskView AndroidDisplayService::status(const CallContext& caller, const std::str
     require(found.has_value(), ErrorCode::task_not_found, "Unknown Android display request");
     return *found;
 }
-std::unique_ptr<vm::AndroidDisplayLease> AndroidDisplayService::acquire(const std::string& vm_id, const std::string& vm_name) {
-    try { impl_->begin("vm", vm_id, vm_name, 0, false); }
+std::unique_ptr<vm::AndroidDisplayLease> AndroidDisplayService::acquire(const std::string& vm_id, const std::string& vm_name, bool stop_zygote) {
+    try { impl_->begin("vm", vm_id, vm_name, 0, false, stop_zygote); }
     catch (const ServiceError& error) { throw std::runtime_error(error.what()); }
     return std::make_unique<Lease>(impl_);
 }
@@ -681,7 +839,11 @@ public:
             const int null = open("/dev/null", O_WRONLY);
             if (null >= 0) dup2(null, 2);
             signal(SIGPIPE, SIG_IGN);
-            execl(executable.c_str(), "droidvmd-android-sentinel", "--android-display-sentinel", static_cast<char*>(nullptr));
+            // The verified hangdetect driver authorizes kicks by the cmdline
+            // system-path prefix. Only the sentinel uses this argv[0]; exec
+            // still loads the actual DroidVM executable supplied above.
+            execl(executable.c_str(), plan.watchdog_required ? "/system/bin/droidvmd-android-sentinel" : "droidvmd-android-sentinel",
+                  "--android-display-sentinel", static_cast<char*>(nullptr));
             _exit(127);
         }
         ::close(in[0]); ::close(out[1]);
@@ -743,8 +905,52 @@ AndroidDisplayIo android_display_real_io(std::string executable, std::string loc
     io.signal = [](int pid, int number) { if (kill(pid, number) != 0) throw std::runtime_error(std::string("kill: ") + std::strerror(errno)); };
     io.sleep = [](std::chrono::milliseconds duration) { std::this_thread::sleep_for(duration); };
     io.wall_ms = [] { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()); };
+    io.uptime_ms = [] {
+        timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) throw std::runtime_error("cannot read Android uptime");
+        return static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1000000;
+    };
     io.default_interface = default_route_interface;
-    io.watchdog_status = [] { return hangdetect_status(nullptr); };
+    io.wifi_plan = android_wifi_plan;
+    io.prepare_wifi = android_wifi_prepare;
+    io.network_status = []() -> std::optional<AndroidDisplayNetwork> {
+#ifdef __ANDROID__
+        ChildOptions options; options.argv = {"/system/bin/dumpsys", "-t", "2", "connectivity"};
+        Child child(options);
+        const auto result = child.communicate({}, 3s, 1u << 20);
+        if (result.exit_code != 0 || result.timed_out || result.truncated) return std::nullopt;
+        return android_display_network(result.output);
+#else
+        return std::nullopt;
+#endif
+    };
+    io.watchdog_status = [] {
+        return android_display_probe_watchdog([](const std::string& path) {
+            struct stat info{};
+            if (lstat(path.c_str(), &info) == 0) return true;
+            if (errno == ENOENT) return false;
+            throw std::runtime_error("inspect " + path + ": " + std::strerror(errno));
+        }, [] { return hangdetect_status(nullptr); });
+    };
+    io.open_watchdog = [] { return std::make_unique<Hangdetect>(); };
+    io.rescue_status = []() -> AndroidRescueStatus {
+#ifdef __ANDROID__
+        return android_rescue_probe([](const std::string& path) {
+            struct stat info{};
+            if (stat(path.c_str(), &info) == 0) return true;
+            if (errno == ENOENT) return false;
+            throw std::runtime_error("cannot inspect crash recovery module");
+        }, [](const std::string& path) {
+            ChildOptions options; options.argv = {"/system/bin/sha256sum", path};
+            Child child(options);
+            const auto result = child.communicate({}, 3s, 1024);
+            if (result.exit_code != 0 || result.timed_out || result.truncated) throw std::runtime_error("cannot verify crash recovery module fingerprint");
+            return result.output.substr(0, result.output.find(' '));
+        }, property_get);
+#else
+        return {};
+#endif
+    };
     io.spawn_sentinel = [executable, lock_directory](const AndroidDisplayPlan& plan) -> std::unique_ptr<AndroidSentinel> {
         auto copy = plan;
         if (copy.lock_directory.empty()) copy.lock_directory = lock_directory;
@@ -774,22 +980,30 @@ int android_display_sentinel_main() {
     if (io.start_ticks(plan.daemon_pid).value_or("") != plan.daemon_start) return fail("daemon identity mismatch");
     Fd daemon(static_cast<int>(syscall(SYS_pidfd_open, plan.daemon_pid, 0)));
     if (daemon.get() < 0) return fail(std::string("pidfd_open: ") + std::strerror(errno));
-    std::unique_ptr<Hangdetect> watchdog;
-    try { watchdog = std::make_unique<Hangdetect>(); watchdog->kick(watchdog_kick_seconds); }
+    std::unique_ptr<AndroidWatchdog> watchdog;
+    std::unique_ptr<AndroidWifiSession> wifi;
+    try {
+        watchdog = android_display_arm_watchdog(io, plan);
+        AndroidRescueRestart(io, plan.rescue_adapter).verify_access();
+        if (!plan.wifi.isNull()) wifi = io.prepare_wifi(plan.wifi);
+    }
     catch (const std::exception& error) { return fail(error.what()); }
     say("ready");
     Fd watched;
     std::string reason, input;
     const auto started = std::chrono::steady_clock::now();
     unsigned link_down = 0;
+    bool wifi_started = false;
     while (reason.empty()) {
         pollfd events[3] = {{daemon.get(), POLLIN, 0}, {0, POLLIN, 0}, {watched.get(), POLLIN, 0}};
         const int count = poll(events, watched.get() >= 0 ? 3 : 2, 10000);
         if (count < 0 && errno == EINTR) continue;
         if (count < 0) { reason = std::string("poll: ") + std::strerror(errno); break; }
         if (count == 0) {
-            try { watchdog->kick(watchdog_kick_seconds); }
+            try { if (watchdog) watchdog->kick(watchdog_kick_seconds); }
             catch (const std::exception& error) { reason = std::string("watchdog: ") + error.what(); break; }
+            try { if (wifi_started) wifi->check(); }
+            catch (const std::exception& error) { reason = error.what(); break; }
             if (plan.auto_restore_seconds > 0 && std::chrono::steady_clock::now() - started >= std::chrono::seconds(plan.auto_restore_seconds)) { reason = "auto-restore deadline"; break; }
             if (plan.restore_on_network_loss) {
                 const auto state = operstate(io, plan.network_interface);
@@ -809,6 +1023,15 @@ int android_display_sentinel_main() {
                 const auto command = input.substr(0, newline);
                 input.erase(0, newline + 1);
                 if (command == "restore") reason = "requested";
+                else if (command == "start-wifi") {
+                    try {
+                        if (!wifi || wifi_started) throw std::runtime_error("invalid Wi-Fi handoff request");
+                        if (watchdog) watchdog->kick(watchdog_kick_seconds);
+                        wifi->start(); wifi_started = true; say("wifi-ready");
+                    } catch (const std::exception& error) {
+                        say(std::string("wifi-failed ") + error.what()); reason = "Wi-Fi handoff failed";
+                    }
+                }
                 else if (command == "unwatch") watched = Fd();
                 else if (command.starts_with("watch ")) {
                     try { watched = Fd(static_cast<int>(syscall(SYS_pidfd_open, std::stoi(command.substr(6)), 0))); } catch (...) { watched = Fd(); }
@@ -826,9 +1049,9 @@ int android_display_sentinel_main() {
         watched = Fd();
     }
     int status = 0;
-    try { android_display_restore(io, plan, watchdog.get(), [&](const std::string& phase) { say("progress " + phase); }); }
+    try { android_display_restore(io, plan, watchdog.get(), [&](const std::string& phase) { say("progress " + phase); }, wifi.get()); }
     catch (const std::exception& error) { say(std::string("failed ") + error.what()); status = 1; }
-    try { watchdog->restore(); } catch (const std::exception& error) { if (status == 0) { say(std::string("failed hangdetect restore: ") + error.what()); status = 1; } }
+    try { if (watchdog) watchdog->restore(); } catch (const std::exception& error) { if (status == 0) { say(std::string("failed hangdetect restore: ") + error.what()); status = 1; } }
     if (status == 0) say("restored");
     return status;
 }

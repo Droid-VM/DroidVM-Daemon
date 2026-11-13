@@ -19,6 +19,6 @@ public:
     // Blocks for the stop sequence (seconds). Throws std::runtime_error when
     // Android cannot be stopped; nothing is left half-stopped in that case.
     // Destroying the lease starts restoration without blocking the caller.
-    virtual std::unique_ptr<AndroidDisplayLease> acquire(const std::string& vm_id, const std::string& vm_name) = 0;
+    virtual std::unique_ptr<AndroidDisplayLease> acquire(const std::string& vm_id, const std::string& vm_name, bool stop_zygote = false) = 0;
 };
 }

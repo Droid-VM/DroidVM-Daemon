@@ -68,9 +68,10 @@ void validate(const Json::Value& input) {
     const auto& operation = input["operation"];
     if (!operation.isObject() || !operation["kind"].isString()) invalid();
     if (operation["kind"] == "stop") {
-        if (operation.size() > 3) invalid();
+        if (operation.size() > 4) invalid();
         for (const auto& key : operation.getMemberNames())
-            if (key != "kind" && key != "autoRestoreSeconds" && key != "restoreOnNetworkLoss") invalid();
+            if (key != "kind" && key != "tier" && key != "autoRestoreSeconds" && key != "restoreOnNetworkLoss") invalid();
+        if (operation.isMember("tier") && operation["tier"] != "display" && operation["tier"] != "zygote") invalid();
         if (operation.isMember("autoRestoreSeconds") &&
             (!operation["autoRestoreSeconds"].isInt() || operation["autoRestoreSeconds"].asInt() < 60 || operation["autoRestoreSeconds"].asInt() > 86400)) invalid();
         if (operation.isMember("restoreOnNetworkLoss") && !operation["restoreOnNetworkLoss"].isBool()) invalid();
@@ -83,6 +84,7 @@ Json::Value android_display_catalog(const Json::Value& native) {
             !native["restoreOnNetworkLoss"].isBool() || !native["progress"].isString() || native["progress"].asString().size() > 128 ||
             !native["watchdog"].isObject() || !native["watchdog"]["verified"].isBool() ||
             !(native["watchdog"]["reason"].isNull() || native["watchdog"]["reason"].isString()) ||
+            !(native["watchdog"]["kick"] == "unproven" || native["watchdog"]["kick"] == "accepted" || native["watchdog"]["kick"] == "rejected" || native["watchdog"]["kick"] == "not-required") ||
             !native["services"].isObject() || !native["services"]["surfaceflinger"].isString() || !native["services"]["composer"].isString() ||
             !(native["panelLit"].isNull() || native["panelLit"].isBool())) invalid();
         Json::Value result;
@@ -98,6 +100,7 @@ Json::Value android_display_catalog(const Json::Value& native) {
         result["panelLit"] = native["panelLit"];
         result["watchdog"]["verified"] = native["watchdog"]["verified"];
         result["watchdog"]["reason"] = native["watchdog"]["reason"].isString() ? Json::Value(native["watchdog"]["reason"].asString().substr(0, 256)) : Json::Value();
+        result["watchdog"]["kick"] = native["watchdog"]["kick"];
         result["services"]["surfaceflinger"] = native["services"]["surfaceflinger"].asString().substr(0, 32);
         result["services"]["composer"] = native["services"]["composer"].asString().substr(0, 32);
         result["lastRestore"] = last_restore(native["lastRestore"]);
