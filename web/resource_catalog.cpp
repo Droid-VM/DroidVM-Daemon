@@ -6,6 +6,10 @@
 #include "common/wire.h"
 #include "vm/vulkan_blit_probe.h"
 #include <algorithm>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace droidvm::web {
 Json::Value host_device_catalog(const vm::HostDeviceFacts& facts, const Json::Value& system_blit) {
@@ -142,6 +146,50 @@ Json::Value disk_catalog(const DiskConfigSnapshot& snapshot,
     }
     bound(result); return result;
 }
+void annotate_disk_list(Json::Value& catalog, const Json::Value& vms) {
+    std::map<std::string, Json::Value> users;
+    const auto& rows = member(vms, "vms");
+    size_t scanned = 0;
+    if (rows.isArray()) for (const auto& vm : rows) {
+        const auto& slots = member(vm, "disks");
+        if (!slots.isArray()) continue;
+        for (const auto& slot : slots) {
+            if (++scanned > 65536) break;
+            auto& list = users[text(slot, "path", 8192)];
+            if (!list.isArray()) list = Json::Value(Json::arrayValue);
+            if (list.size() >= 16) continue;
+            Json::Value user;
+            user["vmId"] = text(vm, "id", 128); user["vmName"] = text(vm, "name");
+            if (std::find(list.begin(), list.end(), user) == list.end()) list.append(std::move(user));
+        }
+    }
+    for (auto& item : catalog["items"]) {
+        const auto path = item["path"].asString();
+        item["format"] = Json::Value(); item["virtualBytes"] = Json::Value(); item["allocatedBytes"] = Json::Value();
+        const auto found = users.find(path);
+        item["users"] = found == users.end() ? Json::Value(Json::arrayValue) : found->second;
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY);
+        if (fd < 0) continue;
+        struct stat info{};
+        unsigned char header[24 + 8] = {};
+        const bool regular = fstat(fd, &info) == 0 && S_ISREG(info.st_mode);
+        const auto read = regular ? pread(fd, header, sizeof(header), 0) : -1;
+        close(fd);
+        if (!regular) continue;
+        item["allocatedBytes"] = std::to_string(static_cast<uint64_t>(info.st_blocks) * 512);
+        const auto big = [&](size_t at) { uint64_t value = 0; for (size_t i = 0; i < 8; ++i) value = value << 8 | header[at + i]; return value; };
+        const auto little = [&](size_t at) { uint64_t value = 0; for (size_t i = 8; i-- > 0;) value = value << 8 | header[at + i]; return value; };
+        if (read >= 32 && std::memcmp(header, "QFI\xfb", 4) == 0) {
+            item["format"] = "qcow2"; item["virtualBytes"] = std::to_string(big(24));
+        } else if (read >= 20 && std::memcmp(header, "KDMV", 4) == 0) {
+            item["format"] = "vmdk"; item["virtualBytes"] = std::to_string(little(12) * 512);
+        } else if (read >= 8 && std::memcmp(header, "vhdxfile", 8) == 0) {
+            item["format"] = "vhdx";
+        } else {
+            item["format"] = "raw"; item["virtualBytes"] = std::to_string(static_cast<uint64_t>(info.st_size));
+        }
+    }
+}
 Json::Value disk_detail(const Json::Value& catalog, const VmConfigSnapshot& vms,
     const std::string& id, const std::string& state, const Json::Value& image,
     const std::optional<std::string>& effective_compression) {
@@ -229,6 +277,23 @@ Json::Value disk_detail(const Json::Value& catalog, const VmConfigSnapshot& vms,
             }
             const auto compression = text(member(member(image, "format-specific"), "data"), "compression-type", 128);
             if (!compression.empty()) inspection["compression"] = compression;
+            auto& snapshots = inspection["snapshots"] = Json::Value(Json::arrayValue);
+            const auto& listed = member(image, "snapshots");
+            if (listed.isArray() && listed.size() <= 1024) {
+                for (const auto& row : listed) {
+                    if (!row.isObject()) continue;
+                    const auto number = [&](const char* key) -> int64_t {
+                        const auto& value = member(row, key);
+                        return value.isInt64() && value.asInt64() >= 0 ? value.asInt64() : 0;
+                    };
+                    Json::Value entry;
+                    entry["id"] = text(row, "id", 128); entry["name"] = text(row, "name", 1024);
+                    entry["vmStateBytes"] = std::to_string(number("vm-state-size"));
+                    entry["createdAtMs"] = Json::Int64(number("date-sec") * 1000 + number("date-nsec") / 1000000);
+                    entry["vmClockMs"] = Json::Int64(number("vm-clock-sec") * 1000 + number("vm-clock-nsec") / 1000000);
+                    snapshots.append(std::move(entry));
+                }
+            }
             if (effective_compression && (*effective_compression == "none" ||
                 *effective_compression == "deflate" || *effective_compression == "zstd"))
                 inspection["effectiveCompression"] = *effective_compression;
@@ -238,7 +303,7 @@ Json::Value disk_detail(const Json::Value& catalog, const VmConfigSnapshot& vms,
         std::chrono::system_clock::now().time_since_epoch()).count());
     bound(result); return result;
 }
-Json::Value network_catalog(const Json::Value& active) {
+Json::Value network_catalog(const Json::Value& active, const std::function<std::string(const std::string&)>& state) {
     check_rows(active);
     Json::Value result; result["items"] = Json::Value(Json::arrayValue);
     size_t bytes = 1024;
@@ -252,6 +317,11 @@ Json::Value network_catalog(const Json::Value& active) {
         const bool l2 = text(row, "uplink_mode", 128) == "l2";
         item["bridgeType"] = gvisor ? "gvisor" : "linux";
         item["uplinkMode"] = l2 ? "l2" : "l3";
+        // L3 follows the default route at run time; only a bridged uplink is configured.
+        if (l2) {
+            const auto uplink = text(member(row, "l2"), "uplink", 128);
+            if (!uplink.empty()) item["uplink"] = uplink;
+        }
         item["vlans"] = Json::Value(Json::arrayValue);
         const auto& vlans = member(member(row, "l3"), "vlans");
         if (!vlans.isNull()) {
@@ -268,9 +338,33 @@ Json::Value network_catalog(const Json::Value& active) {
                 append(item["vlans"], std::move(entry), vlan_bytes);
             }
         }
+        if (state) {
+            std::string current;
+            try { current = state(item["id"].asString()); } catch (const std::exception&) {}
+            if (current == "STOPPED" || current == "STARTING" || current == "RUNNING" ||
+                current == "RECOVERING" || current == "STOPPING" || current == "FAILED") item["state"] = current;
+        }
         append(result["items"], std::move(item), bytes);
     }
     bound(result); return result;
+}
+void annotate_network_list(Json::Value& catalog, const Json::Value& vms) {
+    std::map<std::string, std::set<std::string>> users;
+    const auto& rows = member(vms, "vms");
+    size_t scanned = 0;
+    if (rows.isArray()) for (const auto& vm : rows) {
+        const auto& nics = member(vm, "networks");
+        if (!nics.isArray()) continue;
+        for (const auto& nic : nics) {
+            if (++scanned > 65536) break;
+            const auto id = text(nic, "network_id", 128);
+            if (!id.empty()) users[id].insert(text(vm, "id", 128));
+        }
+    }
+    for (auto& item : catalog["items"]) {
+        const auto found = users.find(item["id"].asString());
+        item["vmCount"] = Json::UInt(found == users.end() ? 0 : found->second.size());
+    }
 }
 Json::Value usb_catalog(const Json::Value& snapshot) {
     Json::Value result;

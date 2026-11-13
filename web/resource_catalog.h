@@ -13,7 +13,14 @@ namespace droidvm::web {
 Json::Value disk_catalog(const DiskConfigSnapshot& snapshot,
     const std::function<std::string(const Json::Value&)>& path,
     const std::set<std::string>& valid_paths, const std::set<std::string>& backing_paths);
-Json::Value network_catalog(const Json::Value& active);
+// List view only: format and sizes from the image header and fstat (qcow2 / vmdk /
+// raw, no image tool), plus the VMs whose slots name the disk directly.
+void annotate_disk_list(Json::Value& catalog, const Json::Value& vms);
+// state: optional runtime lookup for the list view; empty results are omitted.
+Json::Value network_catalog(const Json::Value& active,
+    const std::function<std::string(const std::string&)>& state = {});
+// List view only: how many VMs have a NIC on each network.
+void annotate_network_list(Json::Value& catalog, const Json::Value& vms);
 Json::Value audio_catalog(const Json::Value& snapshot);
 Json::Value usb_catalog(const Json::Value& snapshot);
 Json::Value cpu_catalog(const std::vector<vm::HostCpuCore>& cores);
