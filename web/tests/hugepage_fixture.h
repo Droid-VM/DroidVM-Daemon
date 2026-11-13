@@ -71,6 +71,7 @@ struct FixtureHugepages {
             }
             value["stats"]["pool_total"] = "768"; value["stats"]["pool_avail"] = "256";
             value["stats"]["served"] = "512"; value["stats"]["pool_cma"] = "256";
+            if (!legacy) value["cmaLentMb"] = 128; // 64 of the 256 reservoir pages held by other apps
             if (!legacy) {
                 value["stats"]["acquire_active"] = acquiring ? "1" : "0";
                 value["stats"]["acquire_mode"] = std::to_string(acquire_mode);

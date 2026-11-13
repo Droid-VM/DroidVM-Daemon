@@ -29,6 +29,10 @@ public:
     bool wait(int64_t needed, const std::function<bool()>& abort, int attempts = 300,
               std::chrono::milliseconds interval = std::chrono::seconds(1), int acquire_at = 5,
               std::function<void()> acquire_request = {}) const;
+    // Wait for the module's async acquire worker to report idle. Modules without
+    // the refill_stat ABI fail closed instead of guessing that growth is done.
+    bool wait_acquire(const std::function<bool()>& abort, int attempts = 300,
+                      std::chrono::milliseconds interval = std::chrono::seconds(1)) const;
 private:
     std::string parameters_;
 };
@@ -59,6 +63,8 @@ public:
     State snapshot() const;
     void initialize_manual(std::optional<int64_t> pages); // startup; unknown forbids automatic resizing
     bool set_manual(const ControlLease&, int64_t pages); // after verified kernel write
+    bool replace_manual_target(const ControlLease&, int64_t pages); // journal + write, only with no consumers
+    bool admit_manual(const ControlLease&, const std::string& vm, uint64_t generation, int64_t pages);
     bool admit(const std::string& vm, uint64_t generation, int64_t pages, bool automatic);
     void release(const std::string& vm, uint64_t generation);
     bool automatic(const std::string& vm) const;

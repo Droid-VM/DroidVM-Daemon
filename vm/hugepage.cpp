@@ -100,6 +100,28 @@ bool HugepagePool::wait(int64_t needed, const std::function<bool()>& abort, int 
     }
     return false;
 }
+bool HugepagePool::wait_acquire(const std::function<bool()>& abort, int attempts, std::chrono::milliseconds interval) const {
+    std::string previous;
+    int stable = 0;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (abort()) return false;
+        const auto status = text("refill_stat", 4096);
+        if (!status) return false;
+        const auto at = status->find("acquire_active=");
+        if (at == std::string::npos) return false;
+        const auto first = status->data() + at + 15;
+        int active = -1;
+        const auto parsed = std::from_chars(first, status->data() + status->size(), active);
+        if (parsed.ec != std::errc{} || (parsed.ptr < status->data() + status->size() && *parsed.ptr != ' ' && *parsed.ptr != '\n')) return false;
+        if (active == 0) {
+            stable = *status == previous ? stable + 1 : 1;
+            previous = *status;
+            if (stable >= 4) return true;
+        } else { stable = 0; previous.clear(); }
+        std::this_thread::sleep_for(interval);
+    }
+    return false;
+}
 int64_t PoolReservations::total_locked() const {
     int64_t total = 0;
     for (const auto& [vm, consumer] : pages_) {
@@ -154,6 +176,22 @@ bool PoolReservations::set_manual(const ControlLease& lease, int64_t pages) {
     std::lock_guard lock(mutex_);
     if (&lease.owner_ != this || !busy_ || pages < total_locked()) return false;
     manual_ = pages; manual_known_ = true; ++revision_; automatic_target_ = false; deferred_release_ = false;
+    return true;
+}
+bool PoolReservations::replace_manual_target(const ControlLease& lease, int64_t pages) {
+    std::lock_guard lock(mutex_);
+    if (&lease.owner_ != this || !busy_ || pages < 0 || !pages_.empty()) return false;
+    bool written = false;
+    try { written = write_(pages, pages); } catch (...) {}
+    if (!written) return false;
+    manual_ = pages; manual_known_ = true; ++revision_; automatic_target_ = false; deferred_release_ = false;
+    return true;
+}
+bool PoolReservations::admit_manual(const ControlLease& lease, const std::string& vm, uint64_t generation, int64_t pages) {
+    std::lock_guard lock(mutex_);
+    if (&lease.owner_ != this || !busy_ || pages <= 0 || pages > INT64_MAX - total_locked()) return false;
+    if (pages_.contains(vm)) return false;
+    pages_[vm] = {generation, pages, false}; ++revision_;
     return true;
 }
 std::unique_ptr<PoolReservations::ControlLease> PoolReservations::begin_control() {

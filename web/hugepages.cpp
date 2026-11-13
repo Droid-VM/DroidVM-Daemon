@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hugepages.h"
 #include "task_adapter.h"
+#include <algorithm>
 #include <charconv>
 #include <limits>
 #include <array>
@@ -107,6 +108,12 @@ Json::Value hugepage_snapshot(const Json::Value& native) {
     result["poolAvailablePages"] = quantity(stats["pool_avail"]);
     result["servedPages"] = quantity(stats["served"]);
     result["cmaPoolPages"] = quantity(stats["pool_cma"]);
+    // cma_usage reports MiB; pages are 2 MiB and never exceed the reservoir itself.
+    if (const auto lent = quantity(native["cmaLentMb"]); !lent.isNull()) {
+        auto pages = std::stoull(lent.asString()) / 2;
+        if (const auto reservoir = result["cmaPoolPages"]; !reservoir.isNull()) pages = std::min<unsigned long long>(pages, std::stoull(reservoir.asString()));
+        result["cmaLentPages"] = std::to_string(pages);
+    } else result["cmaLentPages"] = Json::Value();
     const auto active = quantity(stats["acquire_active"]);
     result["acquireActive"] = active == "0" ? Json::Value(false) : active == "1" ? Json::Value(true) : Json::Value();
     const auto mode = quantity(stats["acquire_mode"]);

@@ -307,6 +307,21 @@ struct HugepageService::Impl {
         return props(bytes.value_or(""), false);
     }
     Json::Value stat() const { return props(io.read(param("refill_stat"), max_file).value_or(""), true); }
+    // Reservoir pages other apps hold right now, as the App reads it: cma_usage tokens are
+    // key=value but share lines, so split on whitespace. Unreported keeps null.
+    Json::Value cma_lent_mb() const {
+        const auto bytes = io.read(param("cma_usage"), max_file);
+        if (!bytes) return {};
+        std::istringstream words(*bytes); std::string word; bool reservoir = false; std::optional<int64_t> used;
+        while (words >> word) {
+            const auto equals = word.find('=');
+            if (equals == std::string::npos) continue;
+            const auto key = word.substr(0, equals);
+            if (key == "reservoir_mb") reservoir = true;
+            else if (key == "used_mb") used = number(word.substr(equals + 1));
+        }
+        return reservoir && used && *used >= 0 ? Json::Value(Json::Int64(*used)) : Json::Value();
+    }
     Json::Value snapshot() const {
         const auto state = pool.snapshot();
         Json::Value out(Json::objectValue); out["capability"] = HugepageService::capability;
@@ -319,6 +334,7 @@ struct HugepageService::Impl {
         out["bootEnabled"] = out["installed"].asBool() && !io.exists(module("disable"));
         out["hasPoolWant"] = has("pool_want"); out["hasCma"] = has("pool_want_with_cma");
         out["stats"] = stat(); out["settings"] = settings();
+        out["cmaLentMb"] = cma_lent_mb();
         out["hasLegacySettings"] = out["settings"].isMember("cma_probe_result");
         auto& features = out["features"];
         features["acquire"] = has("acquire") || has("manual_refill");
@@ -407,10 +423,27 @@ struct HugepageService::Impl {
             receipt["uncertain"] = false;
         }
     }
+    // A shrinking target write starts a kernel adjust run, and the module
+    // refuses every target write with EBUSY until it ends. Wait for it rather
+    // than stopping it: stopping would abandon the shrink just requested.
+    void settle(Json::Value& receipt) {
+        if (!loaded()) return;
+        for (unsigned i = 0; i < 60; ++i) {
+            const auto observed = stat();
+            if (!observed["acquire_active"].isInt64() || observed["acquire_active"].asInt64() == 0) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        receipt["uncertain"] = true;
+        throw ServiceError(ErrorCode::commit_uncertain, "Kernel adjustment is still running; observe state before another operation");
+    }
     void cma_target(int64_t pages, Json::Value& receipt) {
         if (pages != 0) {
             const auto base = read("pool_want"); require(base && pages >= *base, ErrorCode::invalid_argument, "CMA target is below pool target");
         }
+        // Rewriting an unchanged target is not a no-op for the module: it can
+        // still be refused while an adjust run is active.
+        if (read("pool_want_with_cma") == pages) return;
+        settle(receipt);
         write("pool_want_with_cma", pages, receipt, true, true);
     }
     int64_t actual(const char* key) const {

@@ -26,6 +26,10 @@ struct Fixture {
     std::set<std::string> read_only;
     std::string failed_knob;
     unsigned target_writes = 0, acquire_writes = 0, legacy_writes = 0;
+    // Models the module: a shrinking target starts an adjust run, and target
+    // writes return EBUSY until the run has been observed for this many reads.
+    bool shrink_adjust = false;
+    unsigned adjust_reads = 0, busy_refusals = 0;
     TaskService tasks{limits()};
     vm::PoolReservations pool{[this](int64_t value, int64_t) {
         std::lock_guard lock(mutex); files["/fixture/params/pool_want"] = std::to_string(value); ++target_writes; return true;
@@ -40,12 +44,20 @@ struct Fixture {
         io.read = [this](const std::string& path, size_t) -> std::optional<std::string> {
             std::lock_guard lock(mutex);
             if (path == "/fixture/module/settings.prop" && unreadable_settings) return {};
+            if (path == "/fixture/params/refill_stat" && adjust_reads > 0 && --adjust_reads == 0)
+                files[path] = "pool_total=100 pool_avail=100 served=0 acquire_active=0";
             auto entry = files.find(path); if (entry == files.end()) return {}; return entry->second;
         };
         io.write = [this](const std::string& path, const std::string& value) {
             std::lock_guard lock(mutex);
             if (path == "/proc/sys/vm/drop_caches") return false;
             if (path == failed_knob) return false;
+            const bool target = path == "/fixture/params/pool_want" || path == "/fixture/params/pool_want_with_cma";
+            if (target && adjust_reads > 0) { ++busy_refusals; return false; }
+            if (target && shrink_adjust && std::stoll(value) < std::stoll(files[path])) {
+                adjust_reads = 3;
+                files["/fixture/params/refill_stat"] = "pool_total=100 pool_avail=100 served=0 acquire_active=1";
+            }
             if (path == "/fixture/params/pool_want") ++target_writes;
             if (path == "/fixture/params/acquire") { ++acquire_writes; if (fail_acquire) return false; }
             if (path == "/fixture/params/manual_refill") ++legacy_writes;
@@ -225,8 +237,23 @@ void cma_persistence_preflight_and_legacy_migration() {
         "Crash acknowledgement did not update authoritative snapshot");
 }
 }
+void shrink_waits_for_kernel_adjust() {
+    Fixture fixture;
+    fixture.shrink_adjust = true;
+    Json::Value operation = target(90); operation["cmaPages"] = "300";
+    auto unchanged = fixture.run(fixture.request("shrink-same-cma", operation));
+    check(unchanged.state == TaskState::succeeded && unchanged.result["saved"] == true && fixture.busy_refusals == 0 &&
+        fixture.files["/fixture/params/pool_want_with_cma"] == "300", "Unchanged CMA target was rewritten during the shrink run");
+    fixture.adjust_reads = 0;
+    fixture.files["/fixture/params/refill_stat"] = "pool_total=100 pool_avail=100 served=0 acquire_active=0";
+    operation = target(80); operation["cmaPages"] = "250";
+    auto changed = fixture.run(fixture.request("shrink-both", operation));
+    check(changed.state == TaskState::succeeded && changed.result["saved"] == true && fixture.busy_refusals == 0 &&
+        fixture.files["/fixture/params/pool_want"] == "80" && fixture.files["/fixture/params/pool_want_with_cma"] == "250",
+        "CMA target write did not wait for the shrink run");
+}
 int main() {
-    try { consumer_floor_and_manual_baseline(); operations(); no_unknown_fallback_or_settings_loss(); cma_deficit_triggers_requested_acquire(); queued_cancellation_has_a_definite_receipt(); observed_capabilities_and_advanced_effects(); cma_persistence_preflight_and_legacy_migration(); }
+    try { consumer_floor_and_manual_baseline(); operations(); no_unknown_fallback_or_settings_loss(); cma_deficit_triggers_requested_acquire(); queued_cancellation_has_a_definite_receipt(); observed_capabilities_and_advanced_effects(); cma_persistence_preflight_and_legacy_migration(); shrink_waits_for_kernel_adjust(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     return 0;
 }
