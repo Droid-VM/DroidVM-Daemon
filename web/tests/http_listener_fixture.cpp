@@ -284,8 +284,8 @@ struct Owner {
                 // Legacy probes retain the unavailable, non-VNC simplefb entry.
                 const std::string secondary_reason = !state->display_secondary_port ? "not-vnc" : state->state != "RUNNING" ? "not-running" : "";
                 return VmDisplayTarget{id, state->version->observe(), {
-                    {"gpu-0", reason.empty(), reason, true},
-                    {"simplefb", secondary_reason.empty(), secondary_reason, state->display_secondary_port != 0}
+                    {"gpu-0", reason.empty(), reason, true, {}},
+                    {"simplefb", secondary_reason.empty(), secondary_reason, state->display_secondary_port != 0, {}}
                 }};
             },
             [state = runtime](const CallContext&, const std::string& id, const std::string& screen, const vm::Observation& expected) {

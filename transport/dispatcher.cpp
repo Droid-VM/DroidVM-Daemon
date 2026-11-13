@@ -5,6 +5,7 @@
 #include "store/network_config.h"
 #include "store/vm_config.h"
 #include "vm/console.h"
+#include "vm/command_common.h"
 #include "vm/crosvm_command.h"
 #include <algorithm>
 #include <cctype>
@@ -51,7 +52,7 @@ bool host_command(const std::string& command) {
 }
 constexpr std::array vm_commands{"vm_create", "vm_modify", "vm_delete", "vm_list", "vm_get", "vm_exists", "vm_status",
     "vm_start", "vm_stop", "vm_stop_all", "vm_reboot", "vm_suspend", "vm_resume", "vm_control", "vm_console_list",
-    "vm_console_info", "vm_console_history", "vm_console_write", "vm_console_clear", "vm_vnc_info", "vm_input",
+    "vm_console_info", "vm_console_history", "vm_console_log", "vm_console_write", "vm_console_clear", "vm_vnc_info", "vm_webrtc_info", "vm_input",
     "vm_bootscan", "set_app_config"};
 // android.util.Base64.decode(NO_WRAP) of a client's evdev bytes.
 std::string base64_decode(const std::string& text) {
@@ -655,11 +656,12 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
             result["data"] = vms_->list(caller);
         } else if (command == "vm_stop_all") {
             vms_->stop_all();
-        } else if (command.starts_with("vm_console_") || command == "vm_vnc_info") {
+        } else if (command.starts_with("vm_console_") || command == "vm_vnc_info" || command == "vm_webrtc_info") {
             const auto id = legacy_id(request, "vm_id");
             const auto stream = legacy_id(request, "stream");
             if (id.empty()) { result["message"] = "missing vm_id"; return result; }
-            if (stream.empty() && (command == "vm_console_info" || command == "vm_console_write" || command == "vm_console_clear")) {
+            if (stream.empty() && (command == "vm_console_info" || command == "vm_console_write" || command == "vm_console_clear" ||
+                                   command == "vm_console_log" || (command == "vm_console_history" && request.get("paged", false) == true))) {
                 result["message"] = "missing stream"; return result;
             }
             std::shared_ptr<vm::VmRuntime> target;
@@ -694,14 +696,73 @@ Json::Value RequestDispatcher::execute_vm(const CallContext& caller, const std::
                     const auto addresses = host_ipv4_->current();
                     if (!addresses.empty()) result["remote_host"] = addresses.front();
                 }
+            } else if (command == "vm_webrtc_info") {
+                const auto config = target->config();
+                const auto screen = legacy_id(request, "screen");
+                std::string found;
+                for (const char* candidate : {"gpu-0", "simplefb"}) {
+                    const auto& row = config::member(config::member(config, "screens"), candidate);
+                    if (!row.isObject() || !config::boolean(row, "enabled") ||
+                        config::java_enum(row, "exporter", "NONE", vm::command::exporters) != "WEBRTC") continue;
+                    if (screen.empty() || screen == candidate) { found = candidate; break; }
+                }
+                if (found.empty()) { result["message"] = "WebRTC is not enabled for this VM"; return result; }
+                const auto rtc = vm::command::webrtc_binding(vm::command::Screen{found, &config["screens"][found]});
+                result["screen"] = found;
+                // crosvm binds the wildcard when no host is named.
+                result["host"] = rtc.host.empty() || rtc.host == "0.0.0.0" || rtc.host == "::" ? "127.0.0.1" : rtc.host;
+                result["port"] = Json::Int64(rtc.port);
+                result["token"] = rtc.token;
+                result["transport_cap"] = vm::screen_transport_cap(config, found);
+                if ((rtc.host.empty() || rtc.host == "0.0.0.0") && host_ipv4_) {
+                    const auto addresses = host_ipv4_->current();
+                    if (!addresses.empty()) result["remote_host"] = addresses.front();
+                    // Every filtered host address: the phone can sit on several networks at once.
+                    result["remote_hosts"] = Json::Value(Json::arrayValue);
+                    for (const auto& address : addresses) result["remote_hosts"].append(address);
+                }
+            } else if (command == "vm_console_history" && request.get("paged", false) == true) {
+                // One 64 KiB ring slice per request; clients follow "next" until
+                // it reaches "end" and restart from "floor" on "reset".
+                auto* log = target->log(stream);
+                if (!log) { result["message"] = "stream not found"; return result; }
+                std::optional<vm::LogCursor> cursor;
+                if (request["generation"].isString() && request["offset"].isUInt64())
+                    cursor = vm::LogCursor{request["generation"].asString(), request["offset"].asUInt64()};
+                const auto slice = log->read(cursor, false);
+                auto& data = result["data"];
+                data["generation"] = slice.generation; data["reset"] = slice.reset;
+                data["floor"] = Json::UInt64(slice.floor); data["start"] = Json::UInt64(slice.start);
+                data["next"] = Json::UInt64(slice.next); data["end"] = Json::UInt64(slice.end);
+                data["bytes"] = vm::url_encode_bytes(slice.bytes);
+            } else if (command == "vm_console_log") {
+                auto* log = target->log(stream);
+                if (!log) { result["message"] = "stream not found"; return result; }
+                const auto offset = request["offset"].isUInt64() ? request["offset"].asUInt64() : 0;
+                // 256 KiB encodes to 768 KiB, well inside the transport frame.
+                const auto slice = log->read_file(offset, 256u << 10);
+                if (!slice) { result["message"] = "persistent log not available"; return result; }
+                auto& data = result["data"];
+                data["path"] = log->path(); data["reset"] = slice->reset;
+                data["size"] = Json::UInt64(slice->size); data["offset"] = Json::UInt64(slice->offset);
+                data["next"] = Json::UInt64(slice->offset + slice->bytes.size());
+                data["bytes"] = vm::url_encode_bytes(slice->bytes);
             } else if (command == "vm_console_history") {
                 result["vm_id"] = id;
+                // url_encode_bytes triples every byte; a full 1 MiB ring would
+                // overflow the 2 MiB transport frame, so only the tail is sent.
+                constexpr size_t history_budget = 640u << 10;
+                const auto tail = [](const std::string& data, size_t limit) {
+                    return vm::url_encode_bytes(std::string_view(data).substr(data.size() - std::min(data.size(), limit)));
+                };
                 if (!stream.empty()) {
                     auto* log = target->log(stream);
                     if (!log) { result["message"] = "stream not found"; return result; }
-                    result[stream] = vm::url_encode_bytes(log->contents());
+                    result[stream] = tail(log->contents(), history_budget);
                 } else {
-                    for (const auto& name : target->streams()) if (auto* log = target->log(name)) result[name] = vm::url_encode_bytes(log->contents());
+                    const auto names = target->streams();
+                    const size_t limit = history_budget / std::max<size_t>(names.size(), 1);
+                    for (const auto& name : names) if (auto* log = target->log(name)) result[name] = tail(log->contents(), limit);
                 }
             } else {
                 auto* log = target->log(stream);

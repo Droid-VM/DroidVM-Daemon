@@ -180,11 +180,14 @@ bool has_gpu_device(const Json::Value& config) { return screen_enabled(config, g
 std::vector<const char*> transport_options(const std::string& id, const std::string& exporter) {
     if (exporter == "NATIVE") return id == gpu0 ? std::vector<const char*>{"cpu", "gpu", "zero"} : std::vector<const char*>{"cpu", "gpu"};
     if (exporter == "VNC") return {"cpu", "gpu", "gpu-hw"};
+    // crosvm refuses gpu here: it forbids the encoder, and WebRTC sends nothing without one.
+    if (exporter == "WEBRTC") return {"cpu", "gpu-hw"};
     return {};
 }
 bool transport_implemented(const std::string& exporter, const std::string& cap) {
     if (exporter == "NATIVE") return cap == "cpu" || cap == "gpu";
     if (exporter == "VNC") return cap == "cpu" || cap == "gpu" || cap == "gpu-hw";
+    if (exporter == "WEBRTC") return cap == "cpu" || cap == "gpu-hw";
     return false;
 }
 std::string transport_default(const std::string& id, const std::string& exporter) {
@@ -220,7 +223,7 @@ bool has_gpu_blit_binding(const Json::Value& config) {
     for (const auto& screen : screens_of(config)) {
         if (!screen.enabled() || screen.exporter() == "NONE") continue;
         const auto exporter = screen.exporter();
-        if (exporter == "NATIVE" || (exporter == "VNC" && transport_cap(screen) != "cpu")) return true;
+        if (exporter == "NATIVE" || ((exporter == "VNC" || exporter == "WEBRTC") && transport_cap(screen) != "cpu")) return true;
     }
     return false;
 }
@@ -435,6 +438,23 @@ struct Builder {
         arg += ",screen=" + screen.id;
         return arg;
     }
+    std::string webrtc_arg(const Screen& screen, const WebrtcBinding& rtc) const {
+        if (rtc.port < 1 || rtc.port > 65535) throw std::invalid_argument("WebRTC port is not assigned for screen " + screen.id);
+        if (!webrtc_token_valid(rtc.token))
+            throw std::invalid_argument("WebRTC token may only use letters, digits, '-', '_', '.' and '~'");
+        std::string arg;
+        if (!rtc.host.empty()) arg += "host=" + crosvm_option_value(rtc.host) + ",";
+        arg += "port=" + decimal(rtc.port);
+        if (!rtc.token.empty()) arg += ",token=" + rtc.token;
+        if (!rtc.stun.empty()) arg += ",stun=[" + crosvm_option_value(rtc.stun) + "]";
+        arg += ",view-only=" + java_bool(!screen.input_enabled());
+        arg += ",screen=" + screen.id;
+        arg += ",codec=" + rtc.codec;
+        // crosvm refuses a bitrate outside 500..=100000 kbit/s; anything else means "derive".
+        if (rtc.bitrate >= 500 && rtc.bitrate <= 100000) arg += ",bitrate=" + decimal(rtc.bitrate);
+        if (!rtc.adapt) arg += ",adapt=false";
+        return arg;
+    }
     void exporters_args(CrosvmLaunch& launch) {
         launch.kms = crosvm_kms_screen(item);
         for (const auto& screen : screens_of(item)) {
@@ -456,6 +476,11 @@ struct Builder {
                 const auto binding = vnc_binding(screen, run.vnc);
                 launch.vnc_endpoints.push_back({screen.id, binding.host, std::max<int64_t>(binding.port, 1),
                     binding.password, screen.input_enabled(), ""});
+            } else if (exporter == "WEBRTC") {
+                const auto rtc = webrtc_binding(screen);
+                args.push_back("--webrtc-server");
+                args.push_back(webrtc_arg(screen, rtc) + transport_cap_arg(screen));
+                launch.webrtc_endpoints.push_back({screen.id, rtc.host, rtc.port, rtc.token, screen.input_enabled()});
             }
         }
     }
@@ -481,7 +506,9 @@ struct Builder {
     }
     void inputs(CrosvmLaunch& launch) {
         for (const auto& screen : screens_of(item)) {
-            if (!screen.enabled() || screen.exporter() == "NONE" || screen.exporter() == "KMS" || !screen.input_enabled()) continue;
+            // WebRTC input arrives over its DataChannel into crosvm's own per-binding devices.
+            if (!screen.enabled() || screen.exporter() == "NONE" || screen.exporter() == "KMS" ||
+                screen.exporter() == "WEBRTC" || !screen.input_enabled()) continue;
             launch.touch_screens.push_back(screen.id);
             if (screen.exporter() == "NATIVE") launch.native_input_screens.push_back(screen.id);
         }
@@ -671,7 +698,7 @@ struct Builder {
         for (const auto& screen : screens_of(item)) {
             const auto exporter = screen.exporter();
             if (screen.enabled() && exporter == "KMS") kms_inputs(screen);
-            else launch.input_bridge = launch.input_bridge || (screen.enabled() && exporter != "NONE");
+            else launch.input_bridge = launch.input_bridge || (screen.enabled() && exporter != "NONE" && exporter != "WEBRTC");
         }
         if (launch.input_bridge) inputs(launch);
         peripherals();

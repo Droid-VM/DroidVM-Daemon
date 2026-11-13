@@ -100,6 +100,23 @@ VncBinding vnc_binding(const Screen& screen, const std::map<std::string, VncRun>
     }
     return out;
 }
+WebrtcBinding webrtc_binding(const Screen& screen) {
+    const auto& rtc = member(*screen.item, "webrtc");
+    const auto& stored = rtc.isObject() ? rtc : Json::Value::nullSingleton();
+    WebrtcBinding out;
+    out.host = string(stored, "host", "");
+    out.port = integer(stored, "port", -1);
+    if (boolean(stored, "token_auth", true)) out.token = string(stored, "token", "");
+    out.codec = lower(string(stored, "codec", "auto")) == "h264" ? "h264" : "auto";
+    out.bitrate = integer(stored, "bitrate", 0);
+    out.adapt = boolean(stored, "adapt", true);
+    out.stun = trim(string(stored, "stun", ""));
+    return out;
+}
+bool webrtc_token_valid(const std::string& token) {
+    return token.size() <= 128 && token.find_first_not_of(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~") == std::string::npos;
+}
 
 bool vnc_options_overridden(const Json::Value& item, Backend backend) {
     std::vector<std::string> args;
@@ -117,7 +134,7 @@ bool vnc_options_overridden(const Json::Value& item, Backend backend) {
                     : i + 1 < args.size() ? args[i + 1] : std::string();
                 if (value.starts_with("vnc.")) return true;
             }
-        } else if (key == "--vnc-server" || key == "--android-display-service" ||
+        } else if (key == "--vnc-server" || key == "--webrtc-server" || key == "--android-display-service" ||
             key == "--cfg" || key == "--config" || key == "-c") return true;
     }
     return false;

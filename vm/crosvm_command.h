@@ -76,6 +76,13 @@ struct CrosvmRun {
     // by the launcher; absent means the screen gets no touch input at all.
     std::optional<std::string> kms_touch_device;
 };
+// A --webrtc-server listener: crosvm serves its viewer page at http://host:port/?token=.
+struct WebrtcEndpoint {
+    std::string screen, host;
+    int64_t port = -1;
+    std::string token;
+    bool input_enabled = true;
+};
 // NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3.
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
@@ -89,6 +96,7 @@ struct CrosvmLaunch {
     std::vector<std::string> touch_screens, native_input_screens; // touchscreenScreens()/nativeInputScreens()
     std::vector<InputSocket> input_sockets; // every socket the input bridge pre-binds
     std::vector<VncEndpoint> vnc_endpoints; // Exact listeners emitted by this launch.
+    std::vector<WebrtcEndpoint> webrtc_endpoints;
     // Set when a screen is exported straight to the panel (--kms-display). The
     // launcher must own the Android display before spawning this command.
     bool kms = false;

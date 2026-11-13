@@ -24,6 +24,7 @@
 #include <climits>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <glob.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -45,6 +46,20 @@ namespace {
 using namespace std::chrono_literals;
 constexpr std::array state_names{"STOPPED", "STARTING", "RUNNING", "SUSPENDED", "STOPPING", "REBOOTING"};
 constexpr int crosvm_reset = 32; // CrosvmExit.RESET
+int64_t host_hugepage_capacity_pages() {
+    std::ifstream input("/proc/meminfo");
+    std::string key, unit;
+    int64_t kib = 0;
+    while (input >> key) {
+        if (key == "MemTotal:") {
+            if (!(input >> kib >> unit) || unit != "kB" || kib <= 0) break;
+            return kib / (HugepagePool::page_mb * 1024);
+        }
+        std::string rest;
+        std::getline(input, rest);
+    }
+    throw std::runtime_error("Cannot read MemTotal for automatic Gunyah memory sizing");
+}
 std::string lower(std::string text) { for (auto& c : text) if (c >= 'A' && c <= 'Z') c += 'a' - 'A'; return text; }
 Json::Value& child(Json::Value& parent, const char* key) {
     if (!parent[key].isObject()) parent[key] = Json::Value(Json::objectValue);
@@ -120,22 +135,29 @@ std::string random_password(size_t length) {
     return result;
 }
 // VMInstance.resolveVncConfig: fill each VNC screen's unset port/password.
+// WebRTC listeners get the same treatment and share the port pool with VNC.
 void resolve_vnc(Json::Value& config) {
     std::vector<int64_t> taken;
     for (const char* id : {"gpu-0", "simplefb"}) {
         auto& screens = config["screens"];
         if (!screens.isObject() || !screens[id].isObject()) continue;
         auto& screen = screens[id];
-        if (!config::boolean(screen, "enabled") || config::java_enum(screen, "exporter", "NONE", {"NATIVE", "VNC", "NONE"}) != "VNC") continue;
-        auto& vnc = child(screen, "vnc");
-        auto port = config::integer(vnc, "port", -1);
+        if (!config::boolean(screen, "enabled")) continue;
+        const auto exporter = config::java_enum(screen, "exporter", "NONE", command::exporters);
+        if (exporter != "VNC" && exporter != "WEBRTC") continue;
+        auto& listener = child(screen, exporter == "VNC" ? "vnc" : "webrtc");
+        auto port = config::integer(listener, "port", -1);
         if (port <= 0 || std::find(taken.begin(), taken.end(), port) != taken.end()) {
             int fresh = random_port();
             while (fresh > 0 && std::find(taken.begin(), taken.end(), fresh) != taken.end()) fresh = random_port();
-            if (fresh > 0) { vnc["port"] = fresh; port = fresh; }
+            if (fresh > 0) { listener["port"] = fresh; port = fresh; }
         }
         if (port > 0) taken.push_back(port);
-        if (config::boolean(vnc, "password_auth") && config::string(vnc, "password").empty()) vnc["password"] = random_password(8);
+        if (exporter == "VNC") {
+            if (config::boolean(listener, "password_auth") && config::string(listener, "password").empty()) listener["password"] = random_password(8);
+        } else if (config::boolean(listener, "token_auth", true) && config::string(listener, "token").empty()) {
+            listener["token"] = random_password(16);
+        }
     }
 }
 std::vector<std::string> merged_environment(const std::vector<std::pair<std::string, std::string>>& overrides) {
@@ -259,7 +281,10 @@ Json::Value VmRuntime::snapshot() const {
     if (retired_) return row;
     if (state_ == State::stopped && !worker_) actions.append("start");
     if (state_ == State::starting || state_ == State::running || state_ == State::suspended || state_ == State::rebooting) actions.append("stop");
-    if (state_ == State::running && !reboot_requested_ && !control_uncertain_) { actions.append("reboot"); actions.append("suspend"); }
+    if (state_ == State::running && !reboot_requested_ && !control_uncertain_) {
+        actions.append("reboot"); actions.append("suspend");
+        if (process_) { actions.append("powerbtn"); actions.append("sleepbtn"); }
+    }
     if (state_ == State::suspended && !reboot_requested_ && !control_uncertain_) actions.append("resume");
     return row;
 }
@@ -420,13 +445,25 @@ bool VmRuntime::start_locked(bool relaunch, bool clear_logs) {
         HostFacts facts;
         facts.has_kvm = access("/dev/kvm", F_OK) == 0;
         facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
+        if (config::boolean(config, "memory_auto", false) &&
+            (relaunch || !context_.pool || !resolves_to_gunyah(config, facts)))
+            throw std::runtime_error("Automatic memory is supported only for Gunyah crosvm VMs");
         if (!relaunch && context_.pool && resolves_to_gunyah(config, facts)) {
             static std::atomic<uint64_t> next_consumer{1};
             hugepage_generation_ = next_consumer.fetch_add(1);
-            const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
-            const bool automatic = context_.hugepages.resizable() && context_.hugepage_auto_reserve();
-            if (!context_.pool->admit(id_, hugepage_generation_.load(), (mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, automatic))
-                throw std::runtime_error("Huge-page control is busy or reserve target could not be set");
+            if (config::boolean(config, "memory_auto", false)) {
+                if (!(context_.hugepages.resizable() && context_.hugepages.present() &&
+                    context_.hugepages.has("system_reserve_mb") && context_.hugepages.has("refill_stat") &&
+                    context_.hugepages.has("pool_avail") && context_.pool))
+                    throw std::runtime_error("Automatic memory requires a resizable hugepage module with reserve and acquire status controls");
+                if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "CROSVM")
+                    throw std::runtime_error("Automatic memory is supported only by the Gunyah crosvm backend");
+            } else {
+                const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
+                const bool automatic = context_.hugepages.resizable() && context_.hugepage_auto_reserve();
+                if (!context_.pool->admit(id_, hugepage_generation_.load(), (mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, automatic))
+                    throw std::runtime_error("Huge-page control is busy or reserve target could not be set");
+            }
         }
         set_state(State::starting);
         { std::lock_guard state(state_mutex_); worker_ = true; }
@@ -514,15 +551,61 @@ void VmRuntime::run() {
     }
     if (plan.entry_fallback) fire("boot_entry_fallback");
     auto aborted = [&] { return stopped_by_user_ || context_.shutting_down(); };
-    const auto config = this->config();
+    auto config = this->config();
     HostFacts facts;
     facts.has_kvm = access("/dev/kvm", F_OK) == 0;
     facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
     bool ready = true;
     if (resolves_to_gunyah(config, facts)) {
+        const bool automatic_memory = config::boolean(config, "memory_auto", false);
+        if (automatic_memory) {
+            try {
+                if (!context_.android_display) throw std::runtime_error("Automatic memory requires Android zygote takeover support");
+                auto panel = context_.android_display->acquire(id_, config::string(config, "name"), true);
+                { std::lock_guard lock(state_mutex_); android_display_ = std::move(panel); }
+                auto lease = context_.pool->begin_control();
+                if (!lease) throw std::runtime_error("Huge-page control is busy");
+                if (context_.pool->snapshot().consumers != 0)
+                    throw std::runtime_error("Automatic memory needs the hugepage pool to have no active VM consumers");
+                const auto reserve_mb = context_.hugepages.read("system_reserve_mb");
+                if (!reserve_mb || *reserve_mb < 0)
+                    throw std::runtime_error("The module's system_reserve_mb setting is unavailable");
+                const auto total_pages = host_hugepage_capacity_pages();
+                if (total_pages <= 0 || !context_.pool->replace_manual_target(*lease, total_pages))
+                    throw std::runtime_error("Cannot set the hugepage module target to device memory");
+                const auto target_pages = context_.hugepages.read("pool_want");
+                if (!target_pages || *target_pages < total_pages)
+                    throw std::runtime_error("The hugepage module reported an invalid device-memory target");
+                if (context_.hugepages.has("acquire")) {
+                    if (!context_.hugepages.write("acquire", "2")) throw std::runtime_error("Cannot start hugepage acquisition");
+                } else if (context_.hugepages.has("manual_refill")) {
+                    if (!context_.hugepages.write("manual_refill", "1")) throw std::runtime_error("Cannot start hugepage acquisition");
+                } else throw std::runtime_error("The hugepage module has no acquire control");
+                if (!context_.hugepages.wait_acquire(aborted))
+                    throw std::runtime_error(aborted() ? "Automatic hugepage acquisition was cancelled" : "Hugepage acquisition did not reach a stable completed state");
+                const auto available = context_.hugepages.read("pool_avail");
+                if (!available || *available <= 0 || *available > *target_pages ||
+                    *available > INT64_MAX / HugepagePool::page_mb)
+                    throw std::runtime_error("The module reported an invalid available hugepage count");
+                const auto extra_mb = boot_guest_prealloc_mb(config);
+                const auto acquired_mb = *available * HugepagePool::page_mb;
+                if (acquired_mb < extra_mb || acquired_mb - extra_mb < 64)
+                    throw std::runtime_error("The acquired hugepage pool is too small for this VM");
+                const auto guest_mb = acquired_mb - extra_mb;
+                config["memory_mb"] = Json::Int64(guest_mb);
+                if (!context_.pool->admit_manual(*lease, id_, hugepage_generation_.load(), *available))
+                    throw std::runtime_error("Cannot reserve the acquired hugepages for this VM");
+                lease.reset();
+            } catch (const std::exception& error) {
+                stdio(std::string("automatic memory sizing failed: ") + error.what() + "\n");
+                context_.warn("VM " + id_ + ": automatic memory sizing failed: " + error.what());
+                finish_stopped(-1);
+                return;
+            }
+        }
         const bool required = context_.pool && context_.pool->automatic(id_);
         // Automatic sizing off: start on the reserve as the user left it, without waiting.
-        if (required || (context_.hugepages.present() && context_.hugepage_auto_reserve())) {
+        if (!automatic_memory && (required || (context_.hugepages.present() && context_.hugepage_auto_reserve()))) {
             const auto mb = std::max<int64_t>(config::integer(config, "memory_mb", 512), 64) + boot_guest_prealloc_mb(config);
             ready = context_.hugepages.wait((mb + HugepagePool::page_mb - 1) / HugepagePool::page_mb, aborted,
                 300, std::chrono::seconds(1), 5, [&] {
@@ -536,7 +619,9 @@ void VmRuntime::run() {
     // The panel is handed over before crosvm exists, so freed Android memory
     // precedes guest allocation and crosvm's preflight finds no DRM master.
     try {
-        if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "QEMU" && crosvm_kms_screen(config)) {
+        bool panel_owned = false;
+        { std::lock_guard lock(state_mutex_); panel_owned = static_cast<bool>(android_display_); }
+        if (!panel_owned && config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "QEMU" && crosvm_kms_screen(config)) {
             if (!context_.android_display) throw std::runtime_error("Android display takeover is not available in this daemon");
             auto lease = context_.android_display->acquire(id_, config::string(config, "name"));
             std::lock_guard lock(state_mutex_);
@@ -774,6 +859,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     {
         std::lock_guard lock(state_mutex_);
         vnc_endpoints_ = command.vnc_endpoints;
+        webrtc_endpoints_ = command.webrtc_endpoints;
         if (android_display_ && pid_ > 0) android_display_->watch(static_cast<int>(pid_));
     }
     return true;
@@ -986,6 +1072,7 @@ void VmRuntime::cleanup_backend() {
     for (const auto& path : sockets_) unlink(path.c_str());
     sockets_.clear(); qemu_ = false;
     vnc_endpoints_.clear();
+    webrtc_endpoints_.clear();
     serials_.clear();
     if (!identity_.name.empty() && context_.identities) {
         try { context_.identities->cleanup(identity_.name); identity_.directory = Fd(); identity_.name.clear(); } catch (const std::exception&) {}
@@ -1154,6 +1241,14 @@ bool VmRuntime::control_transition(std::optional<Observation> expected, State fr
     set_state(to);
     return true;
 }
+bool VmRuntime::press(const std::string& button, std::optional<Observation> expected) {
+    if (button != "powerbtn" && button != "sleepbtn") return false;
+    std::lock_guard lock(lock_);
+    if (reboot_requested_ || !claim_action(expected, {State::running})) return false;
+    if (send_control(button) == 0) return true;
+    if (expected) throw ServiceError(ErrorCode::unavailable, "VM control socket did not accept the button");
+    return false;
+}
 bool VmRuntime::control(const std::string& command) {
     if (command == "stop") return stop();
     if (command == "suspend") return suspend();
@@ -1257,10 +1352,19 @@ VmRuntime::DisplayTarget VmRuntime::display_target() const {
     if (context_.private_console) throw ServiceError(ErrorCode::permission_denied, "Private display unavailable");
     DisplayTarget result{version_.observe(), {}};
     for (const auto& screen : command::screens_of(config_)) {
-        DisplayScreen item{screen.id, false, {}, false};
+        DisplayScreen item{screen.id, false, {}, false, {}};
         if (!screen.enabled()) item.reason = "disabled";
         else if (retired_ || state_ != State::running || pid_.load() <= 0 || control_uncertain_) item.reason = "not-running";
-        else if (screen.exporter() != "VNC") item.reason = "not-vnc";
+        else if (screen.exporter() == "WEBRTC") {
+            // Not an RFB stream: the browser talks to crosvm's own viewer page directly.
+            item.reason = "webrtc";
+            const auto endpoint = std::find_if(webrtc_endpoints_.begin(), webrtc_endpoints_.end(),
+                [&](const auto& value) { return value.screen == screen.id; });
+            if (endpoint != webrtc_endpoints_.end() && endpoint->port >= 1 && endpoint->port <= 65535) {
+                item.webrtc = *endpoint;
+                item.input_enabled = endpoint->input_enabled;
+            } else item.reason = "unsupported";
+        } else if (screen.exporter() != "VNC") item.reason = "not-vnc";
         else {
             const auto endpoint = std::find_if(vnc_endpoints_.begin(), vnc_endpoints_.end(),
                 [&](const auto& value) { return value.screen == screen.id; });

@@ -4,6 +4,7 @@
 #include "vm/observation.h"
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -13,6 +14,9 @@ struct VmDisplayScreen {
     bool available = false;
     std::string reason;
     bool input_enabled = false;
+    // reason "webrtc": crosvm's own viewer page. The token is shown to administrators only.
+    struct Webrtc { std::string host; int64_t port = 0; std::string token; };
+    std::optional<Webrtc> webrtc;
 };
 struct VmDisplayTarget {
     std::string vm_id;

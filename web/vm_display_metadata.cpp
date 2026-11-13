@@ -38,13 +38,20 @@ Json::Value vm_display_list(const VmDisplaySource& source, const CallContext& ca
     if (target.vm_id != id || target.screens.size() > 2) throw ServiceError(ErrorCode::unavailable, "Invalid display metadata");
     Json::Value result; result["vmId"] = id; result["expected"] = observed(target.observed);
     result["screens"] = Json::Value(Json::arrayValue); std::set<std::string> ids;
-    const std::set<std::string> reasons{"", "disabled", "not-vnc", "not-running", "input-disabled", "unsupported", "invalid-endpoint"};
+    const std::set<std::string> reasons{"", "disabled", "not-vnc", "not-running", "input-disabled", "unsupported", "invalid-endpoint", "webrtc"};
     for (const auto& screen : target.screens) {
         if ((screen.id != "gpu-0" && screen.id != "simplefb") || !ids.insert(screen.id).second
             || !reasons.contains(screen.reason) || (screen.available != screen.reason.empty()))
             throw ServiceError(ErrorCode::unavailable, "Invalid display screen");
         Json::Value row; row["id"] = screen.id; row["available"] = screen.available; row["reason"] = screen.reason;
-        row["inputEnabled"] = screen.input_enabled; result["screens"].append(std::move(row));
+        row["inputEnabled"] = screen.input_enabled;
+        if (screen.reason == "webrtc") {
+            if (!screen.webrtc || screen.webrtc->port < 1 || screen.webrtc->port > 65535)
+                throw ServiceError(ErrorCode::unavailable, "Invalid display screen");
+            Json::Value rtc; rtc["host"] = screen.webrtc->host; rtc["port"] = Json::Int64(screen.webrtc->port);
+            rtc["token"] = screen.webrtc->token; row["webrtc"] = std::move(rtc);
+        }
+        result["screens"].append(std::move(row));
     }
     return result;
 }

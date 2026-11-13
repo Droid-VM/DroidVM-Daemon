@@ -21,7 +21,7 @@ using Names = std::vector<const char*>;
 inline const Names hypervisors{"AUTO", "SOFT", "KVM", "GUNYAH", "GENIEZONE"};
 inline const Names protections{"PROTECTED_NORMAL", "PROTECTED_PROTECTED", "PROTECTED_WITHOUT_FIRMWARE", "PSEUDO_UNPROTECTED"};
 inline const Names gpu_backends{"NONE", "GPU_2D", "GPU_GFXSTREAM", "GPU_VIRGLRENDERER"};
-inline const Names exporters{"NATIVE", "VNC", "KMS", "NONE"};
+inline const Names exporters{"NATIVE", "VNC", "KMS", "WEBRTC", "NONE"};
 inline const Names disk_buses{"VIRTIO", "SCSI", "PMEM", "PFLASH", "CDROM"};
 inline const Names dir_caches{"NEVER", "AUTO", "ALWAYS"};
 inline const Names peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB"};
@@ -71,6 +71,17 @@ bool screen_enabled(const Json::Value& config, const char* id);
 // getVncHost/getVncPort/getVncPassword after VMInstance.resolveVncConfig.
 struct VncBinding { std::string host; int64_t port = -1; std::string password; };
 VncBinding vnc_binding(const Screen& screen, const std::map<std::string, VncRun>& run);
+// screens.<id>.webrtc; port and token are resolved by the runtime before launch.
+struct WebrtcBinding {
+    std::string host;
+    int64_t port = -1;
+    std::string token, codec = "auto", stun;
+    int64_t bitrate = 0; // kbit/s; 0 lets crosvm derive it from the screen size
+    bool adapt = true;
+};
+WebrtcBinding webrtc_binding(const Screen& screen);
+// Characters crosvm's raw ?token= comparison and the option string both pass through.
+bool webrtc_token_valid(const std::string& token);
 
 // VMHypervisor.valueOf(optString("hypervisor","auto").toUpperCase()) then
 // resolveConfigured(backend, ...); nullopt when nothing is supported.

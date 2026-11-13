@@ -3,6 +3,7 @@
 #include "vm/android_display_control.h"
 #include "vm/boot_plan.h"
 #include "vm/console.h"
+#include "vm/crosvm_command.h"
 #include "vm/input_bridge.h"
 #include "vm/hugepage.h"
 #include "vm/usb_acm.h"
@@ -119,6 +120,8 @@ public:
     bool reboot(std::optional<Observation> expected = {});
     bool suspend(std::optional<Observation> expected = {});
     bool resume(std::optional<Observation> expected = {});
+    // ACPI power/sleep button; the lifecycle state is left to the guest.
+    bool press(const std::string& button, std::optional<Observation> expected = {});
     bool control(const std::string& command);
     bool write_input(const std::string& screen, int channel, std::string_view data) {
         return !context_.private_console && input_.write(screen, channel, data);
@@ -145,6 +148,7 @@ public:
         bool available = false;
         std::string reason;
         bool input_enabled = false;
+        std::optional<WebrtcEndpoint> webrtc; // Set with reason "webrtc".
     };
     struct DisplayTarget { Observation observed; std::vector<DisplayScreen> screens; };
     struct OpenedDisplay { std::shared_ptr<VncStream> stream; std::string password; };
@@ -188,6 +192,7 @@ private:
     std::optional<std::string> control_socket_, boot_entry_;
     bool qemu_ = false; // control_socket_ is a QMP socket
     std::vector<VncEndpoint> vnc_endpoints_; // Actual launch output; state_mutex_.
+    std::vector<WebrtcEndpoint> webrtc_endpoints_; // Actual launch output; state_mutex_.
     std::vector<std::string> sockets_; // QEMU chardev sockets removed at cleanup
     std::vector<Serial> serials_;
     std::vector<std::string> acm_owners_; // ResolvedSerial.acmDevPath holders

@@ -779,8 +779,11 @@ int main(int argc, char** argv) {
                     [&](const droidvm::CallContext& caller, const std::string& id) {
                         const auto native = vms->runtime(caller, id)->display_target();
                         droidvm::web::VmDisplayTarget result{id, native.observed, {}};
-                        for (const auto& screen : native.screens)
-                            result.screens.push_back({screen.id, screen.available, screen.reason, screen.input_enabled});
+                        for (const auto& screen : native.screens) {
+                            droidvm::web::VmDisplayScreen row{screen.id, screen.available, screen.reason, screen.input_enabled, {}};
+                            if (screen.webrtc) row.webrtc = droidvm::web::VmDisplayScreen::Webrtc{screen.webrtc->host, screen.webrtc->port, screen.webrtc->token};
+                            result.screens.push_back(std::move(row));
+                        }
                         return result;
                     },
                     [&](const droidvm::CallContext& caller, const std::string& id, const std::string& screen,
@@ -860,7 +863,7 @@ int main(int argc, char** argv) {
                                 return droidvm::config::string(current, "state") == "RUNNING" &&
                                     droidvm::config::string(current, "runtime_instance") == instance &&
                                     droidvm::config::string(current, "runtime_revision") == revision;
-                            });
+                            }, droidvm::web::vm_process_usage);
                     },
                     [store](const Json::Value& value) { store->save(value); }, load,
                     droidvm::web::WebBuild{DROIDVM_VERSION_NAME, std::to_string(DROIDVM_VERSION_CODE)}, droidvm::web::ipv6_available,
@@ -876,6 +879,7 @@ int main(int argc, char** argv) {
                         else if (request.action == "reboot") admitted = runtime->reboot(request.observed);
                         else if (request.action == "suspend") admitted = runtime->suspend(request.observed);
                         else if (request.action == "resume") admitted = runtime->resume(request.observed);
+                        else if (request.action == "powerbtn" || request.action == "sleepbtn") admitted = runtime->press(request.action, request.observed);
                         if (!admitted) throw droidvm::ServiceError(droidvm::ErrorCode::conflict, "VM operation was not admitted");
                     }), droidvm::web::vm_logs({
                         [&](const droidvm::CallContext& caller, const std::string& id) {
@@ -889,6 +893,14 @@ int main(int argc, char** argv) {
                             auto* log = runtime->log(request.stream);
                             if (!log) throw droidvm::ServiceError(droidvm::ErrorCode::not_found, "Log stream not found");
                             return log->read(request.cursor, request.tail);
+                        },
+                        [&](const droidvm::CallContext& caller, const droidvm::web::VmLogRead& request) {
+                            auto runtime = vms->runtime(caller, request.vm_id);
+                            if (runtime->observation().instance != request.instance_id)
+                                throw droidvm::ServiceError(droidvm::ErrorCode::conflict, "VM instance changed");
+                            auto* log = runtime->log(request.stream);
+                            if (!log) throw droidvm::ServiceError(droidvm::ErrorCode::not_found, "Log stream not found");
+                            log->clear();
                         }
                     }), droidvm::web::vm_configuration(tasks, {
                         [uploads = dispatcher.config_uploads()](const droidvm::CallContext& caller, const std::string& revision, size_t bytes) {
@@ -920,11 +932,18 @@ int main(int argc, char** argv) {
                             const auto references = droidvm::config::disk_references(Json::Value(Json::objectValue), snapshot->document);
                             auto result = droidvm::web::disk_catalog(*snapshot, droidvm::config::disk_path,
                                 droidvm::config::valid_disk_paths(snapshot->document), references.bases);
-                            result["vmRevision"] = configuration->vms().snapshot(caller)->revision;
+                            const auto vms_snapshot = configuration->vms().snapshot(caller);
+                            droidvm::web::annotate_disk_list(result, vms_snapshot->document);
+                            result["vmRevision"] = vms_snapshot->revision;
                             return result;
                         },
                         [&](const droidvm::CallContext& caller) {
-                            return droidvm::web::network_catalog(network_config->list(caller));
+                            auto result = droidvm::web::network_catalog(network_config->list(caller), [&](const std::string& id) {
+                                return network_runtime ? std::string(droidvm::network_state_name(network_runtime->get(caller, id).state)) : std::string();
+                            });
+                            try { droidvm::web::annotate_network_list(result, configuration->vms().snapshot(caller)->document); }
+                            catch (const std::exception&) {}
+                            return result;
                         }
 #ifdef DROIDVM_PLATFORM_SERVICES
                         , [&](const droidvm::CallContext&) {

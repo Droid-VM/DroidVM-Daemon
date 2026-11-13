@@ -24,7 +24,7 @@ void contract() {
     auto source = std::make_shared<VmDisplaySource>(VmDisplaySource{
         [&](const CallContext& caller, const std::string& id) {
             require(caller.principal == grant.session.caller.principal && id == "vm");
-            return VmDisplayTarget{id, expected, {{"gpu-0", true, "", true}, {"simplefb", false, "not-vnc", false}}};
+            return VmDisplayTarget{id, expected, {{"gpu-0", true, "", true, {}}, {"simplefb", false, "webrtc", true, VmDisplayScreen::Webrtc{"", 8090, "viewer-token"}}}};
         },
         [&](const CallContext& caller, const std::string& id, const std::string& screen, const vm::Observation& actual) {
             require(caller.principal == grant.session.caller.principal && id == "vm" && screen == "gpu-0" && actual == expected);
@@ -44,7 +44,9 @@ void contract() {
     const auto metadata_response = api.handle({"GET", "/api/v1/vm-displays/vm", headers, {}});
     require(metadata_response.status == 200 && metadata_response.body.find("password") == std::string::npos);
     const auto metadata = wire::parse(metadata_response.body);
-    require(metadata["screens"].size() == 2 && metadata["screens"][1]["reason"] == "not-vnc");
+    require(metadata["screens"].size() == 2 && metadata["screens"][1]["reason"] == "webrtc");
+    require(!metadata["screens"][0].isMember("webrtc") && metadata["screens"][1]["webrtc"]["port"] == 8090 &&
+        metadata["screens"][1]["webrtc"]["token"] == "viewer-token");
     HttpRequest request{"GET", "/api/v1/display", headers, {}};
     auto authorize = [&](const Json::Value& value) { return api.authorize_display(request, value); };
     auto first = api.reserve_display(request), second = api.reserve_display(request);

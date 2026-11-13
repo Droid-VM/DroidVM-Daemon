@@ -24,7 +24,8 @@ VmOperation parse(const Json::Value& input) {
     result.request_id = field(input["requestId"], 128);
     result.vm_id = field(input["vmId"], 128);
     result.action = field(input["action"], 16);
-    if (result.action != "start" && result.action != "stop" && result.action != "reboot" && result.action != "suspend" && result.action != "resume") invalid();
+    if (result.action != "start" && result.action != "stop" && result.action != "reboot" && result.action != "suspend" && result.action != "resume" &&
+        result.action != "powerbtn" && result.action != "sleepbtn") invalid();
     const auto& expected = input["expected"];
     result.observed.instance = field(expected["instanceId"], 32);
     if (result.observed.instance.size() != 32 || result.observed.instance.find_first_not_of("0123456789abcdef") != std::string::npos) invalid();
