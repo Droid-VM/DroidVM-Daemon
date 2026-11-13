@@ -74,6 +74,7 @@ struct ImageUploadOperations { PackageUploadOperations uploads; BackgroundOperat
 struct VmLogs {
     std::function<Json::Value(const CallContext&, const std::string&)> list;
     std::function<Json::Value(const CallContext&, const Json::Value&)> read;
+    std::function<void(const CallContext&, const Json::Value&)> clear{};
 };
 struct ConfigOperations {
     std::function<Json::Value(const CallContext&, const std::string&, const Json::Value&)> invoke;

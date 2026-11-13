@@ -181,6 +181,7 @@ Json::Value HttpApi::server_json() const {
     if (tasks_.receipt) value["capabilities"].append("tasks.receipts.v1");
     if (vms_.submit && vms_.find) value["capabilities"].append("vm.lifecycle.v1");
     if (logs_.list && logs_.read) value["capabilities"].append("vm.logs.v1");
+    if (logs_.list && logs_.read && logs_.clear) value["capabilities"].append("vm.logs.clear.v1");
     if (events_) value["capabilities"].append("events.invalidate.v1");
     if (config_.invoke) value["capabilities"].append("vm.configuration.v1");
     if (config_.invoke && config_.defaults) value["capabilities"].append("vm.defaults.v1");
@@ -663,6 +664,22 @@ HttpResponse HttpApi::handle(const HttpRequest& request) {
             } else result = configuration.invoke(session.caller, operation, input);
             result["context"] = context_json(session);
             return json(operation == "commit" ? 202 : 200, result);
+        }
+        if (request.path == "/api/v1/vm-logs/clear") {
+            if (request.method != "POST") {
+                auto response = problem(405, "method_not_allowed"); response.headers.emplace_back("Allow", "POST"); return response;
+            }
+            const auto session = sessions_.authenticate(cookie(request), header(request, "x-droidvm-csrf").value_or(""), true, request.trusted_lan);
+            if (!logs_.clear) return problem(501, "unsupported");
+            auto input = parse_object(request);
+            if (input.size() != 4 || !input["context"].isObject() || input["context"].size() != 2 ||
+                !input["context"]["daemonEpoch"].isString() || !input["context"]["sessionId"].isString()) invalid();
+            if (input["context"] != context_json(session)) return problem(409, "context_changed");
+            input.removeMember("context");
+            logs_.clear(session.caller, input);
+            Json::Value result;
+            result["context"] = context_json(session);
+            return json(200, result);
         }
         if (request.path == "/api/v1/vm-logs/read" || request.path.starts_with("/api/v1/vm-logs/")) {
             const bool read = request.path == "/api/v1/vm-logs/read";

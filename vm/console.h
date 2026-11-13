@@ -10,6 +10,11 @@
 #include <vector>
 
 namespace droidvm::vm {
+struct LogFileSlice {
+    std::string bytes;
+    uint64_t size = 0, offset = 0;
+    bool reset = false; // the file shrank below the cursor (cleared or restarted)
+};
 // daemon/console/ConsoleStream's history: the last 1 MiB of output plus a
 // persistent copy at cache/console_<vm id>_<stream>.log, reloaded when the
 // stream is created. Endpoints (pipes/sockets) belong to the VM runtime.
@@ -30,6 +35,9 @@ public:
     LogSlice read(const std::optional<LogCursor>& cursor, bool tail) const;
     // Interactive transport must not wait behind append's persistent file IO.
     std::optional<LogSlice> try_read(const std::optional<LogCursor>& cursor, bool tail) const;
+    // Pages the persistent copy, which keeps a whole run beyond the ring.
+    // Empty when the stream is memory-only or the copy was never written.
+    std::optional<LogFileSlice> read_file(uint64_t offset, size_t maximum) const;
     const std::string& path() const { return path_; }
 private:
     std::string path_;

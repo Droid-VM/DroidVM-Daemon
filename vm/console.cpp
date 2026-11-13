@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace droidvm::vm {
@@ -66,6 +67,27 @@ std::optional<LogSlice> ConsoleLog::try_read(const std::optional<LogCursor>& cur
     std::unique_lock lock(mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return {};
     return history_.read(cursor, tail);
+}
+std::optional<LogFileSlice> ConsoleLog::read_file(uint64_t offset, size_t maximum) const {
+    // Append-only while open, so no lock: reading must not stall the writer.
+    if (path_.empty()) return {};
+    Fd file(open(path_.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+    struct stat info{};
+    if (file.get() < 0 || fstat(file.get(), &info) != 0) return {};
+    LogFileSlice result;
+    result.size = static_cast<uint64_t>(info.st_size);
+    if (offset > result.size) { result.reset = true; offset = 0; }
+    result.offset = offset;
+    result.bytes.resize(static_cast<size_t>(std::min<uint64_t>(maximum, result.size - offset)));
+    size_t done = 0;
+    while (done < result.bytes.size()) {
+        const auto count = pread(file.get(), result.bytes.data() + done, result.bytes.size() - done, static_cast<off_t>(offset + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        done += static_cast<size_t>(count);
+    }
+    result.bytes.resize(done);
+    return result;
 }
 uint64_t ConsoleLog::mark() const { std::lock_guard lock(mutex_); return appended_; }
 std::string ConsoleLog::since(uint64_t mark) const {

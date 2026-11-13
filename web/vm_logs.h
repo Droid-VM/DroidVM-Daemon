@@ -13,6 +13,8 @@ struct VmLogRead {
 struct VmLogSource {
     std::function<VmLogTarget(const CallContext&, const std::string&)> list;
     std::function<vm::LogSlice(const CallContext&, const VmLogRead&)> read;
+    // Drops the stream's history and persistent log (the App's clear action).
+    std::function<void(const CallContext&, const VmLogRead&)> clear{};
 };
 VmLogs vm_logs(VmLogSource source);
 }

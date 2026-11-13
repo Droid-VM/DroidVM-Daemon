@@ -76,7 +76,17 @@ VmLogs vm_logs(VmLogSource source) {
             result["reset"] = slice.reset; result["more"] = slice.next < slice.end;
             result["data"] = wire::encode_base64(slice.bytes);
             return result;
-        }
+        },
+        source.clear ? std::function<void(const CallContext&, const Json::Value&)>([source](const CallContext& caller, const Json::Value& input) {
+            access(caller);
+            if (!caller.manage_tasks) throw ServiceError(ErrorCode::permission_denied, "Log permission required");
+            if (!input.isObject() || input.size() != 3) invalid();
+            VmLogRead request;
+            request.vm_id = field(input["vmId"]); request.instance_id = instance(input["instanceId"]);
+            request.stream = field(input["stream"], 64);
+            if (request.stream == "agent") throw ServiceError(ErrorCode::permission_denied, "Not a log stream");
+            source.clear(caller, request);
+        }) : std::function<void(const CallContext&, const Json::Value&)>{}
     };
 }
 }
