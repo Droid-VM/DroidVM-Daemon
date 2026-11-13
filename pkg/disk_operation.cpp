@@ -296,8 +296,10 @@ private:
     std::vector<Member> related_;
     bool delete_files_ = false;
     std::string reset_options_;
+    std::string snapshot_; // snapshot-*: qcow2 internal snapshot name or ID.
     bool follow_ = true; // create: writable slots on a childless backing follow the overlay.
     bool installs() const { return fresh_ || relocate_; }
+    bool snapshot_action() const { return action_ == "snapshot-create" || action_ == "snapshot-apply" || action_ == "snapshot-delete"; }
     std::string target() const { return installs() ? path_join(folder_, name_) : chain_.front().path; }
     void relocate_registry();
     TaskCompletion merge(TaskControl& control);
@@ -315,6 +317,7 @@ private:
     }
     Json::Value graph(size_t index, int writable_fd = -1) const;
     TaskCompletion resize(TaskControl& control);
+    TaskCompletion snapshot(TaskControl& control);
     TaskCompletion rewrite(TaskControl& control);
     void finish_flatten();
     Json::Value result() const;
@@ -332,8 +335,15 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         throw ServiceError(ErrorCode::invalid_argument, "Disk revision is required");
     action_ = request["action"].isString() ? request["action"].asString() : "";
     if (action_ != "resize" && action_ != "convert" && action_ != "flatten" && action_ != "create" && action_ != "clone"
-            && action_ != "commit" && action_ != "delete" && action_ != "reset")
+            && action_ != "commit" && action_ != "delete" && action_ != "reset" && !snapshot_action())
         throw ServiceError(ErrorCode::invalid_argument, "Unsupported disk operation");
+    if (snapshot_action()) {
+        const auto& name = request["snapshot"];
+        if (!name.isString() || name.asString().empty() || name.asString().size() > 128 || name.asString().front() == '-' ||
+                std::any_of(name.asString().begin(), name.asString().end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+            throw ServiceError(ErrorCode::invalid_argument, "Invalid snapshot name");
+        snapshot_ = name.asString();
+    }
     if (request.isMember("create_folder")) {
         if (action_ != "clone" || !request["create_folder"].isBool())
             throw ServiceError(ErrorCode::invalid_argument, "create_folder is only valid as a clone boolean");
@@ -484,6 +494,8 @@ DiskOperationService::Operation::Operation(DiskOperationService& owner, const Js
         target_format_ = "qcow2";
     }
     if (target_format_.empty()) target_format_ = chain_.front().format;
+    if (snapshot_action() && chain_.front().format != "qcow2")
+        throw ServiceError(ErrorCode::invalid_argument, "Only qcow2 images have internal snapshots");
     if (action_ == "clone" && chain_.size() > 1 && target_format_ != "qcow2")
         throw ServiceError(ErrorCode::conflict, "Registered overlay is not a qcow2 image");
     if (action_ == "convert" && chain_.size() > 1 && target_format_ != "qcow2")
@@ -647,6 +659,7 @@ TaskCompletion DiskOperationService::Operation::run(TaskControl& control) {
         if (lease_) lease_->verify();
         if (action_ == "commit") return merge(control);
         if (action_ == "delete") return remove(control);
+        if (snapshot_action()) return snapshot(control);
         return action_ == "resize" ? resize(control) : rewrite(control);
     } catch (const Abandoned& error) {
         return TaskCompletion::failure(ErrorCode::internal, error.what());
@@ -675,6 +688,23 @@ TaskCompletion DiskOperationService::Operation::resize(TaskControl& control) {
     if (output.exit_code != 0 || output.timed_out || output.truncated)
         throw ServiceError(ErrorCode::io_error, tool_failure("resize", output));
     sync_or_throw(io.get(), "sync resized disk");
+    return TaskCompletion::success(result());
+}
+// DiskInfoSnapshotTab's qemu-img snapshot -c/-a/-d, on the leased writable inode.
+TaskCompletion DiskOperationService::Operation::snapshot(TaskControl& control) {
+    if (!control.enter_commit()) return TaskCompletion::cancelled();
+    const auto flag = action_ == "snapshot-create" ? "-c" : action_ == "snapshot-apply" ? "-a" : "-d";
+    control.progress({"snapshot", "", 0, {}});
+    const auto io = lease_->open_file(chain_.front().path, true);
+    ChildOptions options;
+    options.argv = {tool(), "snapshot", flag, snapshot_, "json:" + wire::stringify(graph(0, io.get()))};
+    options.preserve_fds = {io.get()};
+    bind_cpus(options, cpus_);
+    const auto output = Child(options).communicate({}, std::chrono::minutes(30), 1u << 20);
+    lease_->verify();
+    if (output.exit_code != 0 || output.timed_out || output.truncated)
+        throw ServiceError(ErrorCode::io_error, tool_failure("snapshot", output));
+    sync_or_throw(io.get(), "sync snapshot metadata");
     return TaskCompletion::success(result());
 }
 TaskCompletion DiskOperationService::Operation::rewrite(TaskControl& control) {

@@ -2,6 +2,7 @@
 #include "disk_operations.h"
 #include "task_adapter.h"
 #include "common/wire.h"
+#include <algorithm>
 #include <charconv>
 #include <set>
 
@@ -41,8 +42,14 @@ Json::Value native_request(const Json::Value& input) {
         else if (action == "convert") keys.insert({"format", "folder", "name", "compress", "preallocate"});
         else if (action == "flatten") keys.insert({"format", "compress", "preallocate"});
         else if (action == "delete") keys.insert("deleteFiles");
+        else if (action == "snapshot-create" || action == "snapshot-apply" || action == "snapshot-delete") keys.insert("snapshot");
         else if (action != "commit" && action != "reset") invalid();
         request["disk_id"] = id(op["diskId"]);
+    }
+    if (action.starts_with("snapshot-")) {
+        const auto name = text(op["snapshot"], 128);
+        if (name.front() == '-' || std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; })) invalid();
+        request["snapshot"] = name;
     }
     for (const auto& key : op.getMemberNames()) if (!keys.contains(key)) invalid();
     request["action"] = action;
