@@ -912,6 +912,10 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         host.crosvm_input_vibrator = supported("vibrator");
         host.crosvm_mbi_spis = supported("--mbi-spis");
         host.crosvm_virtio_mmio_console = supported("--virtio-mmio-console");
+        // The codec backend choice: the newer table (backend=msm-vidc) is a value
+        // inside the option string, the older decoder switch is in the synopsis.
+        host.crosvm_media_backend = crosvm_binary_mentions(data + "/usr/bin/crosvm", "msm-vidc");
+        host.crosvm_media_vidc = supported("vidc=");
         // The AAudio performance modes are parsed inside host_device; only the
         // binary itself can say whether this crosvm knows them.
         host.crosvm_sound_performance = crosvm_binary_mentions(data + "/usr/bin/crosvm", "power_saving") &&

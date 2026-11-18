@@ -29,7 +29,8 @@
 //            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b,
 //            "crosvm_serial_name":b,"crosvm_input_vibrator":b,"crosvm_mbi_spis":b,
 //            "firmware_code_offset":n,"crosvm_sound_performance":b,
-//            "crosvm_virtio_mmio_console":b}}
+//            "crosvm_virtio_mmio_console":b,"crosvm_media_backend":b,
+//            "crosvm_media_vidc":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -94,6 +95,14 @@ struct HostFacts {
     // The installed crosvm lists --virtio-mmio-console; an MMIO VM's
     // virtio-console ports stay on PCI without it.
     bool crosvm_virtio_mmio_console = false;
+    // The installed crosvm's virtio-media codec devices take backend=NAME
+    // (mediacodec|auto|msm-vidc). A value inside the option string, so the
+    // launcher looks for "msm-vidc" in the binary itself.
+    bool crosvm_media_backend = false;
+    // The installed crosvm's decoder takes vidc=BOOL (`run --help` lists
+    // "vidc="): the older spelling of the msm_vidc decoder backend, which has
+    // no AUTO and no encoder choice.
+    bool crosvm_media_vidc = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}

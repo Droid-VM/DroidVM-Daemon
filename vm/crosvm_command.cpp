@@ -24,6 +24,18 @@ const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
 const Names kms_planes{"SPLIT", "SINGLE"};
 const Names virtio_transports{"PCI", "MMIO"};
+// VpuDecoderBackend / VpuEncoderBackend (the same three names).
+const Names vpu_backends{"MEDIACODEC", "AUTO", "MSM_VIDC"};
+// CrosvmBackendInstance.quotable: a value inside a double-quoted crosvm key
+// cannot carry its own quote or an escape, so a backslash becomes a space and
+// a double quote a single one.
+std::string quotable(std::string value) {
+    for (auto& c : value) {
+        if (c == '\\') c = ' ';
+        else if (c == '"') c = '\'';
+    }
+    return value;
+}
 // NativeDisplay.MOTION_DEVICE_NAME
 constexpr const char* motion_device_name = "DroidVM Motion Sensors";
 // NativeDisplay.VIBRATOR_DEVICE_NAME
@@ -816,15 +828,46 @@ struct Builder {
             if (stripped) launch.warnings.push_back("this crosvm's AAudio backend has no latency mode; the sound card's endpoints start in its default");
         }
     }
-    // P1: one decoder and one encoder adapter, both in helpers under the app uid.
-    // Only Gunyah gets the media-host-mb pool (hypervisor_args), and crosvm
-    // refuses a virtio-media device without it, so KVM/GenieZone get none.
-    void virtio_media() {
-        if (!gunyah || !vpu_plan(item, host).enabled || host.app_uid <= 0) return;
-        for (const char* kind : {"decoder", "encoder"}) {
-            args.push_back("--virtio-media");
-            args.push_back(std::string("kind=") + kind + ",uid=" + decimal(host.app_uid));
+    // VpuConfig.codecDevicesAttached and appendCodecDevices: what the switch
+    // itself buys, a hardware decoder and encoder (VpuConfig.CODEC_KINDS, in
+    // that order: the encoder was appended so a guest's decoder node keeps its
+    // number), each a helper under the app uid. After the camera rows, so the
+    // cameras keep their /dev/videoN when codecs come or go. vpu_codec_enabled
+    // (default on) takes only these away, never the pools or a camera. Only
+    // Gunyah gets the media-host-mb pool (hypervisor_args), and crosvm refuses
+    // a virtio-media device without it, so KVM/GenieZone get none.
+    void codec_devices(CrosvmLaunch& launch) {
+        if (!vpu_plan(item, host).enabled || !boolean(item, "vpu_codec_enabled", true)) return;
+        if (!gunyah) {
+            launch.warnings.push_back("codec devices skipped: they serve buffers from the media_host pool, which only a Gunyah VM is passed");
+            return;
         }
+        if (host.app_uid <= 0) {
+            launch.warnings.push_back("cannot resolve app uid; codec devices skipped");
+            return;
+        }
+        for (const char* kind : codec_kinds) {
+            args.push_back("--virtio-media");
+            args.push_back(codec_config(kind, launch));
+        }
+    }
+    static constexpr const char* codec_kinds[] = {"decoder", "encoder"};
+    // CrosvmBackendInstance.buildCodecConfig. The card is the name crosvm's
+    // helper falls back to, passed explicitly so the guest's name for its
+    // device is decided here. The backend choice (VpuDecoderBackend /
+    // VpuEncoderBackend; MediaCodec, crosvm's default, adds nothing) goes in
+    // the spelling the installed crosvm knows: backend=NAME where it has the
+    // backend table, else vidc=true for the decoder's msm_vidc, else nothing
+    // and the launcher says the device keeps MediaCodec.
+    std::string codec_config(const std::string& kind, CrosvmLaunch& launch) const {
+        auto cfg = "kind=" + kind + ",card=\"" + quotable("droidvm " + kind) + "\",uid=" + decimal(host.app_uid);
+        const auto backend = java_enum(item, kind == "decoder" ? "vpu_decoder_backend" : "vpu_encoder_backend", "MEDIACODEC", vpu_backends);
+        if (backend == "MEDIACODEC") return cfg;
+        const auto name = backend == "AUTO" ? "auto" : "msm-vidc";
+        if (host.crosvm_media_backend) return cfg + ",backend=" + name;
+        if (kind == "decoder" && backend == "MSM_VIDC" && host.crosvm_media_vidc) return cfg + ",vidc=true";
+        launch.warnings.push_back("this crosvm cannot choose the " + kind + "'s backend (" + name + "); it keeps MediaCodec");
+        return cfg;
     }
     void serials(CrosvmLaunch& launch) {
         const auto& ports = member(item, "serial_ports");
@@ -1002,7 +1045,7 @@ struct Builder {
         vibrator(launch);
         virtio_transport(launch);
         peripherals(launch);
-        virtio_media();
+        codec_devices(launch);
         serials(launch);
         mbi(launch);
         extra_options(item, args);
