@@ -832,6 +832,39 @@ struct Builder {
         launch.gnss = true;
     }
 
+    // PCI MSI/MSI-X on Gunyah (pci_msi, on unless switched off): crosvm's
+    // --mbi-spis puts a GICv2m-style MSI frame in front of mbi_spis SPIs, so
+    // each virtio-pci queue and the xHCI get an edge interrupt of their own
+    // instead of sharing INTx lines. Each guest finds the frame or not (Linux
+    // by the device tree's msi-parent, Windows by the GIC MSI Frame
+    // edk2-gunyah writes into the MADT), and one that knows neither keeps
+    // INTx. Only Gunyah has the frame -- the other irq chips refuse it -- and a
+    // count the user put in extra_options wins.
+    //
+    // Gunyah takes a VM's irqfds only from the device tree at start, which
+    // grows it by about 9 KB; EDK2's PrePi copies the tree into the room after
+    // its image header, which edk2-gunyah kept at 32 KB until a7903f0. An older
+    // image would copy the tree over its own code, so a firmware without
+    // mbi_min_firmware_code_offset of room boots without MSI instead.
+    static constexpr int mbi_spis = 64;
+    static constexpr int64_t mbi_min_firmware_code_offset = 0x20000;
+    void mbi(CrosvmLaunch& launch) {
+        if (!gunyah || !boolean(item, "pci_msi", true)) return;
+        const auto& options = member(item, "extra_options");
+        if (options.isArray()) for (const auto& option : options) if (option.isString() && option.asString() == "--mbi-spis") return;
+        if (!host.crosvm_mbi_spis) {
+            launch.warnings.push_back("this crosvm has no --mbi-spis; PCI devices keep INTx");
+            return;
+        }
+        if (boot.uefi && host.firmware_code_offset < mbi_min_firmware_code_offset) {
+            launch.warnings.push_back("PCI MSI off: the firmware starts its code at " + decimal(host.firmware_code_offset) +
+                ", under " + decimal(mbi_min_firmware_code_offset) + " (an older edk2-gunyah)");
+            return;
+        }
+        args.push_back("--mbi-spis");
+        args.push_back(decimal(mbi_spis));
+    }
+
     int64_t pflash_block_size() const {
         const auto size = host.pflash_vars_size;
         for (int64_t block : {262144, 65536, 4096}) if (size > 0 && size % block == 0) return block;
@@ -906,6 +939,7 @@ struct Builder {
         peripherals();
         virtio_media();
         serials(launch);
+        mbi(launch);
         extra_options(item, args);
         if (boot.uefi) {
             args.push_back(boot.firmware.empty() ? path_join(data_dir, "/usr/share/droidvm/edk2-gunyah.fd") : boot.firmware);

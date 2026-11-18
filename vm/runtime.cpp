@@ -881,6 +881,10 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         // The --serial synopsis: "...,[hardware=HW,name=NAME,num=NUM,...".
         host.crosvm_serial_name = supported("hardware=HW,name=NAME");
         host.crosvm_input_vibrator = supported("vibrator");
+        host.crosvm_mbi_spis = supported("--mbi-spis");
+        // The image a UEFI boot runs, as the command line names it.
+        if (plan.uefi) host.firmware_code_offset = firmware_code_offset(
+            plan.firmware.empty() ? command::path_join(data, "/usr/share/droidvm/edk2-gunyah.fd") : plan.firmware);
     }
     // A VIRTIO_GNSS row's port. AUTO is resolved here, against this phone, so a
     // VM moved to a phone without a receiver reports its location instead. A

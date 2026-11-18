@@ -29,4 +29,9 @@ std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::st
 // has-feature`, as root, cached once answered). A VIRTIO_GNSS row on AUTO
 // takes the receiver only when this holds, else the location alone.
 bool host_has_gps_receiver();
+// CrosvmBackendInstance.firmwareCodeOffset: where an EDK2 image of the
+// arm64-Linux-header kind (edk2-gunyah's) starts its code -- its first word is
+// `adr x1, .`, its second a `b` over the room PrePi copies the device tree
+// into. -1 for a file that does not start that way or cannot be read.
+int64_t firmware_code_offset(const std::string& path);
 }

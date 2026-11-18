@@ -27,7 +27,8 @@
 //            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
 //            "system_vulkan_hal":s,"viosnd_dump_exists":b,"crosvm_uvc_camera":b,
 //            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b,
-//            "crosvm_serial_name":b,"crosvm_input_vibrator":b}}
+//            "crosvm_serial_name":b,"crosvm_input_vibrator":b,"crosvm_mbi_spis":b,
+//            "firmware_code_offset":n}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -77,6 +78,13 @@ struct HostFacts {
     // The installed crosvm's --input takes the vibrator device (a
     // force-feedback virtio-input device). Without it the row is skipped.
     bool crosvm_input_vibrator = false;
+    // The installed crosvm lists --mbi-spis (a GICv2m-style MSI frame for
+    // Gunyah). Without it a Gunyah VM's PCI devices keep INTx.
+    bool crosvm_mbi_spis = false;
+    // firmware_code_offset() of the UEFI image this launch boots (the
+    // configured firmware or edk2-gunyah.fd); -1 unknown or not an
+    // edk2-gunyah-style image. Only read for a UEFI boot.
+    int64_t firmware_code_offset = -1;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}

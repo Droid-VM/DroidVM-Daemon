@@ -265,3 +265,18 @@ bool host_has_gps_receiver() {
     return *cached;
 }
 }
+namespace droidvm::vm {
+int64_t firmware_code_offset(const std::string& path) {
+    unsigned char bytes[8];
+    std::ifstream input(path, std::ios::binary);
+    if (!input || !input.read(reinterpret_cast<char*>(bytes), sizeof(bytes))) return -1;
+    const auto word = [&](int at) {
+        return static_cast<uint32_t>(bytes[at]) | static_cast<uint32_t>(bytes[at + 1]) << 8 |
+            static_cast<uint32_t>(bytes[at + 2]) << 16 | static_cast<uint32_t>(bytes[at + 3]) << 24;
+    };
+    const uint32_t code0 = word(0), code1 = word(4);
+    // `adr x1, .` then a forward `b`: imm26 is signed, and one that branches back has no room.
+    if (code0 != 0x10000001u || (code1 & 0xfe000000u) != 0x14000000u) return -1;
+    return 4 + 4 * static_cast<int64_t>(code1 & 0x01ffffffu);
+}
+}
