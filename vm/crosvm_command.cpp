@@ -285,6 +285,7 @@ struct Builder {
     const HostFacts& host;
     std::string data_dir;
     std::vector<std::string> args;
+    bool gunyah = false;
     std::string vm_id() const { return config::uuid(item); }
     std::string run_path() const { return path_join(data_dir, "run"); }
 
@@ -609,6 +610,9 @@ struct Builder {
                     if (!value.isString()) throw std::runtime_error("Expected type STRING");
                     key = value.asString();
                 }
+                // An older crosvm refuses the unknown flag and the VM would not
+                // start at all; leave the camera out rather than the VM.
+                if (!host.crosvm_uvc_camera) continue;
                 args.push_back("--uvc-camera");
                 args.push_back(key.empty() ? decimal(camera_seen) : key);
                 ++camera_seen;
@@ -629,8 +633,10 @@ struct Builder {
         }
     }
     // P1: one decoder and one encoder adapter, both in helpers under the app uid.
+    // Only Gunyah gets the media-host-mb pool (hypervisor_args), and crosvm
+    // refuses a virtio-media device without it, so KVM/GenieZone get none.
     void virtio_media() {
-        if (!vpu_plan(item, host).enabled || host.app_uid <= 0) return;
+        if (!gunyah || !vpu_plan(item, host).enabled || host.app_uid <= 0) return;
         for (const char* kind : {"decoder", "encoder"}) {
             args.push_back("--virtio-media");
             args.push_back(std::string("kind=") + kind + ",uid=" + decimal(host.app_uid));
@@ -711,6 +717,7 @@ struct Builder {
         }
         const auto hypervisor = resolve_hypervisor(item, host, Backend::crosvm);
         if (!hypervisor) throw std::runtime_error("No supported hypervisor found for CROSVM backend");
+        gunyah = *hypervisor == "GUNYAH";
         std::string def_protected = "PROTECTED_NORMAL";
         hypervisor_args(*hypervisor, def_protected);
         auto protection = java_enum(item, "protected_vm", def_protected.c_str(), protections);

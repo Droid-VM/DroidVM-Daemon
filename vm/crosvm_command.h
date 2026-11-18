@@ -56,6 +56,9 @@ struct HostFacts {
     // override, never replace, the persisted per-VM choice.
     std::optional<bool> virtio_media_override; // absent = follow the VM config
     std::optional<int64_t> virtio_media_host_mb_override; // 1..65536 MiB
+    // The installed crosvm lists --uvc-camera in `run --help`. Builds without
+    // it reject the whole command line, so camera rows are skipped instead.
+    bool crosvm_uvc_camera = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}

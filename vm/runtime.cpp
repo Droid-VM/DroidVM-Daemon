@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
@@ -196,6 +197,37 @@ bool crosvm_disk_capabilities_supported(const std::string& executable, const std
         try { supported = crosvm_retained_chain_supported(config::parse_json(capabilities.output)); }
         catch (const std::exception&) {}
     }
+    return supported;
+}
+bool crosvm_run_option_supported(const std::string& executable, const std::string& library_dir,
+                                 const std::string& option, const std::function<bool()>& cancelled) {
+    struct stat info{};
+    if (stat(executable.c_str(), &info) != 0) return false;
+    const auto key = executable + '|' + std::to_string(info.st_size) + '|' +
+        std::to_string(info.st_mtim.tv_sec) + '.' + std::to_string(info.st_mtim.tv_nsec) + '|' + option;
+    static std::mutex cache_mutex;
+    static std::map<std::string, bool> cache;
+    {
+        std::lock_guard lock(cache_mutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
+    ChildOptions probe;
+    probe.argv = {executable, "run", "--help"};
+    probe.environment = merged_environment({{"LD_LIBRARY_PATH", library_dir}, {"LD_PRELOAD", ""}});
+    const auto help = Child(probe).communicate({}, 2s, 256 * 1024, cancelled);
+    if (help.cancelled || help.timed_out) return false; // not cached: retry next launch
+    // argh prints the option table and exits; look for the option as a whole word.
+    const auto text = help.output + help.error;
+    bool supported = false;
+    for (size_t at = text.find(option); at != std::string::npos; at = text.find(option, at + 1)) {
+        const auto end = at + option.size();
+        if (end == text.size() || !(std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '-')) {
+            supported = true;
+            break;
+        }
+    }
+    std::lock_guard lock(cache_mutex);
+    cache[key] = supported;
     return supported;
 }
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
@@ -829,6 +861,11 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
                                    plan.uefi ? (plan.vars.empty() ? edk2_vars() : plan.vars) : std::string()});
     auto host = facts;
     host.data_dir = context_.data_dir;
+    {
+        const auto data = command::data_dir(host);
+        host.crosvm_uvc_camera = crosvm_run_option_supported(data + "/usr/bin/crosvm", data + "/usr/lib", "--uvc-camera",
+            [this] { return stopped_by_user_ || context_.shutting_down(); });
+    }
     // crosvm opens <cgroup>/tasks and never creates it; the flag needs this first.
     std::string cgroup_warning;
     run.gpu_cgroup_path = prepare_gpu_cgroup(config, cgroup_warning);
