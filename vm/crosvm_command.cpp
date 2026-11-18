@@ -678,7 +678,28 @@ struct Builder {
         }
     }
     // HostAudioTable.PATH; the dump path is a literal in the Java too.
-    std::string sound_config(const std::vector<const Json::Value*>& endpoints, const Json::Value& peripheral) const {
+    // HostAudioDevices.ATTR_SEPARATOR: a host_device key is the endpoint, then
+    // what the stream is for as attr=value,... after '#'. Passed to crosvm as
+    // is, except the latency mode (performance=) when the installed crosvm's
+    // AAudio backend does not know it: it would refuse the whole card.
+    std::string sound_key(std::string key, bool& stripped) const {
+        if (host.crosvm_sound_performance) return key;
+        const auto hash = key.find('#');
+        if (hash == std::string::npos) return key;
+        std::string kept;
+        bool dropped = false;
+        for (const auto& pair : split(key.substr(hash + 1), ',')) {
+            const auto eq = pair.find('=');
+            if (eq != std::string::npos && eq > 0 && trim(pair.substr(0, eq)) == "performance") { dropped = true; continue; }
+            if (!kept.empty()) kept += ',';
+            kept += pair;
+        }
+        if (!dropped) return key;
+        stripped = true;
+        key.resize(hash);
+        return kept.empty() ? key : key + '#' + kept;
+    }
+    std::string sound_config(const std::vector<const Json::Value*>& endpoints, const Json::Value& peripheral, bool& stripped) const {
         std::vector<const Json::Value*> outputs, inputs;
         for (const auto* endpoint : endpoints) (java_enum(*endpoint, "mode", "SPEAKER", sound_modes) == "MICROPHONE" ? inputs : outputs).push_back(endpoint);
         std::string cfg = host.viosnd_dump_exists ? "backend=file" : "backend=aaudio";
@@ -698,6 +719,7 @@ struct Builder {
                     key = value.asString();
                 }
                 if (key.empty()) key = "DEFAULT|system default";
+                key = sound_key(std::move(key), stripped);
                 cfg += std::string(i == 0 ? "" : ",") + "[host_device=\"" + key + "\"]";
             }
             cfg += "]";
@@ -710,7 +732,7 @@ struct Builder {
         cfg += ",uid=" + decimal(host.app_uid);
         return cfg;
     }
-    void peripherals() {
+    void peripherals(CrosvmLaunch& launch) {
         const auto& list = member(item, "peripherals");
         if (!list.isArray()) return;
         static const Json::Value empty_object(Json::objectValue);
@@ -748,7 +770,9 @@ struct Builder {
             }
             if (endpoints.empty()) continue;
             args.push_back("--virtio-snd");
-            args.push_back(sound_config(endpoints, peripheral));
+            bool stripped = false;
+            args.push_back(sound_config(endpoints, peripheral, stripped));
+            if (stripped) launch.warnings.push_back("this crosvm's AAudio backend has no latency mode; the sound card's endpoints start in its default");
         }
     }
     // P1: one decoder and one encoder adapter, both in helpers under the app uid.
@@ -936,7 +960,7 @@ struct Builder {
         motion_sensors(launch);
         vibrator(launch);
         virtio_transport(launch);
-        peripherals();
+        peripherals(launch);
         virtio_media();
         serials(launch);
         mbi(launch);

@@ -236,6 +236,35 @@ bool crosvm_run_option_supported(const std::string& executable, const std::strin
     }
     return false;
 }
+bool crosvm_binary_mentions(const std::string& executable, const std::string& text) {
+    struct stat info{};
+    if (text.empty() || stat(executable.c_str(), &info) != 0) return false;
+    const auto key = executable + '|' + std::to_string(info.st_size) + '|' +
+        std::to_string(info.st_mtim.tv_sec) + '.' + std::to_string(info.st_mtim.tv_nsec) + '|' + text;
+    static std::mutex cache_mutex;
+    static std::map<std::string, bool> cache;
+    {
+        std::lock_guard lock(cache_mutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
+    std::ifstream input(executable, std::ios::binary);
+    if (!input) return false;
+    // Chunks overlapping by the needle's length, so a match across two reads is found.
+    std::string window;
+    std::vector<char> buffer(1 << 20);
+    bool found = false;
+    while (!found && input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto got = static_cast<size_t>(input.gcount());
+        if (got == 0) break;
+        window.append(buffer.data(), got);
+        found = window.find(text) != std::string::npos;
+        if (window.size() > text.size()) window.erase(0, window.size() - text.size());
+    }
+    std::lock_guard lock(cache_mutex);
+    cache[key] = found;
+    return found;
+}
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
     : id_(std::move(id)), context_(context), config_(std::move(config)) {
     if (context_.private_console) {
@@ -882,6 +911,10 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         host.crosvm_serial_name = supported("hardware=HW,name=NAME");
         host.crosvm_input_vibrator = supported("vibrator");
         host.crosvm_mbi_spis = supported("--mbi-spis");
+        // The AAudio performance modes are parsed inside host_device; only the
+        // binary itself can say whether this crosvm knows them.
+        host.crosvm_sound_performance = crosvm_binary_mentions(data + "/usr/bin/crosvm", "power_saving") &&
+            crosvm_binary_mentions(data + "/usr/bin/crosvm", "low_latency");
         // The image a UEFI boot runs, as the command line names it.
         if (plan.uefi) host.firmware_code_offset = firmware_code_offset(
             plan.firmware.empty() ? command::path_join(data, "/usr/share/droidvm/edk2-gunyah.fd") : plan.firmware);

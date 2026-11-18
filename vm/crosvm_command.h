@@ -28,7 +28,7 @@
 //            "system_vulkan_hal":s,"viosnd_dump_exists":b,"crosvm_uvc_camera":b,
 //            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b,
 //            "crosvm_serial_name":b,"crosvm_input_vibrator":b,"crosvm_mbi_spis":b,
-//            "firmware_code_offset":n}}
+//            "firmware_code_offset":n,"crosvm_sound_performance":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -85,6 +85,11 @@ struct HostFacts {
     // configured firmware or edk2-gunyah.fd); -1 unknown or not an
     // edk2-gunyah-style image. Only read for a UEFI boot.
     int64_t firmware_code_offset = -1;
+    // The installed crosvm's AAudio backend knows a sound endpoint's
+    // performance= attribute (power_saving|none|low_latency in host_device
+    // after '#'). It is not in `run --help`; the launcher looks for the
+    // values in the binary. Without it the attribute is stripped.
+    bool crosvm_sound_performance = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}

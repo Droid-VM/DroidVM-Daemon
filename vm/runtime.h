@@ -40,6 +40,11 @@ bool crosvm_disk_capabilities_supported(const std::string& executable, const std
 // cached per executable path, size and mtime, so a prebuilt update is seen.
 bool crosvm_run_option_supported(const std::string& executable, const std::string& library_dir,
                                  const std::string& option, const std::function<bool()>& cancelled);
+// Whether the installed crosvm binary contains [text] at all, for a key
+// that never reaches `run --help` (a value parsed inside another option's
+// string, e.g. the AAudio attributes of a sound endpoint's host_device).
+// Read once per executable path, size, mtime and text.
+bool crosvm_binary_mentions(const std::string& executable, const std::string& text);
 enum class State { stopped, starting, running, suspended, stopping, rebooting };
 const char* state_name(State state); // VMState.name()
 struct RuntimeContext {
