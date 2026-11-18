@@ -22,6 +22,11 @@ std::string system_property(const char* name);
 // First evdev node reporting multi-touch absolute axes (the panel digitizer),
 // in event-number order; nullopt when none is readable. Does not grab it.
 std::optional<std::string> host_touchscreen(const std::string& directory = "/dev/input");
+// The VM trackpad's side in its units, from the built-in display's real size;
+// asked once per daemon.
+int64_t trackpad_side_units();
+// The phone's touch panel reports ABS_MT_TOUCH_MAJOR with a range.
+bool host_touch_reports_contact_size();
 // CrosvmBackendInstance.prepareGpuCgroup without a shell: the cpuset path
 // crosvm may join, or empty (soft failure, reason in warning).
 std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::string& warning);

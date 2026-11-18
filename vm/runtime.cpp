@@ -905,6 +905,12 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
                 [this] { return stopped_by_user_ || context_.shutting_down(); });
         };
         host.crosvm_uvc_camera = supported("--uvc-camera");
+        host.crosvm_trackpad_contacts = supported("contacts");
+        host.crosvm_trackpad_touch_size = supported("touch-size");
+        if (host.crosvm_trackpad_contacts) {
+            host.trackpad_side_units = trackpad_side_units();
+            host.touch_contact_size = host_touch_reports_contact_size();
+        }
         host.crosvm_motion_magnetometer = supported("magnetometer");
         host.crosvm_virtio_mmio_snd = supported("--virtio-mmio-snd");
         // The --serial synopsis: "...,[hardware=HW,name=NAME,num=NUM,...".

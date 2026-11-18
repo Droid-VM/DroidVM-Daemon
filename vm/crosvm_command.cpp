@@ -724,6 +724,26 @@ struct Builder {
             args.push_back("stylus[path=" + path + ",name=DroidVM Pen (" + id + ")]");
         }
     }
+    // The VM's trackpad, which the console's TRACKPAD mode drives: crosvm's
+    // multi-finger trackpad with no buttons (the guest's taps click). A square
+    // as wide as the phone's screen is long, in twentieths of a millimetre, so
+    // guests get its real size; contact size only when the phone's panel
+    // reports it. One per VM, as the relative mouse; emitted last of the input
+    // devices, for the reason motion_sensors() gives.
+    void trackpad(CrosvmLaunch& launch) {
+        if (!host.crosvm_trackpad_contacts) {
+            launch.warnings.push_back("this crosvm's trackpad has no contacts option; the console's trackpad mode has no device");
+            return;
+        }
+        const auto path = socket_path("", "tp", false);
+        launch.input_sockets.push_back({"", input_channel_trackpad, path});
+        const auto side = decimal(host.trackpad_side_units);
+        auto spec = "trackpad[path=" + path + ",width=" + side + ",height=" + side + ",res=" + decimal(trackpad_units_per_mm) +
+            ",contacts=" + decimal(trackpad_contacts);
+        if (host.crosvm_trackpad_touch_size) spec += std::string(",touch-size=") + (host.touch_contact_size ? "true" : "false");
+        args.push_back("--input");
+        args.push_back(spec + ",name=DroidVM Trackpad]");
+    }
     // On an MMIO VM, crosvm's switches that move the input devices, the network
     // cards and the GPU to virtio-mmio (the disks moved one by one in disks()).
     // A switch already among the extra options -- how such a VM was configured
@@ -1137,7 +1157,10 @@ struct Builder {
         if (launch.input_bridge) inputs(launch);
         motion_sensors(launch);
         vibrator(launch);
-        if (launch.input_bridge) pens(launch);
+        if (launch.input_bridge) {
+            pens(launch);
+            trackpad(launch);
+        }
         virtio_transport(launch);
         peripherals(launch);
         codec_devices(launch);

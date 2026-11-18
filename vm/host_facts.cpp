@@ -279,4 +279,51 @@ int64_t firmware_code_offset(const std::string& path) {
     if (code0 != 0x10000001u || (code1 & 0xfe000000u) != 0x14000000u) return -1;
     return 4 + 4 * static_cast<int64_t>(code1 & 0x01ffffffu);
 }
+// The VM trackpad's side in its units: a square as wide as the phone's screen
+// is long (NativeDisplay.trackpadSideUnits, from the same real metrics the
+// console clamps to). The built-in display's pixels and dpi come from
+// `dumpsys display` (DisplayDeviceInfo "W x H, ..., X x Y dpi"); the daemon has
+// no DisplayManager. A 300 mm square when they cannot be read.
+int64_t trackpad_side_units() {
+    static std::mutex mutex;
+    static std::optional<int64_t> cached;
+    std::lock_guard lock(mutex);
+    if (cached) return *cached;
+    constexpr int64_t fallback = 300 * trackpad_units_per_mm;
+    try {
+        ChildOptions options;
+        options.argv = {"/system/bin/dumpsys", "display"};
+        const auto result = Child(options).communicate({}, std::chrono::seconds(10), 4 * 1024 * 1024);
+        if (result.timed_out) return fallback; // not cached: asked again next time
+        static const std::regex info(R"(DisplayDeviceInfo\{[^\n]*?(\d+) x (\d+), [^\n]*?([0-9.]+) x ([0-9.]+) dpi)");
+        std::smatch m;
+        if (!std::regex_search(result.output, m, info)) { cached = fallback; return fallback; }
+        const double width = std::stod(m[1].str()), height = std::stod(m[2].str());
+        double xdpi = std::stod(m[3].str()), ydpi = std::stod(m[4].str());
+        if (xdpi <= 0) xdpi = 160;
+        if (ydpi <= 0) ydpi = 160;
+        const double mm = std::max(width / xdpi, height / ydpi) * 25.4;
+        cached = mm > 0 ? static_cast<int64_t>(std::ceil(mm)) * trackpad_units_per_mm : fallback;
+    } catch (const std::exception&) {
+        return fallback;
+    }
+    return *cached;
+}
+// Whether the phone's touch panel reports contact size: ABS_MT_TOUCH_MAJOR
+// with a real range. Optional in Linux's multi-touch protocol, and a panel
+// may declare it as 0..0, which Android treats as absent.
+bool host_touch_reports_contact_size() {
+    static std::mutex mutex;
+    static std::optional<bool> cached;
+    std::lock_guard lock(mutex);
+    if (cached) return *cached;
+    const auto node = host_touchscreen();
+    if (!node) return false;
+    const int raw = open(node->c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (raw < 0) return false;
+    input_absinfo major{};
+    cached = ioctl(raw, EVIOCGABS(ABS_MT_TOUCH_MAJOR), &major) >= 0 && major.maximum > major.minimum;
+    close(raw);
+    return *cached;
+}
 }

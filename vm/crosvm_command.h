@@ -67,6 +67,15 @@ struct HostFacts {
     // The installed crosvm lists --uvc-camera in `run --help`. Builds without
     // it reject the whole command line, so camera rows are skipped instead.
     bool crosvm_uvc_camera = false;
+    // The installed crosvm's trackpad device takes contacts=N (a multi-finger
+    // trackpad) and touch-size=BOOL. Without contacts the console's trackpad
+    // mode has no device to drive, so none is emitted.
+    bool crosvm_trackpad_contacts = false;
+    bool crosvm_trackpad_touch_size = false;
+    // The trackpad's side in units (trackpad_side_units()) and whether the
+    // phone's panel reports contact size; filled at launch.
+    int64_t trackpad_side_units = 300 * 20;
+    bool touch_contact_size = false;
     // The installed crosvm's motion device takes magnetometer=BOOL (its
     // `run --help` lists it). Without it the device is emitted without the
     // magnetometer rather than refused.
@@ -148,6 +157,11 @@ struct WebrtcEndpoint {
 // (VM-wide; nothing is written to it, the guest's rumble is read back from it).
 inline constexpr int input_channel_pen = 5; // per screen, as the tablet
 inline constexpr int input_channel_vibrator = 7;
+inline constexpr int input_channel_trackpad = 6;
+// NativeDisplay.TRACKPAD_CONTACTS / TRACKPAD_UNITS_PER_MM: what the console
+// encodes with, so what the device must declare.
+inline constexpr int trackpad_contacts = 5;
+inline constexpr int64_t trackpad_units_per_mm = 20;
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
     std::vector<std::string> argv;
