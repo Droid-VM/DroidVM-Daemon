@@ -24,6 +24,22 @@ const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
 const Names kms_planes{"SPLIT", "SINGLE"};
 const Names virtio_transports{"PCI", "MMIO"};
+// VmmLogLevel: what --log-level crosvm does with no flag, and what a filter
+// may be at most.
+constexpr const char* vmm_log_level_key = "log_level";
+constexpr const char* vmm_log_level_default = "info";
+constexpr size_t vmm_log_level_max = 256;
+bool vmm_level(const std::string& text) {
+    const auto l = lower(text);
+    return l == "off" || l == "error" || l == "warn" || l == "info" || l == "debug" || l == "trace";
+}
+bool vmm_target(const std::string& text) {
+    if (text.empty()) return false;
+    for (const char c : text)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-' || c == '.' || c == ':' || c == '*')) return false;
+    return true;
+}
 // VpuDecoderBackend / VpuEncoderBackend (the same three names).
 const Names vpu_backends{"MEDIACODEC", "AUTO", "MSM_VIDC"};
 // CrosvmBackendInstance.quotable: a value inside a double-quoted crosvm key
@@ -1020,6 +1036,23 @@ struct Builder {
         args.push_back(decimal(mbi_spis));
     }
 
+    // --log-level <filter> when the VM asked for a level other than crosvm's
+    // own info. A top-level option: between the binary and `run`, where argh
+    // takes it (extra_options land after `run`, where it is refused). The VMM
+    // forwards its level to every device helper it starts, so this is what
+    // makes a debug! in the media helpers readable. A value that is not a
+    // filter is dropped with a warning: the VM boots at info rather than not.
+    void log_level(CrosvmLaunch& launch) {
+        try {
+            if (const auto filter = vmm_log_level(item)) {
+                args.push_back("--log-level");
+                args.push_back(*filter);
+            }
+        } catch (const std::invalid_argument& error) {
+            launch.warnings.push_back(std::string(error.what()) + "; the VM keeps crosvm's default of info");
+        }
+    }
+
     int64_t pflash_block_size() const {
         const auto size = host.pflash_vars_size;
         for (int64_t block : {262144, 65536, 4096}) if (size > 0 && size % block == 0) return block;
@@ -1030,8 +1063,10 @@ struct Builder {
         strace(launch);
         const auto& name = member(item, "name");
         if (!name.isString()) throw std::invalid_argument("VM name is not a string");
-        for (auto arg : {path_join(data_dir, "usr", "bin", "crosvm"), std::string("--extended-status"), std::string("run"), std::string("--name"), name.asString()})
-            args.push_back(std::move(arg));
+        args.push_back(path_join(data_dir, "usr", "bin", "crosvm"));
+        args.push_back("--extended-status");
+        log_level(launch);
+        for (auto arg : {std::string("run"), std::string("--name"), name.asString()}) args.push_back(std::move(arg));
         args.push_back("--mem");
         args.push_back(decimal(std::max<int64_t>(integer(item, "memory_mb", 512), 64)));
         args.push_back("--cpus");
@@ -1212,5 +1247,54 @@ int64_t boot_media_guest_mb(const Json::Value& item) {
     if (!boolean(item, "vpu_enabled", false)) return 0;
     if (!media_guest_pool_applies(java_enum(item, "protected_vm", "PROTECTED_WITHOUT_FIRMWARE", protections))) return 0;
     return std::max<int64_t>(integer(item, "vpu_guest_pool_mb", default_vpu_guest_pool_mb), 0);
+}
+}
+namespace droidvm::vm {
+std::string parse_vmm_log_level(const std::string& raw) {
+    const auto refuse = [&](const std::string& value, const std::string& why) {
+        return std::invalid_argument(std::string(vmm_log_level_key) + " '" + value + "' is not a crosvm --log-level filter: " + why);
+    };
+    const auto not_a_level = [](const std::string& part) {
+        return "'" + part + "' is not a level (off, error, warn, info, debug, trace); a directive with no '=' must be one";
+    };
+    const auto filter = command::trim(raw);
+    if (filter.empty()) throw refuse(raw, "it is empty");
+    if (filter.size() > vmm_log_level_max)
+        throw refuse(filter, "it is " + std::to_string(filter.size()) + " characters, over the " + std::to_string(vmm_log_level_max) + " this accepts");
+    auto directives = filter;
+    // env_logger takes an optional message regex after the directives: the
+    // rest of the string, only checked for shape.
+    if (const auto slash = filter.find('/'); slash != std::string::npos) {
+        directives = filter.substr(0, slash);
+        const auto regex = filter.substr(slash + 1);
+        if (regex.empty()) throw refuse(filter, "the '/' has no regex after it");
+        for (const char c : regex)
+            if (static_cast<unsigned char>(c) <= ' ' || static_cast<unsigned char>(c) > '~')
+                throw refuse(filter, "the regex after '/' has whitespace or control characters");
+    }
+    if (directives.empty()) throw refuse(filter, "it has no directive before the '/'");
+    size_t begin = 0;
+    while (true) {
+        const auto comma = directives.find(',', begin);
+        const auto directive = directives.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+        if (directive.empty()) throw refuse(filter, "it has an empty directive (a stray or doubled comma)");
+        if (const auto eq = directive.find('='); eq == std::string::npos) {
+            if (!vmm_level(directive)) throw refuse(filter, not_a_level(directive));
+        } else {
+            const auto target = directive.substr(0, eq), level = directive.substr(eq + 1);
+            if (!vmm_target(target)) throw refuse(filter, "'" + target + "' is not a module path (letters, digits, '_', '-', '.' and ':')");
+            if (!vmm_level(level)) throw refuse(filter, not_a_level(level));
+        }
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    }
+    return filter;
+}
+std::optional<std::string> vmm_log_level(const Json::Value& item) {
+    auto stored = command::trim(command::string(item, vmm_log_level_key, vmm_log_level_default));
+    if (stored.empty()) stored = vmm_log_level_default;
+    const auto filter = parse_vmm_log_level(stored);
+    if (command::lower(filter) == vmm_log_level_default) return std::nullopt;
+    return filter;
 }
 }

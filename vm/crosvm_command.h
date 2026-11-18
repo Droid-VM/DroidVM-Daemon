@@ -196,6 +196,17 @@ int64_t boot_media_guest_mb(const Json::Value& item);
 // one passed media_host) and a resolved app uid. The command builder and the
 // peripheral foreground rule ask the same question.
 bool virtio_camera_attached(const Json::Value& item, const HostFacts& host);
+// VmmLogLevel.parse: the trimmed filter, or std::invalid_argument naming the
+// key, the value and what is wrong. An env_logger filter: comma-separated
+// directives, each a level (off|error|warn|info|debug|trace, any case) or
+// target=level, optionally followed by /<regex>; at most 256 characters.
+// Strict about levels, because env_logger drops what it cannot read and a
+// typo would be a VM that logs as before with nothing to say why.
+std::string parse_vmm_log_level(const std::string& raw);
+// VmmLogLevel.filterFor: the VM's log_level as --log-level wants it, or
+// nullopt for crosvm's default (unset, blank or "info"). Throws
+// std::invalid_argument for a value parse_vmm_log_level refuses.
+std::optional<std::string> vmm_log_level(const Json::Value& item);
 // VMScreenConfig.getTransportCap().getToken() for vm_vnc_info.
 std::string screen_transport_cap(const Json::Value& config, const std::string& id);
 }
