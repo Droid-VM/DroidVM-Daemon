@@ -20,7 +20,7 @@
 // ActivityManager manages holds the uid foreground. A foreground service in
 // the app does that, and only a root caller may start one while the app is in
 // the background, which is why the daemon raises it: as root, through
-//   am start-foreground-service --user <u> -n <pkg>/<service> --ei types <mask>
+//   am start-foreground-service --user <u> -n <pkg>/<service> --ei types <mask> [--ei gnss_sources <bits>] [--ez keep_screen_on true]
 // and `am stopservice` once no running VM needs it.
 //
 // The rule is one pure function, foreground_request(): a VM that is not
@@ -49,11 +49,14 @@ struct ForegroundRequest {
     // phone's sources the running VMs' GNSS receivers want, for the feeder the
     // service runs while it carries foreground_type_location.
     int gnss_sources = 0;
-    // Extension point, one more extra on the same intent and folded the same
-    // way over every VM (see PeripheralForegroundService):
-    //  - camera_keep_screen_on (default on): with foreground_type_camera in
-    //    types, a "keep_screen_on" boolean extra the service holds a display
-    //    wake lock for.
+    // EXTRA_KEEP_SCREEN_ON ("keep_screen_on"): a VM raising the camera type
+    // whose camera_keep_screen_on (default on) holds the display awake. The
+    // CAMERA app op is granted in foreground mode and a sleeping screen makes
+    // the app TOP_SLEEPING, which revokes a capture already streaming; the
+    // service holds a screen wake lock while this is set. Only with
+    // foreground_type_camera in types, so no VM holds the display without a
+    // camera and none opens a camera and lets the display go.
+    bool keep_screen_on = false;
     bool operator==(const ForegroundRequest&) const = default;
 };
 // The request one VM in [state] with [config] (migrated VM JSON) makes.

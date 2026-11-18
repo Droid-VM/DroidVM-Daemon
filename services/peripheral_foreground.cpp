@@ -40,6 +40,9 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
         // VPU switch on, Gunyah, the uid known -- the command builder's rule.
         if (type == "VIRTIO_CAMERA" && vm::virtio_camera_attached(config, camera_host)) request.types |= foreground_type_camera;
     }
+    // The bit comes from the mask itself: a VM that raises the camera type
+    // and has not switched the display hold off.
+    request.keep_screen_on = (request.types & foreground_type_camera) != 0 && boolean(config, "camera_keep_screen_on", true);
     // The GNSS receiver (the first row; the VM has one) reads the phone's
     // location through the app's uid, which needs the location type, and the
     // feeder needs to know which sources: AUTO resolved against this phone the
@@ -55,6 +58,7 @@ ForegroundRequest foreground_union(const std::vector<ForegroundRequest>& request
     for (const auto& request : requests) {
         out.types |= request.types;
         out.gnss_sources |= request.gnss_sources;
+        out.keep_screen_on = out.keep_screen_on || request.keep_screen_on;
     }
     return out;
 }
@@ -66,6 +70,9 @@ std::vector<std::string> foreground_command(const ForegroundRequest& request, co
     if (request.gnss_sources != 0) {
         argv.insert(argv.end(), {"--ei", "gnss_sources", std::to_string(request.gnss_sources)});
     }
+    // Absent reads as false in the service, which releases the lock.
+    if (request.keep_screen_on && (request.types & foreground_type_camera) != 0)
+        argv.insert(argv.end(), {"--ez", "keep_screen_on", "true"});
     return argv;
 }
 bool foreground_accepted(const ForegroundRequest& request, int exit_code, const std::string& output) {
