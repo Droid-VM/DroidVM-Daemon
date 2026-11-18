@@ -2,6 +2,7 @@
 #include "services/peripheral_foreground.h"
 #include "vm/command_common.h"
 #include "store/vm_config.h"
+#include "vm/gnss_port.h"
 #include <algorithm>
 
 namespace droidvm {
@@ -29,20 +30,34 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
         // it never opens, and raising the camera type for it would show a
         // privacy indicator for a camera nothing uses.
         if (type == "VIRTIO_CAMERA" && facts.crosvm_uvc_camera) request.types |= foreground_type_camera;
-        // Extension point: VIRTIO_GNSS -> foreground_type_location.
+    }
+    // The GNSS receiver (the first row; the VM has one) reads the phone's
+    // location through the app's uid, which needs the location type, and the
+    // feeder needs to know which sources: AUTO resolved against this phone the
+    // way the launcher resolves it. Only when crosvm can name the port.
+    if (const auto* row = vm::gnss_row(config); row && facts.crosvm_serial_name) {
+        request.types |= foreground_type_location;
+        request.gnss_sources |= vm::gnss_source_bits(vm::resolve_gnss_source(vm::gnss_source(*row), facts.host_gps_receiver));
     }
     return request;
 }
 ForegroundRequest foreground_union(const std::vector<ForegroundRequest>& requests) {
     ForegroundRequest out;
-    for (const auto& request : requests) out.types |= request.types;
+    for (const auto& request : requests) {
+        out.types |= request.types;
+        out.gnss_sources |= request.gnss_sources;
+    }
     return out;
 }
 std::vector<std::string> foreground_command(const ForegroundRequest& request, const std::string& package, int user) {
     const auto component = package + "/" + peripheral_foreground_service;
     if (request.types == 0) return {"/system/bin/am", "stopservice", "--user", std::to_string(user), "-n", component};
-    return {"/system/bin/am", "start-foreground-service", "--user", std::to_string(user), "-n", component,
-            "--ei", "types", std::to_string(request.types)};
+    std::vector<std::string> argv{"/system/bin/am", "start-foreground-service", "--user", std::to_string(user), "-n", component,
+                                  "--ei", "types", std::to_string(request.types)};
+    if (request.gnss_sources != 0) {
+        argv.insert(argv.end(), {"--ei", "gnss_sources", std::to_string(request.gnss_sources)});
+    }
+    return argv;
 }
 bool foreground_accepted(const ForegroundRequest& request, int exit_code, const std::string& output) {
     if (request.types == 0) {
@@ -77,6 +92,14 @@ void PeripheralForeground::changed() {
     }
     wake_.notify_all();
 }
+void PeripheralForeground::reraise() {
+    {
+        std::lock_guard lock(mutex_);
+        forget_ = true;
+        dirty_ = true;
+    }
+    wake_.notify_all();
+}
 void PeripheralForeground::settle() {
     std::unique_lock lock(mutex_);
     idle_.wait(lock, [this] { return closing_ || (!dirty_ && !busy_); });
@@ -103,6 +126,8 @@ void PeripheralForeground::work() {
         }
         if (closing_) break;
         dirty_ = false;
+        // applied_ belongs to this thread; reraise() only asks for it to go.
+        if (forget_) { applied_.reset(); forget_ = false; }
         busy_ = true;
         lock.unlock();
         bool failed = false;

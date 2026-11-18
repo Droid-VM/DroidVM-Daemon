@@ -52,7 +52,7 @@ std::string upper(const std::string& text) {
 const std::vector<const char*> display_backends{"NONE", "SIMPLEFB", "VIRTIO_GPU"};
 const std::vector<const char*> serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const std::vector<const char*> serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
-const std::vector<const char*> peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB", "VIRTIO_GYROSCOPE"};
+const std::vector<const char*> peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB", "VIRTIO_GYROSCOPE", "VIRTIO_GNSS"};
 constexpr const char* gpu0 = "gpu-0";
 constexpr const char* simplefb = "simplefb";
 

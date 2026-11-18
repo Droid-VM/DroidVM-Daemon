@@ -9,7 +9,7 @@
 
 namespace droidvm::usb {
 namespace {
-const std::vector<const char*> peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB", "VIRTIO_GYROSCOPE"};
+const std::vector<const char*> peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB", "VIRTIO_GYROSCOPE", "VIRTIO_GNSS"};
 Json::Value text_or_null(const std::optional<std::string>& value) { return value ? Json::Value(*value) : Json::Value(); }
 std::string strip(std::string path) {
     while (path.size() > 1 && path.back() == '/') path.pop_back();

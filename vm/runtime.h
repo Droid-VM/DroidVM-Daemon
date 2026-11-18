@@ -5,6 +5,7 @@
 #include "vm/console.h"
 #include "vm/crosvm_command.h"
 #include "vm/input_bridge.h"
+#include "vm/gnss_port.h"
 #include "vm/hugepage.h"
 #include "vm/usb_acm.h"
 #include "vm/observation.h"
@@ -59,6 +60,7 @@ struct RuntimeContext {
     bool private_console = false;
     LegacyEvents* events = nullptr;
     PoolReservations* pool = nullptr;
+    GnssHub* gnss = nullptr; // null: VIRTIO_GNSS rows get no port
     AcmPool* acm = nullptr; // null: USB_ACM ports degrade to a sink
     AndroidDisplayControl* android_display = nullptr; // null: KMS-exported screens cannot start
     HugepagePool hugepages;
@@ -203,6 +205,7 @@ private:
     std::vector<std::string> acm_owners_; // ResolvedSerial.acmDevPath holders
     std::unique_ptr<AndroidDisplayLease> android_display_; // state_mutex_; held while crosvm owns the panel
     InputBridge input_;
+    std::shared_ptr<GnssPort> gnss_port_; // state_mutex_; registered with context_.gnss while crosvm runs
     network::SwitchRuntime::Allocation identity_;
     std::atomic<bool> stopped_by_user_{false}, reboot_requested_{false}, reading_{true};
     bool pin_retry_used_ = false, worker_ = false;

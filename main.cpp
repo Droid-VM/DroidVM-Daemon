@@ -47,6 +47,7 @@
 #include "web/host_network.h"
 #include "services/configuration.h"
 #include "vm/host_facts.h"
+#include "vm/gnss_port.h"
 #include "vm/defaults.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
@@ -466,6 +467,8 @@ int main(int argc, char** argv) {
             // Declared before the worker shutdown guard: VMs release the panel
             // first, then this owner hands any manual session to its sentinel.
             std::unique_ptr<droidvm::AndroidDisplayService> android_display;
+            // Outlives vms: a stopping VM takes its GNSS port out of it.
+            std::unique_ptr<droidvm::vm::GnssHub> gnss_hub;
             std::unique_ptr<droidvm::VmService> vms;
             // Destroyed before vms and after the worker shutdown guard has
             // stopped them; its worker reads vms until it is joined.
@@ -597,6 +600,14 @@ int main(int argc, char** argv) {
                     // Never blocks: the raiser recomputes on its own thread.
                     if (foreground) foreground->changed();
                 };
+                {
+                    // The VMs' GNSS receivers; fed by the app over gnss_feed.
+                    droidvm::vm::GnssHub::Hooks hub;
+                    hub.reraise = [&] { if (foreground) foreground->reraise(); };
+                    hub.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+                    gnss_hub = std::make_unique<droidvm::vm::GnssHub>(std::move(hub));
+                    context.gnss = gnss_hub.get();
+                }
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);
                 };
@@ -627,6 +638,11 @@ int main(int argc, char** argv) {
                         droidvm::ForegroundFacts facts;
                         facts.crosvm_uvc_camera = droidvm::vm::crosvm_run_option_supported((data / "usr/bin/crosvm").string(),
                             (data / "usr/lib").string(), "--uvc-camera", cancelled);
+                        facts.crosvm_serial_name = droidvm::vm::crosvm_run_option_supported((data / "usr/bin/crosvm").string(),
+                            (data / "usr/lib").string(), "hardware=HW,name=NAME", cancelled);
+                        // Only a VM with a GNSS row on AUTO needs the answer; asked
+                        // once and cached, so cheap after the first such VM.
+                        if (facts.crosvm_serial_name) facts.host_gps_receiver = droidvm::vm::host_has_gps_receiver();
                         return facts;
                     };
                     raise.run = [](const std::vector<std::string>& argv, std::string& output) {
@@ -773,6 +789,7 @@ int main(int argc, char** argv) {
                                           hash, tasks.epoch());
             droidvm::RequestDispatcher dispatcher(system, tasks, network_config, host_network.get(), network_runtime.get(), host_ipv4.get(), vms.get(), &legacy_events, keyboard.get());
             if (hugepage_service) dispatcher.set_hugepages(hugepage_service.get());
+            if (gnss_hub) dispatcher.set_gnss(gnss_hub.get());
             if (host_preferences) dispatcher.set_host_preferences(host_preferences.get());
             if (disk_defaults) dispatcher.set_disk_defaults(disk_defaults.get());
             if (usb_acm) dispatcher.set_usb_acm(usb_acm.get());

@@ -16,6 +16,7 @@
 #include "services/legacy_events.h"
 #include "network/host_watch.h"
 #include "input/keyboard_grab.h"
+#include "vm/gnss_port.h"
 #include "usb/service.h"
 #include "pkg/service.h"
 #include "pkg/disk_operation.h"
@@ -63,6 +64,8 @@ public:
     void set_disk_defaults(HostPreferencesService* service) { disk_defaults_ = service; }
     void set_usb_acm(UsbAcmService* service) { usb_acm_ = service; }
     void set_android_display(AndroidDisplayService* service) { android_display_ = service; }
+    // The VMs' GNSS receivers, fed by the app's feeder (gnss_feed).
+    void set_gnss(vm::GnssHub* hub) { gnss_ = hub; }
     void set_disk_config(DiskConfigService* service) {
         if (!service || service->events() != &tasks_ || (disk_config_ && disk_config_ != service))
             throw std::invalid_argument("Disk registry adapter participants do not match");
@@ -124,6 +127,7 @@ private:
     VmService* vms_;
     LegacyEvents* events_;
     input::KeyboardGrab* keyboard_;
+    vm::GnssHub* gnss_ = nullptr;
     std::function<void(const std::string&, const Json::Value&)> display_attach_;
     std::function<Json::Value(const CallContext&, const std::string&, const Json::Value&)> web_execute_;
     std::function<void()> web_maintenance_;

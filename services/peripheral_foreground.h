@@ -34,14 +34,18 @@ inline constexpr int foreground_type_camera = 0x40;
 // What a launch would attach, as far as the foreground rule needs to know.
 struct ForegroundFacts {
     bool crosvm_uvc_camera = false; // HostFacts::crosvm_uvc_camera
+    bool crosvm_serial_name = false; // HostFacts::crosvm_serial_name: the GNSS port exists
+    bool host_gps_receiver = false; // vm::host_has_gps_receiver(), what AUTO resolves on
 };
 // One request to the service: the intent extras it reads.
 struct ForegroundRequest {
     int types = 0; // EXTRA_TYPES; 0 stops the service
-    // Extension points, each one more extra on the same intent and folded the
-    // same way over every VM (see PeripheralForegroundService):
-    //  - GNSS: a VIRTIO_GNSS row adds foreground_type_location and its
-    //    sources go in a "gnss_sources" int extra.
+    // EXTRA_GNSS_SOURCES ("gnss_sources", vm::gnss_source_* bits): which of the
+    // phone's sources the running VMs' GNSS receivers want, for the feeder the
+    // service runs while it carries foreground_type_location.
+    int gnss_sources = 0;
+    // Extension point, one more extra on the same intent and folded the same
+    // way over every VM (see PeripheralForegroundService):
     //  - camera_keep_screen_on (default on): with foreground_type_camera in
     //    types, a "keep_screen_on" boolean extra the service holds a display
     //    wake lock for.
@@ -83,6 +87,10 @@ public:
     // Any VM changed state. Never blocks: `am` takes a second and the caller
     // is the VM's own state transition.
     void changed();
+    // The service may be gone although it was raised (the GNSS feeder fell
+    // silent: the app's process was killed or replaced). Forgets what was
+    // applied, so the whole request goes out again. Never blocks.
+    void reraise();
     // Waits until the worker has nothing pending (tests).
     void settle();
 private:
@@ -91,7 +99,7 @@ private:
     Hooks hooks_;
     std::mutex mutex_;
     std::condition_variable wake_, idle_;
-    bool dirty_ = false, closing_ = false, busy_ = false;
+    bool dirty_ = false, closing_ = false, busy_ = false, forget_ = false;
     // What the service was last given; empty after a refusal, so the next
     // pass asks again even for the same request.
     std::optional<ForegroundRequest> applied_ = ForegroundRequest{};

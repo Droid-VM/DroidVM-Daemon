@@ -3,6 +3,7 @@
 // launch environment. DataItem semantics as in store/vm_config.cpp.
 #include "crosvm_command.h"
 #include "command_common.h"
+#include "gnss_port.h"
 #include <algorithm>
 #include <bit>
 #include <climits>
@@ -734,13 +735,12 @@ struct Builder {
             args.push_back(std::string("kind=") + kind + ",uid=" + decimal(host.app_uid));
         }
     }
-    void serials() {
+    void serials(CrosvmLaunch& launch) {
         const auto& ports = member(item, "serial_ports");
-        if (!ports.isArray()) return;
         struct Arg { std::string type = "sink"; std::optional<std::string> path, input; bool interactive = false; };
         std::vector<Arg> resolved;
         std::vector<const Json::Value*> list;
-        for (Json::ArrayIndex i = 0; i < ports.size(); ++i) {
+        for (Json::ArrayIndex i = 0; ports.isArray() && i < ports.size(); ++i) {
             const auto& port = ports[i];
             const SerialRun none;
             const auto& state = i < run.serials.size() ? run.serials[i] : none;
@@ -784,6 +784,26 @@ struct Builder {
             args.push_back("--serial");
             args.push_back(serial);
         }
+        gnss_serial(launch, list);
+    }
+    // The GNSS receiver's port, after the configured ones: a sink for what the
+    // guest writes, its input the daemon's pipe, under a virtio-console number
+    // no configured port uses (crosvm keys serials by type and number).
+    void gnss_serial(CrosvmLaunch& launch, const std::vector<const Json::Value*>& configured) {
+        if (!run.gnss_input_fd) return;
+        if (!host.crosvm_serial_name) {
+            launch.warnings.push_back("this crosvm cannot name a serial port; the VM starts without its GNSS receiver");
+            return;
+        }
+        int num = 0;
+        for (const auto* port : configured)
+            if (java_enum(*port, "hardware", "SERIAL", serial_hardware) == "VIRTIO_CONSOLE")
+                num = std::max(num, narrow(integer(*port, "num", 1)));
+        args.push_back("--serial");
+        args.push_back("type=sink,hardware=virtio-console,num=" + decimal(num + 1) + ",name=" + gnss_port_name +
+            ",input=/proc/self/fd/" + decimal(*run.gnss_input_fd));
+        launch.preserve_fds.push_back(*run.gnss_input_fd);
+        launch.gnss = true;
     }
 
     int64_t pflash_block_size() const {
@@ -858,7 +878,7 @@ struct Builder {
         virtio_transport(launch);
         peripherals();
         virtio_media();
-        serials();
+        serials(launch);
         extra_options(item, args);
         if (boot.uefi) {
             args.push_back(boot.firmware.empty() ? path_join(data_dir, "/usr/share/droidvm/edk2-gunyah.fd") : boot.firmware);

@@ -25,4 +25,8 @@ std::optional<std::string> host_touchscreen(const std::string& directory = "/dev
 // CrosvmBackendInstance.prepareGpuCgroup without a shell: the cpuset path
 // crosvm may join, or empty (soft failure, reason in warning).
 std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::string& warning);
+// Gnss.hostHasReceiver: the phone declares FEATURE_LOCATION_GPS (`pm
+// has-feature`, as root, cached once answered). A VIRTIO_GNSS row on AUTO
+// takes the receiver only when this holds, else the location alone.
+bool host_has_gps_receiver();
 }

@@ -876,6 +876,23 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         host.crosvm_uvc_camera = supported("--uvc-camera");
         host.crosvm_motion_magnetometer = supported("magnetometer");
         host.crosvm_virtio_mmio_snd = supported("--virtio-mmio-snd");
+        // The --serial synopsis: "...,[hardware=HW,name=NAME,num=NUM,...".
+        host.crosvm_serial_name = supported("hardware=HW,name=NAME");
+    }
+    // A VIRTIO_GNSS row's port. AUTO is resolved here, against this phone, so a
+    // VM moved to a phone without a receiver reports its location instead. A
+    // port that cannot be opened leaves the VM without a receiver rather than
+    // failing the start: the guest then sees what a VM without the row sees.
+    std::shared_ptr<GnssPort> gnss;
+    if (const auto* row = gnss_row(config); row && context_.gnss && !context_.private_console) {
+        auto source = gnss_source(*row);
+        if (source == GnssSource::automatic) source = resolve_gnss_source(source, host_has_gps_receiver());
+        try {
+            gnss = std::make_shared<GnssPort>(id_, source, config::boolean(*row, "gnss_mark_simulated", false));
+            run.gnss_input_fd = gnss->read_fd();
+        } catch (const std::exception& error) {
+            context_.warn("VM " + id_ + ": GNSS port could not be opened; the VM starts without it: " + error.what());
+        }
     }
     // crosvm opens <cgroup>/tasks and never creates it; the flag needs this first.
     std::string cgroup_warning;
@@ -904,7 +921,16 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
             for (size_t i = 0; i < matches.gl_pathc; ++i) write_quiet(matches.gl_pathv[i], std::to_string(*command.udmabuf_limit_mb));
         globfree(&matches);
     }
+    if (!command.gnss) gnss.reset();
     if (!spawn(command.argv, command.env, command.strace_dir, "crosvm", failure, command.preserve_fds)) return false;
+    if (gnss) {
+        // crosvm holds its own copy of the read end now.
+        gnss->close_read_fd();
+        const char* names[] = {"AUTO", "RECEIVER", "LOCATION"};
+        context_.info("VM " + id_ + ": GNSS receiver from the phone's " + names[static_cast<int>(gnss->source())]);
+        { std::lock_guard lock(state_mutex_); gnss_port_ = gnss; }
+        context_.gnss->add(gnss);
+    }
     {
         std::lock_guard lock(state_mutex_);
         vnc_endpoints_ = command.vnc_endpoints;
@@ -1120,7 +1146,9 @@ void VmRuntime::cleanup_backend() {
     input_.release();
     std::vector<std::string> acm;
     std::unique_ptr<AndroidDisplayLease> panel;
-    { std::lock_guard lock(state_mutex_); acm.swap(acm_owners_); panel = std::move(android_display_); }
+    std::shared_ptr<GnssPort> gnss;
+    { std::lock_guard lock(state_mutex_); acm.swap(acm_owners_); panel = std::move(android_display_); gnss.swap(gnss_port_); }
+    if (gnss && context_.gnss) context_.gnss->remove(gnss);
     // Runs after reap_and_cleanup: crosvm has released DRM master by now, so
     // the sentinel can bring the Android display HAL back.
     panel.reset();

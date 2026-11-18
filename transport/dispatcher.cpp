@@ -870,6 +870,19 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
     if (host_preferences_ && host_preferences_command(command)) return execute_background(context(session), command, request);
     if (hugepages_ && hugepage_command(command)) return execute_background(context(session), command, request);
     if (web_execute_ && web_command(command)) return execute_background(context(session), command, request);
+    if (gnss_ && command == "gnss_feed") {
+        // GnssFeedHandler: the app's feeder, once a second at most and every
+        // 5 s at least. Inline: it only records and writes non-blocking pipes.
+        Json::Value result;
+        result["success"] = false;
+        if (!context(session).authenticated) { result["message"] = "client is not authorized to perform this action"; return result; }
+        try {
+            const auto answer = gnss_->feed(request);
+            for (const auto& key : answer.getMemberNames()) result[key] = answer[key];
+            result["success"] = true;
+        } catch (...) { result["message"] = "internal error"; }
+        return result;
+    }
     if (std::find(commands.begin(), commands.end(), command) == commands.end() && !(vm_config_ && vm_config_command(command))
         && !(configuration_ && configuration_command(command)) && !(disk_operations_ && disk_operation_command(command))
         && !(disk_config_ && (command == "disk_config_status" || command == "disk_config_snapshot" || disk_upload_command(command)))) {
@@ -899,6 +912,7 @@ Json::Value RequestDispatcher::execute(ClientSession& session, const std::string
                 for (const auto* name : web_commands) result["commands"].append(name);
                 result["webui"] = "http-session-v1";
             }
+            if (gnss_) result["commands"].append("gnss_feed");
             result["service_api_minor"] = 1;
             for (const auto* name : commands) {
                 if (std::string_view(name) == "network_config_document" && (!networks_ || !networks_->has_events())) continue;

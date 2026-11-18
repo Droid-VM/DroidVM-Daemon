@@ -8,6 +8,9 @@
 #include "qcom_chips.h"
 #include "vm/command_common.h"
 #include "store/network_config.h"
+#include "runtime/child.h"
+#include <chrono>
+#include <mutex>
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
@@ -240,5 +243,25 @@ std::optional<std::string> prepare_gpu_cgroup(const Json::Value& config, std::st
     if (!current) current = read_text(path + "/cpuset.cpus");
     if (!current || command::trim(*current).empty()) return failed("cpus not set");
     return path;
+}
+}
+namespace droidvm::vm {
+bool host_has_gps_receiver() {
+    // PackageManager.hasSystemFeature(FEATURE_LOCATION_GPS), asked once: the
+    // feature list is fixed for the life of the boot.
+    static std::mutex mutex;
+    static std::optional<bool> cached;
+    std::lock_guard lock(mutex);
+    if (cached) return *cached;
+    try {
+        ChildOptions options;
+        options.argv = {"/system/bin/pm", "has-feature", "android.hardware.location.gps"};
+        const auto result = Child(options).communicate({}, std::chrono::seconds(15), 4096);
+        if (result.timed_out) return false; // not cached: asked again next time
+        cached = result.output.find("true") != std::string::npos;
+    } catch (const std::exception&) {
+        return false;
+    }
+    return *cached;
 }
 }

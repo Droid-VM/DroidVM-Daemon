@@ -26,7 +26,8 @@
 //            "pflash_vars_size":n,"android_release":s,"strace_prebuilt_exists":b,
 //            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
 //            "system_vulkan_hal":s,"viosnd_dump_exists":b,"crosvm_uvc_camera":b,
-//            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b}}
+//            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b,
+//            "crosvm_serial_name":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -70,6 +71,9 @@ struct HostFacts {
     // The installed crosvm lists --virtio-mmio-snd; an MMIO VM's sound cards
     // stay on PCI without it.
     bool crosvm_virtio_mmio_snd = false;
+    // The installed crosvm's --serial takes name=NAME (a named virtio-console
+    // port). Without it the GNSS receiver's port is left out.
+    bool crosvm_serial_name = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}
@@ -95,6 +99,9 @@ struct CrosvmRun {
     // KMS exporter: the host touch node crosvm grabs directly (evdev). Resolved
     // by the launcher; absent means the screen gets no touch input at all.
     std::optional<std::string> kms_touch_device;
+    // The read end of the VM's GNSS port (GnssPort): a VIRTIO_GNSS row's
+    // named virtio-console port takes its input from it. Absent: no receiver.
+    std::optional<int> gnss_input_fd;
 };
 // A --webrtc-server listener: crosvm serves its viewer page at http://host:port/?token=.
 struct WebrtcEndpoint {
@@ -124,6 +131,9 @@ struct CrosvmLaunch {
     // Devices left out or reduced because the installed crosvm cannot take
     // them; the launcher logs each one.
     std::vector<std::string> warnings;
+    // The GNSS port is on the command line: the launcher hands the pipe to
+    // the hub once crosvm runs (and drops it otherwise).
+    bool gnss = false;
 };
 // The gpu-0 screen is exported to the panel over DRM/KMS. Throws
 // std::invalid_argument for combinations crosvm would refuse.
