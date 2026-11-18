@@ -26,6 +26,8 @@ const Names kms_planes{"SPLIT", "SINGLE"};
 const Names virtio_transports{"PCI", "MMIO"};
 // NativeDisplay.MOTION_DEVICE_NAME
 constexpr const char* motion_device_name = "DroidVM Motion Sensors";
+// NativeDisplay.VIBRATOR_DEVICE_NAME
+constexpr const char* vibrator_device_name = "DroidVM Vibrator";
 // Guards loops that Java would only finish by exhausting its heap.
 constexpr int64_t max_cpu_entries = 1 << 20;
 
@@ -629,6 +631,30 @@ struct Builder {
         args.push_back("--input");
         args.push_back(spec);
     }
+    // The vibrator (a VIRTIO_VIBRATOR row; one per VM): crosvm's virtio-input
+    // device that declares FF_RUMBLE and only listens. Its socket is the
+    // daemon's like the console's devices, so it rides the same bridge; a VM
+    // exporting no screen has no bridge and so no vibrator. After the motion
+    // sensors, for the reason motion_sensors() gives.
+    void vibrator(CrosvmLaunch& launch) {
+        const auto& list = member(item, "peripherals");
+        bool wanted = false;
+        if (list.isArray()) for (const auto& peripheral : list)
+            wanted = wanted || java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "VIRTIO_VIBRATOR";
+        if (!wanted) return;
+        if (!launch.input_bridge) {
+            launch.warnings.push_back("peripheral virtio_vibrator skipped: the VM exports no screen, so there is no input bridge for its socket");
+            return;
+        }
+        if (!host.crosvm_input_vibrator) {
+            launch.warnings.push_back("this crosvm has no vibrator input device; the VM starts without its vibrator");
+            return;
+        }
+        const auto path = socket_path("", "vib", false);
+        launch.input_sockets.push_back({"", input_channel_vibrator, path});
+        args.push_back("--input");
+        args.push_back("vibrator[path=" + path + ",name=" + vibrator_device_name + "]");
+    }
     // On an MMIO VM, crosvm's switches that move the input devices, the network
     // cards and the GPU to virtio-mmio (the disks moved one by one in disks()).
     // A switch already among the extra options -- how such a VM was configured
@@ -875,6 +901,7 @@ struct Builder {
         }
         if (launch.input_bridge) inputs(launch);
         motion_sensors(launch);
+        vibrator(launch);
         virtio_transport(launch);
         peripherals();
         virtio_media();

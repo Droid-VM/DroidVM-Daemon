@@ -48,6 +48,7 @@
 #include "services/configuration.h"
 #include "vm/host_facts.h"
 #include "vm/gnss_port.h"
+#include "input/host_vibrator.h"
 #include "vm/defaults.h"
 #ifdef DROIDVM_PLATFORM_SERVICES
 #include "audio_table.h"
@@ -469,6 +470,8 @@ int main(int argc, char** argv) {
             std::unique_ptr<droidvm::AndroidDisplayService> android_display;
             // Outlives vms: a stopping VM takes its GNSS port out of it.
             std::unique_ptr<droidvm::vm::GnssHub> gnss_hub;
+            // Outlives vms too: a stopping VM's rumble is released in it.
+            std::unique_ptr<droidvm::input::HostVibrator> vibrator;
             std::unique_ptr<droidvm::VmService> vms;
             // Destroyed before vms and after the worker shutdown guard has
             // stopped them; its worker reads vms until it is joined.
@@ -607,6 +610,28 @@ int main(int argc, char** argv) {
                     hub.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
                     gnss_hub = std::make_unique<droidvm::vm::GnssHub>(std::move(hub));
                     context.gnss = gnss_hub.get();
+                }
+                // The phone's motor is host-global: only the installed app's own
+                // daemon plays the VMs' vibrators on it.
+                if (same) {
+                    droidvm::input::HostVibrator::Hooks motor;
+                    motor.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+                    motor.open = [&]() -> std::unique_ptr<droidvm::input::VibratorMotor> {
+                        auto found = droidvm::input::hal_vibrator([&](const std::string& why) {
+                            if (log) log->write("INFO", "HostVibrator: no vibrator HAL (" + why + "); trying cmd vibrator_manager");
+                        });
+                        if (found) return found;
+                        return droidvm::input::shell_vibrator([](const std::vector<std::string>& argv, std::string& output) {
+                            droidvm::ChildOptions options;
+                            options.argv = argv;
+                            const auto result = droidvm::Child(options).communicate({}, std::chrono::seconds(5), 16u << 10);
+                            output = result.output + result.error;
+                            return result.timed_out ? -1 : result.exit_code;
+                        });
+                    };
+                    vibrator = std::make_unique<droidvm::input::HostVibrator>(std::move(motor));
+                    context.vibrator_status = [&](const std::string& id, std::string records) { vibrator->on_guest_status(id, records); };
+                    context.vibrator_release = [&](const std::string& id) { vibrator->release(id); };
                 }
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);

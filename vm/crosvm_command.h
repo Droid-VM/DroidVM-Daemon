@@ -27,7 +27,7 @@
 //            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
 //            "system_vulkan_hal":s,"viosnd_dump_exists":b,"crosvm_uvc_camera":b,
 //            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b,
-//            "crosvm_serial_name":b}}
+//            "crosvm_serial_name":b,"crosvm_input_vibrator":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -74,6 +74,9 @@ struct HostFacts {
     // The installed crosvm's --serial takes name=NAME (a named virtio-console
     // port). Without it the GNSS receiver's port is left out.
     bool crosvm_serial_name = false;
+    // The installed crosvm's --input takes the vibrator device (a
+    // force-feedback virtio-input device). Without it the row is skipped.
+    bool crosvm_input_vibrator = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}
@@ -111,7 +114,10 @@ struct WebrtcEndpoint {
     bool input_enabled = true;
 };
 // NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3, SENSOR 4
-// (the VM-wide motion sensors a console overrides crosvm's host readings with).
+// (the VM-wide motion sensors a console overrides crosvm's host readings with),
+// PEN 5 and TRACKPAD 6 (reserved for the console's pen and trackpad), VIBRATOR 7
+// (VM-wide; nothing is written to it, the guest's rumble is read back from it).
+inline constexpr int input_channel_vibrator = 7;
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
     std::vector<std::string> argv;

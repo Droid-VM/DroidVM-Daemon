@@ -14,7 +14,8 @@
 namespace droidvm::vm {
 // NativeDisplayInputBridge: crosvm is the client of each --input socket, so
 // they are bound before it starts and fed the UI's evdev bytes (vm_input).
-// Keyboard-channel peers send 8-byte LED status records back.
+// Keyboard-channel peers send 8-byte LED status records back, the vibrator
+// channel the guest's force-feedback records.
 class InputBridge {
 public:
     using Status = std::function<void(const std::string& screen, int channel, std::string records)>;

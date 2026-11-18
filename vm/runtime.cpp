@@ -246,6 +246,8 @@ VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& c
         context_.events = nullptr;
         context_.state_changed = {};
         context_.input_status = {};
+        context_.vibrator_status = {};
+        context_.vibrator_release = {};
         context_.warn = [](const std::string&) {};
         context_.info = [](const std::string&) {};
     }
@@ -878,6 +880,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         host.crosvm_virtio_mmio_snd = supported("--virtio-mmio-snd");
         // The --serial synopsis: "...,[hardware=HW,name=NAME,num=NUM,...".
         host.crosvm_serial_name = supported("hardware=HW,name=NAME");
+        host.crosvm_input_vibrator = supported("vibrator");
     }
     // A VIRTIO_GNSS row's port. AUTO is resolved here, against this phone, so a
     // VM moved to a phone without a receiver reports its location instead. A
@@ -909,9 +912,14 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     for (const auto& warning : command.warnings) context_.warn("VM " + id_ + ": " + warning);
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.
+        // What the guest says back: the keyboard's lamps go to the grab
+        // manager, the vibrator's rumble to the phone's motor.
         InputBridge::Status status;
-        if (context_.input_status)
-            status = [this](const std::string& screen, int, std::string records) { context_.input_status(id_, screen, std::move(records)); };
+        if (context_.input_status || context_.vibrator_status)
+            status = [this](const std::string& screen, int channel, std::string records) {
+                if (channel == input_channel_vibrator) { if (context_.vibrator_status) context_.vibrator_status(id_, std::move(records)); }
+                else if (context_.input_status) context_.input_status(id_, screen, std::move(records));
+            };
         try { input_.listen(command.input_sockets, std::move(status)); }
         catch (const std::invalid_argument& error) { failure = std::string("display input setup failed: ") + error.what(); return false; }
     }
@@ -1144,6 +1152,7 @@ void VmRuntime::reap_and_cleanup() {
 }
 void VmRuntime::cleanup_backend() {
     input_.release();
+    if (context_.vibrator_release) context_.vibrator_release(id_);
     std::vector<std::string> acm;
     std::unique_ptr<AndroidDisplayLease> panel;
     std::shared_ptr<GnssPort> gnss;

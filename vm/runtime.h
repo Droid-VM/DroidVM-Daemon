@@ -79,6 +79,10 @@ struct RuntimeContext {
     // KeyboardGrabManager.onVmState on every transition; onGuestStatus for keyboard status records.
     std::function<void(const std::string& id, const std::string& name, State state)> state_changed;
     std::function<void(const std::string& id, const std::string& screen, std::string records)> input_status;
+    // HostVibrator: the force-feedback records a VM's vibrator sends back, and
+    // the VM stopping (its rumble stops with it).
+    std::function<void(const std::string& id, std::string records)> vibrator_status;
+    std::function<void(const std::string& id)> vibrator_release;
 };
 // One VMInstance: its config, console streams and at most one VMM process.
 // Lifecycle calls serialize on one lock like startLock; the process is

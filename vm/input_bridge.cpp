@@ -56,9 +56,11 @@ void InputBridge::accept(Slot& slot) {
         if (closed_) break;
         if (slot.peer) shutdown(slot.peer->get(), SHUT_RDWR);
         slot.peer = peer;
-        if (slot.socket.channel != keyboard) continue;
-        // Guest LED status, delivered in whole 8-byte records.
-        slot.readers.emplace_back([this, peer, screen = slot.socket.screen] {
+        // Only the keyboard (guest LED status) and the vibrator (the rumble the
+        // guest wants) say anything back.
+        if (slot.socket.channel != keyboard && slot.socket.channel != input_channel_vibrator) continue;
+        // Delivered in whole 8-byte records.
+        slot.readers.emplace_back([this, peer, screen = slot.socket.screen, channel = slot.socket.channel] {
             std::string held;
             char buffer[256];
             for (;;) {
@@ -67,7 +69,7 @@ void InputBridge::accept(Slot& slot) {
                 if (count <= 0 || closed_) break;
                 held.append(buffer, static_cast<size_t>(count));
                 const auto whole = held.size() - held.size() % 8;
-                if (whole && status_) status_(screen, keyboard, held.substr(0, whole));
+                if (whole && status_) status_(screen, channel, held.substr(0, whole));
                 held.erase(0, whole);
             }
         });
