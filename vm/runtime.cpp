@@ -203,32 +203,38 @@ bool crosvm_run_option_supported(const std::string& executable, const std::strin
                                  const std::string& option, const std::function<bool()>& cancelled) {
     struct stat info{};
     if (stat(executable.c_str(), &info) != 0) return false;
+    // One `run --help` per installed binary, whatever number of options a
+    // launch asks about.
     const auto key = executable + '|' + std::to_string(info.st_size) + '|' +
-        std::to_string(info.st_mtim.tv_sec) + '.' + std::to_string(info.st_mtim.tv_nsec) + '|' + option;
+        std::to_string(info.st_mtim.tv_sec) + '.' + std::to_string(info.st_mtim.tv_nsec);
     static std::mutex cache_mutex;
-    static std::map<std::string, bool> cache;
+    static std::map<std::string, std::string> cache;
+    std::string text;
+    bool cached = false;
     {
         std::lock_guard lock(cache_mutex);
-        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+        if (const auto found = cache.find(key); found != cache.end()) { text = found->second; cached = true; }
     }
-    ChildOptions probe;
-    probe.argv = {executable, "run", "--help"};
-    probe.environment = merged_environment({{"LD_LIBRARY_PATH", library_dir}, {"LD_PRELOAD", ""}});
-    const auto help = Child(probe).communicate({}, 2s, 256 * 1024, cancelled);
-    if (help.cancelled || help.timed_out) return false; // not cached: retry next launch
-    // argh prints the option table and exits; look for the option as a whole word.
-    const auto text = help.output + help.error;
-    bool supported = false;
+    if (!cached) {
+        ChildOptions probe;
+        probe.argv = {executable, "run", "--help"};
+        probe.environment = merged_environment({{"LD_LIBRARY_PATH", library_dir}, {"LD_PRELOAD", ""}});
+        const auto help = Child(probe).communicate({}, 2s, 256 * 1024, cancelled);
+        if (help.cancelled || help.timed_out) return false; // not cached: retry next launch
+        text = help.output + help.error;
+        std::lock_guard lock(cache_mutex);
+        cache[key] = text;
+    }
+    // argh prints the option table and exits; look for the option as a whole
+    // word. Device sub-options ("magnetometer") appear in their device's
+    // synopsis, e.g. motion[path=PATH,host-sensors=BOOL,...].
     for (size_t at = text.find(option); at != std::string::npos; at = text.find(option, at + 1)) {
         const auto end = at + option.size();
-        if (end == text.size() || !(std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '-')) {
-            supported = true;
-            break;
-        }
+        const bool starts = at == 0 || !(std::isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '-');
+        if (!starts && option.front() != '-') continue;
+        if (end == text.size() || !(std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '-')) return true;
     }
-    std::lock_guard lock(cache_mutex);
-    cache[key] = supported;
-    return supported;
+    return false;
 }
 VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& context)
     : id_(std::move(id)), context_(context), config_(std::move(config)) {
@@ -863,8 +869,13 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     host.data_dir = context_.data_dir;
     {
         const auto data = command::data_dir(host);
-        host.crosvm_uvc_camera = crosvm_run_option_supported(data + "/usr/bin/crosvm", data + "/usr/lib", "--uvc-camera",
-            [this] { return stopped_by_user_ || context_.shutting_down(); });
+        const auto supported = [&](const char* option) {
+            return crosvm_run_option_supported(data + "/usr/bin/crosvm", data + "/usr/lib", option,
+                [this] { return stopped_by_user_ || context_.shutting_down(); });
+        };
+        host.crosvm_uvc_camera = supported("--uvc-camera");
+        host.crosvm_motion_magnetometer = supported("magnetometer");
+        host.crosvm_virtio_mmio_snd = supported("--virtio-mmio-snd");
     }
     // crosvm opens <cgroup>/tasks and never creates it; the flag needs this first.
     std::string cgroup_warning;
@@ -878,6 +889,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         }
     }
     const auto command = crosvm_command(config, run, plan, host);
+    for (const auto& warning : command.warnings) context_.warn("VM " + id_ + ": " + warning);
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.
         InputBridge::Status status;

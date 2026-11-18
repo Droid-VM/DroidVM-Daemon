@@ -34,8 +34,9 @@ void require_crosvm_disk_capabilities(const std::string& executable, const std::
 // False when the backend lacks retained backing chains; throws only on cancellation.
 bool crosvm_disk_capabilities_supported(const std::string& executable, const std::string& library_dir,
                                         const std::function<bool()>& cancelled);
-// Whether `crosvm run --help` lists the long option (e.g. "--uvc-camera").
-// Cached per executable path, size and mtime, so a prebuilt update is seen.
+// Whether `crosvm run --help` lists the long option (e.g. "--uvc-camera") or
+// a device sub-option (e.g. "magnetometer") as a whole word. The help text is
+// cached per executable path, size and mtime, so a prebuilt update is seen.
 bool crosvm_run_option_supported(const std::string& executable, const std::string& library_dir,
                                  const std::string& option, const std::function<bool()>& cancelled);
 enum class State { stopped, starting, running, suspended, stopping, rebooting };

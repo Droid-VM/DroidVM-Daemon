@@ -24,7 +24,9 @@ inline const Names gpu_backends{"NONE", "GPU_2D", "GPU_GFXSTREAM", "GPU_VIRGLREN
 inline const Names exporters{"NATIVE", "VNC", "KMS", "WEBRTC", "NONE"};
 inline const Names disk_buses{"VIRTIO", "SCSI", "PMEM", "PFLASH", "CDROM"};
 inline const Names dir_caches{"NEVER", "AUTO", "ALWAYS"};
-inline const Names peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB"};
+// PeripheralType; an unknown name reads as VIRTIO_SOUND, so every type the app
+// writes must be listed here (and in store/vm_config.cpp, usb/service.cpp).
+inline const Names peripheral_types{"VIRTIO_SOUND", "INTEL_HDA", "VIRTIO_CAMERA", "XHCI_USB", "VIRTIO_GYROSCOPE"};
 inline constexpr const char* gpu0 = "gpu-0";
 inline constexpr const char* simplefb = "simplefb";
 

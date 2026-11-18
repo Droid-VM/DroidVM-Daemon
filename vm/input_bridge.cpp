@@ -74,7 +74,8 @@ void InputBridge::accept(Slot& slot) {
     }
 }
 bool InputBridge::write(const std::string& screen, int channel, std::string_view data) {
-    if (channel < 0 || channel >= 4 || data.empty()) return false;
+    // Channels 0-3 are the console devices, 4 the VM-wide motion sensors.
+    if (channel < 0 || channel >= 5 || data.empty()) return false;
     Slot* slot;
     {
         std::lock_guard lock(mutex_);

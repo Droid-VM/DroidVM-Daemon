@@ -22,6 +22,9 @@ const Names sound_underruns{"SILENCE", "REPEAT", "WSOLA", "LPC"};
 const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
 const Names kms_planes{"SPLIT", "SINGLE"};
+const Names virtio_transports{"PCI", "MMIO"};
+// NativeDisplay.MOTION_DEVICE_NAME
+constexpr const char* motion_device_name = "DroidVM Motion Sensors";
 // Guards loops that Java would only finish by exhausting its heap.
 constexpr int64_t max_cpu_entries = 1 << 20;
 
@@ -313,6 +316,17 @@ struct Builder {
     std::vector<std::string> args;
     bool gunyah = false;
     std::string vm_id() const { return config::uuid(item); }
+    // VirtioTransport.fromItem: how the guest finds its virtio devices. A
+    // config without the key is a PCI VM, what crosvm does with no flag.
+    bool mmio() const { return java_enum(item, "virtio_transport", "PCI", virtio_transports) == "MMIO"; }
+    // MotionSensors.rowOf: the first VIRTIO_GYROSCOPE row (crosvm has one motion device).
+    const Json::Value* motion_row() const {
+        const auto& list = member(item, "peripherals");
+        if (!list.isArray()) return nullptr;
+        for (const auto& peripheral : list)
+            if (java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "VIRTIO_GYROSCOPE") return &peripheral;
+        return nullptr;
+    }
     std::string run_path() const { return path_join(data_dir, "run"); }
 
     void strace(CrosvmLaunch& launch) { launch.strace_dir = strace_args(item, host, args); }
@@ -400,7 +414,8 @@ struct Builder {
             } else if (bus == "VIRTIO") {
                 arg += ",lock=false";
                 if (readonly) arg += ",ro=true";
-                args.push_back("--block");
+                // A disk is the one virtio device crosvm moves to MMIO one at a time.
+                args.push_back(mmio() ? "--virtio-mmio-block" : "--block");
             } else continue;
             args.push_back(arg);
         }
@@ -585,6 +600,56 @@ struct Builder {
             args.push_back("keyboard[path=" + socket_path(id, "kbd", true) + ",name=DroidVM Keyboard (" + id + ")]");
         }
     }
+    // The VM's motion sensors (a VIRTIO_GYROSCOPE row, or the VM-level
+    // motion_sensor switch from before the row existed): crosvm reads the
+    // phone's own sensors (host-sensors), and a console that corrects them
+    // overrides them through the SENSOR socket, which exists whenever the input
+    // bridge does. Without a bridge nothing can override, so no path.
+    //
+    // Emitted after the other input devices: on an MMIO VM the input windows
+    // follow the command line order, so the screens' devices keep their
+    // addresses whether or not this one is there.
+    void motion_sensors(CrosvmLaunch& launch) {
+        const auto* row = motion_row();
+        if (!row && !boolean(item, "motion_sensor", false)) return;
+        std::string spec = "motion[";
+        if (launch.input_bridge) {
+            const auto path = socket_path("", "sen", false);
+            launch.input_sockets.push_back({"", 4, path});
+            spec += "path=" + path + ",";
+        }
+        spec += "host-sensors=true";
+        // MotionSensors.magnetometer: only a row can carry it; on by default.
+        if (row && boolean(*row, "magnetometer", true)) {
+            if (host.crosvm_motion_magnetometer) spec += ",magnetometer=true";
+            else launch.warnings.push_back("this crosvm's motion device has no magnetometer; the motion sensors start without it");
+        }
+        spec += std::string(",name=") + motion_device_name + "]";
+        args.push_back("--input");
+        args.push_back(spec);
+    }
+    // On an MMIO VM, crosvm's switches that move the input devices, the network
+    // cards and the GPU to virtio-mmio (the disks moved one by one in disks()).
+    // A switch already among the extra options -- how such a VM was configured
+    // before the setting existed -- is not repeated.
+    void virtio_transport(CrosvmLaunch& launch) {
+        if (!mmio()) return;
+        std::set<std::string> extra;
+        const auto& options = member(item, "extra_options");
+        if (options.isArray()) for (const auto& option : options) if (option.isString()) extra.insert(option.asString());
+        for (const char* flag : {"--virtio-mmio-input", "--virtio-mmio-net", "--virtio-mmio-gpu"})
+            if (!extra.contains(flag)) args.push_back(flag);
+        // The sound card's switch only when there is a card: it moves every
+        // --virtio-snd the peripheral list emits.
+        bool sound = false;
+        const auto& list = member(item, "peripherals");
+        if (list.isArray()) for (const auto& peripheral : list)
+            sound = sound || java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "VIRTIO_SOUND";
+        if (sound && !extra.contains("--virtio-mmio-snd")) {
+            if (host.crosvm_virtio_mmio_snd) args.push_back("--virtio-mmio-snd");
+            else launch.warnings.push_back("this crosvm has no --virtio-mmio-snd; the sound card stays on PCI");
+        }
+    }
     // HostAudioTable.PATH; the dump path is a literal in the Java too.
     std::string sound_config(const std::vector<const Json::Value*>& endpoints, const Json::Value& peripheral) const {
         std::vector<const Json::Value*> outputs, inputs;
@@ -644,7 +709,8 @@ struct Builder {
                 ++camera_seen;
                 continue;
             }
-            // XHCI_USB and the unbacked types only log.
+            // VIRTIO_GYROSCOPE is motion_sensors(), after the other input
+            // devices; XHCI_USB and the unbacked types only log.
             if (type != "VIRTIO_SOUND") continue;
             if (host.app_uid <= 0) continue;
             std::vector<const Json::Value*> endpoints;
@@ -788,6 +854,8 @@ struct Builder {
             else launch.input_bridge = launch.input_bridge || (screen.enabled() && exporter != "NONE" && exporter != "WEBRTC");
         }
         if (launch.input_bridge) inputs(launch);
+        motion_sensors(launch);
+        virtio_transport(launch);
         peripherals();
         virtio_media();
         serials();

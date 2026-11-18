@@ -25,7 +25,8 @@
 //            "app_uid":n,"app_gids":[n,...],"cpu_cores":[{"index":n,"capacity":n,"max_frequency_khz":n},...],
 //            "pflash_vars_size":n,"android_release":s,"strace_prebuilt_exists":b,
 //            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
-//            "system_vulkan_hal":s,"viosnd_dump_exists":b}}
+//            "system_vulkan_hal":s,"viosnd_dump_exists":b,"crosvm_uvc_camera":b,
+//            "crosvm_motion_magnetometer":b,"crosvm_virtio_mmio_snd":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -62,6 +63,13 @@ struct HostFacts {
     // The installed crosvm lists --uvc-camera in `run --help`. Builds without
     // it reject the whole command line, so camera rows are skipped instead.
     bool crosvm_uvc_camera = false;
+    // The installed crosvm's motion device takes magnetometer=BOOL (its
+    // `run --help` lists it). Without it the device is emitted without the
+    // magnetometer rather than refused.
+    bool crosvm_motion_magnetometer = false;
+    // The installed crosvm lists --virtio-mmio-snd; an MMIO VM's sound cards
+    // stay on PCI without it.
+    bool crosvm_virtio_mmio_snd = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}
@@ -95,7 +103,8 @@ struct WebrtcEndpoint {
     std::string token;
     bool input_enabled = true;
 };
-// NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3.
+// NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3, SENSOR 4
+// (the VM-wide motion sensors a console overrides crosvm's host readings with).
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {
     std::vector<std::string> argv;
@@ -112,6 +121,9 @@ struct CrosvmLaunch {
     // Set when a screen is exported straight to the panel (--kms-display). The
     // launcher must own the Android display before spawning this command.
     bool kms = false;
+    // Devices left out or reduced because the installed crosvm cannot take
+    // them; the launcher logs each one.
+    std::vector<std::string> warnings;
 };
 // The gpu-0 screen is exported to the panel over DRM/KMS. Throws
 // std::invalid_argument for combinations crosvm would refuse.
