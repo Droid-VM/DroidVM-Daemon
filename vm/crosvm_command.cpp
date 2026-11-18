@@ -712,6 +712,18 @@ struct Builder {
         args.push_back("--input");
         args.push_back("vibrator[path=" + path + ",name=" + vibrator_device_name + "]");
     }
+    // Each natively exported screen's pen: crosvm's stylus device (tip and
+    // eraser, pressure, hover distance, tilt, barrel buttons), which the console
+    // fills from the phone's stylus. After the vibrator, for the reason
+    // motion_sensors() gives.
+    void pens(CrosvmLaunch& launch) {
+        for (const auto& id : launch.native_input_screens) {
+            const auto path = socket_path(id, "pen", true);
+            launch.input_sockets.push_back({id, input_channel_pen, path});
+            args.push_back("--input");
+            args.push_back("stylus[path=" + path + ",name=DroidVM Pen (" + id + ")]");
+        }
+    }
     // On an MMIO VM, crosvm's switches that move the input devices, the network
     // cards and the GPU to virtio-mmio (the disks moved one by one in disks()).
     // A switch already among the extra options -- how such a VM was configured
@@ -1125,6 +1137,7 @@ struct Builder {
         if (launch.input_bridge) inputs(launch);
         motion_sensors(launch);
         vibrator(launch);
+        if (launch.input_bridge) pens(launch);
         virtio_transport(launch);
         peripherals(launch);
         codec_devices(launch);

@@ -144,8 +144,9 @@ struct WebrtcEndpoint {
 };
 // NativeDisplay channels: MULTITOUCH 0, KEYBOARD 1, MOUSE 2, TABLET 3, SENSOR 4
 // (the VM-wide motion sensors a console overrides crosvm's host readings with),
-// PEN 5 and TRACKPAD 6 (reserved for the console's pen and trackpad), VIBRATOR 7
+// PEN 5 (per screen, the console's stylus), TRACKPAD 6 (VM-wide), VIBRATOR 7
 // (VM-wide; nothing is written to it, the guest's rumble is read back from it).
+inline constexpr int input_channel_pen = 5; // per screen, as the tablet
 inline constexpr int input_channel_vibrator = 7;
 struct InputSocket { std::string screen; int channel = 0; std::string path; };
 struct CrosvmLaunch {

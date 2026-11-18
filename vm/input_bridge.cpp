@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "input_bridge.h"
+#include "vm/crosvm_command.h"
 #include <cerrno>
 #include <chrono>
 #include <sys/socket.h>
@@ -9,7 +10,7 @@
 namespace droidvm::vm {
 namespace {
 constexpr int keyboard = 1;
-bool per_screen(int channel) { return channel == 0 || channel == 3 || channel == keyboard; }
+bool per_screen(int channel) { return channel == 0 || channel == 3 || channel == keyboard || channel == input_channel_pen; }
 }
 std::string InputBridge::key(const std::string& screen, int channel) {
     return (per_screen(channel) ? screen : std::string()) + "/" + std::to_string(channel);
@@ -77,7 +78,7 @@ void InputBridge::accept(Slot& slot) {
 }
 bool InputBridge::write(const std::string& screen, int channel, std::string_view data) {
     // Channels 0-3 are the console devices, 4 the VM-wide motion sensors.
-    if (channel < 0 || channel >= 5 || data.empty()) return false;
+    if (channel < 0 || (channel >= 5 && channel != input_channel_pen) || data.empty()) return false;
     Slot* slot;
     {
         std::lock_guard lock(mutex_);
