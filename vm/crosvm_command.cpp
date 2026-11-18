@@ -676,6 +676,18 @@ struct Builder {
             if (host.crosvm_virtio_mmio_snd) args.push_back("--virtio-mmio-snd");
             else launch.warnings.push_back("this crosvm has no --virtio-mmio-snd; the sound card stays on PCI");
         }
+        // The virtio-console switch only when there is a console device: it
+        // moves the configured virtio-console ports and the GNSS receiver's
+        // named port (serials()), which a guest without PCI (iPadOS) could not
+        // otherwise reach.
+        bool console = run.gnss_input_fd && host.crosvm_serial_name;
+        const auto& ports = member(item, "serial_ports");
+        if (ports.isArray()) for (const auto& port : ports)
+            console = console || java_enum(port, "hardware", "SERIAL", serial_hardware) == "VIRTIO_CONSOLE";
+        if (console && !extra.contains("--virtio-mmio-console")) {
+            if (host.crosvm_virtio_mmio_console) args.push_back("--virtio-mmio-console");
+            else launch.warnings.push_back("this crosvm has no --virtio-mmio-console; the virtio-console ports stay on PCI");
+        }
     }
     // HostAudioTable.PATH; the dump path is a literal in the Java too.
     // HostAudioDevices.ATTR_SEPARATOR: a host_device key is the endpoint, then
