@@ -169,8 +169,16 @@ CrosvmLaunch crosvm_command(const Json::Value& config, const CrosvmRun& run, con
 bool crosvm_retained_chain_supported(const Json::Value& capabilities);
 // PoolPreflight.appliesTo: the configured or preferred hypervisor is Gunyah.
 bool resolves_to_gunyah(const Json::Value& item, const HostFacts& host);
-// GuestPoolSizing.bootGuestPreallocMb, budgeted by the huge-page preflight.
+// What the huge-page preflight budgets beside --mem: GuestPoolSizing.
+// bootGuestPreallocMb plus boot_media_guest_mb (PoolPreflight.neededPages).
 int64_t boot_guest_prealloc_mb(const Json::Value& item);
+// VpuConfig.bootMediaGuestMb: the media-guest-mb a VM is passed at boot -- the
+// VM's own VPU switch on and a protection mode whose memory the host cannot
+// read (an absent protected_vm is a Gunyah VM's default,
+// PROTECTED_WITHOUT_FIRMWARE) -- else 0. The host pool is not counted: it is
+// consume_system_mem and comes out of --mem. Read from the config alone, so
+// the virtio-media system-property override never adds an unbudgeted pool.
+int64_t boot_media_guest_mb(const Json::Value& item);
 // VMScreenConfig.getTransportCap().getToken() for vm_vnc_info.
 std::string screen_transport_cap(const Json::Value& config, const std::string& id);
 }

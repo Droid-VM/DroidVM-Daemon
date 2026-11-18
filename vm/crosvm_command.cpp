@@ -290,24 +290,43 @@ int64_t boot_guest_pool_mb(const Json::Value& item) {
     return 0;
 }
 
-// VpuConfig: one App switch for both the decoder and the encoder, plus the
-// host pool they allocate from. Configs written before the keys existed keep
-// the App's own defaults (off, 256 MiB); the system properties, when set,
-// override both for this launch only.
-constexpr int64_t default_vpu_host_pool_mb = 256; // VpuConfig.DEFAULT_HOST_POOL_MB
-constexpr int64_t max_vpu_host_pool_mb = 65536; // checkInputField(etMediaHostPoolMb, false, 0, 65536)
+// VpuConfig: one App switch for the whole virtio-media transport -- the two
+// pools and every media device -- plus the pool sizes. Configs written before
+// the keys existed keep the App's own defaults (off, 320/192 MiB); the system
+// properties, when set, override the switch and the host pool for this launch.
+//
+// 320 MiB of media_host holds 26 4K NV12 buffers (12,441,600 B each): the 22
+// ffmpeg's v4l2 camera input asks for, plus four. 192 MiB of media_guest
+// holds 16: the 11 a 4K encode's driver-owned OUTPUT queue needs, plus five.
+// Both are whole 2 MiB huge pages.
+constexpr int64_t default_vpu_host_pool_mb = 320; // VpuConfig.DEFAULT_HOST_POOL_MB
+constexpr int64_t default_vpu_guest_pool_mb = 192; // VpuConfig.DEFAULT_GUEST_POOL_MB
+constexpr int64_t max_vpu_host_pool_mb = 65536; // checkInputField(etMediaHostPoolMb, false, 1, 65536)
 struct VpuPlan {
     bool enabled = false;
     int64_t host_pool_mb = default_vpu_host_pool_mb;
+    // VpuConfig.hostPoolIsDefaulted: the switch is on and the stored size is
+    // one crosvm cannot be given (zero or less, or over the editor's limit).
+    std::optional<int64_t> defaulted_from;
 };
 VpuPlan vpu_plan(const Json::Value& item, const HostFacts& host) {
     VpuPlan plan;
     plan.enabled = boolean(item, "vpu_enabled", false);
     const auto pool = integer(item, "vpu_host_pool_mb", default_vpu_host_pool_mb);
     plan.host_pool_mb = pool > 0 && pool <= max_vpu_host_pool_mb ? pool : default_vpu_host_pool_mb;
+    if (plan.host_pool_mb != pool) plan.defaulted_from = pool;
     if (host.virtio_media_override) plan.enabled = *host.virtio_media_override;
-    if (host.virtio_media_host_mb_override) plan.host_pool_mb = *host.virtio_media_host_mb_override;
+    if (host.virtio_media_host_mb_override) {
+        plan.host_pool_mb = *host.virtio_media_host_mb_override;
+        plan.defaulted_from.reset();
+    }
+    if (!plan.enabled) plan.defaulted_from.reset();
     return plan;
+}
+// VpuConfig.guestPoolApplies: a guest-owned pool exists only where the host
+// cannot otherwise read guest memory.
+bool media_guest_pool_applies(const std::string& protection) {
+    return protection == "PROTECTED_PROTECTED" || protection == "PROTECTED_WITHOUT_FIRMWARE";
 }
 
 struct Builder {
@@ -333,7 +352,7 @@ struct Builder {
     std::string run_path() const { return path_join(data_dir, "run"); }
 
     void strace(CrosvmLaunch& launch) { launch.strace_dir = strace_args(item, host, args); }
-    void hypervisor_args(const std::string& hypervisor, std::string& def_protected) {
+    void hypervisor_args(const std::string& hypervisor, std::string& def_protected, CrosvmLaunch& launch) {
         args.push_back("--hypervisor");
         if (hypervisor == "KVM") { args.push_back("kvm"); return; }
         if (hypervisor == "GENIEZONE") { args.push_back("geniezone"); return; }
@@ -364,10 +383,20 @@ struct Builder {
         };
         if (drm2kgsl) pool_args("drm-host-mb", integer(item, "gpu_drm2kgsl_pool_mb", 0));
         if (venus) pool_args("venus-host-mb", integer(item, "gpu_venus_pool_mb", 256));
-        // P1: gunyah refuses a virtio-media device without this pool key.
+        // The virtio-media pools, from the VPU switch and nothing else: gunyah
+        // refuses a virtio-media device without media_host, and no GPU device
+        // is needed for either (a VPU-only VM is a real configuration).
+        // media_host is consume_system_mem on the crosvm side, inside --mem;
+        // media_guest is the guest driver's own pool beside the RAM, only where
+        // the host cannot read guest memory, and boot_guest_prealloc_mb()
+        // budgets it for the huge-page reserve.
         if (const auto vpu = vpu_plan(item, host); vpu.enabled) {
+            if (vpu.defaulted_from)
+                launch.warnings.push_back("video acceleration is on with a stored host pool size of " + decimal(*vpu.defaulted_from) +
+                    ": using media-host-mb=" + decimal(vpu.host_pool_mb) + " instead, which crosvm requires before it will create a virtio-media device on gunyah");
             if (!pre_alloc.empty()) pre_alloc += ',';
             pre_alloc += "media-host-mb=" + decimal(vpu.host_pool_mb);
+            if (const auto guest = boot_media_guest_mb(item); guest > 0) pre_alloc += ",media-guest-mb=" + decimal(guest);
         }
         if (!pre_alloc.empty()) {
             args.push_back("--pre-alloc");
@@ -926,7 +955,7 @@ struct Builder {
         if (!hypervisor) throw std::runtime_error("No supported hypervisor found for CROSVM backend");
         gunyah = *hypervisor == "GUNYAH";
         std::string def_protected = "PROTECTED_NORMAL";
-        hypervisor_args(*hypervisor, def_protected);
+        hypervisor_args(*hypervisor, def_protected, launch);
         auto protection = java_enum(item, "protected_vm", def_protected.c_str(), protections);
         if (protection == "PSEUDO_UNPROTECTED" && *hypervisor != "GUNYAH") protection = "PROTECTED_NORMAL";
         if (protection == "PROTECTED_PROTECTED") args.push_back("--protected-vm");
@@ -1003,6 +1032,10 @@ struct Builder {
                 launch.udmabuf_limit_mb = integer(item, "gpu_udmabuf_limit_mb", 4096);
             }
         }
+        // virtio-media imports guest-owned buffers out of media_guest through
+        // udmabuf as well, whole, on a VM that may have no renderer at all.
+        if (!launch.udmabuf_limit_mb && vpu_plan(item, host).enabled)
+            launch.udmabuf_limit_mb = integer(item, "gpu_udmabuf_limit_mb", 4096);
         // applyDisplayBlitEnv
         if (has_gpu_blit_binding(item)) {
             const auto provider = java_enum(item, "display_blit_provider", "TURNIP", blit_providers);
@@ -1077,8 +1110,14 @@ std::string screen_transport_cap(const Json::Value& config, const std::string& i
     return transport_cap(*screen);
 }
 int64_t boot_guest_prealloc_mb(const Json::Value& item) {
+    int64_t mb = boot_media_guest_mb(item);
     const auto pool = boot_guest_pool_mb(item);
-    if (pool <= 0) return 0;
-    return std::max<int64_t>(std::min<int64_t>(integer(item, "gpu_guest_prealloc_mb", pool), pool), 0);
+    if (pool <= 0) return mb;
+    return mb + std::max<int64_t>(std::min<int64_t>(integer(item, "gpu_guest_prealloc_mb", pool), pool), 0);
+}
+int64_t boot_media_guest_mb(const Json::Value& item) {
+    if (!boolean(item, "vpu_enabled", false)) return 0;
+    if (!media_guest_pool_applies(java_enum(item, "protected_vm", "PROTECTED_WITHOUT_FIRMWARE", protections))) return 0;
+    return std::max<int64_t>(integer(item, "vpu_guest_pool_mb", default_vpu_guest_pool_mb), 0);
 }
 }
