@@ -23,7 +23,11 @@ Rule validate(Layer layer, size_t index, const Rule& rule, const TargetExists& e
     const auto at = where(layer, index);
     const bool wants_id = layer == Layer::exact || layer == Layer::device;
     const bool wants_port = layer == Layer::exact || layer == Layer::port;
+    const bool wants_class = layer == Layer::klass;
     const std::string key = layer_key(layer);
+    if (wants_class && !rule.cls) refuse(at + ": missing class");
+    if (!wants_class && rule.cls) refuse(at + ": a " + key + " rule takes no class");
+    if (rule.cls && !valid_rule_class(*rule.cls)) refuse(at + ": bad class " + *rule.cls + " (want two hex digits, such as 03)");
     if (wants_id && !rule.id) refuse(at + ": missing id");
     if (!wants_id && rule.id) refuse(at + ": a " + key + " rule takes no id");
     if (wants_port && !rule.port) refuse(at + ": missing port");
@@ -36,6 +40,7 @@ Rule validate(Layer layer, size_t index, const Rule& rule, const TargetExists& e
         if (rule.controller->empty()) refuse(at + ": controller must be a controller id or null");
     }
     Rule out = rule;
+    if (rule.cls) out.cls = lower(*rule.cls);
     if (rule.id) {
         if (!valid_rule_id(*rule.id)) refuse(at + ": bad id " + *rule.id + " (want vid:pid or vid:pid:serial)");
         // vid:pid is hex and lowercased; the serial is compared as reported.
@@ -58,7 +63,7 @@ std::optional<std::string> opt_text(const Json::Value& item, const char* key) {
 Rule rule_from_json(const std::string& layer, size_t index, const Json::Value& item) {
     const auto at = layer + "[" + std::to_string(index) + "]";
     for (const auto& key : item.getMemberNames())
-        if (key != "id" && key != "port" && key != "vm" && key != "controller" && key != "target")
+        if (key != "id" && key != "port" && key != "vm" && key != "controller" && key != "target" && key != "class")
             refuse(at + ": unknown field " + key);
     Rule rule;
     rule.vm = opt_text(item, "vm");
@@ -70,6 +75,7 @@ Rule rule_from_json(const std::string& layer, size_t index, const Json::Value& i
     rule.id = opt_text(item, "id");
     rule.port = opt_text(item, "port");
     rule.controller = opt_text(item, "controller");
+    rule.cls = opt_text(item, "class");
     return rule;
 }
 }
@@ -78,6 +84,7 @@ const char* layer_key(Layer layer) {
     case Layer::exact: return "exact";
     case Layer::port: return "port";
     case Layer::device: return "device";
+    case Layer::klass: return "class";
     case Layer::any: return "any";
     }
     return "any";
@@ -98,8 +105,9 @@ std::optional<Target> target_from_key(const std::string& key) {
     for (auto target : {Target::host, Target::vm, Target::sink}) if (key == target_key(target)) return target;
     return std::nullopt;
 }
-bool Rule::matches(const std::string& device_id, const std::string& device_port) const {
+bool Rule::matches(const std::string& device_id, const std::string& device_port, const std::set<std::string>& classes) const {
     if (id && *id != device_id) return false;
+    if (cls && !classes.count(*cls)) return false;
     return !port || *port == device_port;
 }
 bool valid_rule_id(const std::string& id) {
@@ -122,8 +130,9 @@ bool valid_rule_port(const std::string& port) {
     }
     return digit;
 }
+bool valid_rule_class(const std::string& cls) { return cls.size() == 2 && hex(cls[0]) && hex(cls[1]); }
 Rules Rules::empty() { return build(true, {}, nullptr); }
-Rules Rules::build(bool enabled, const std::array<std::vector<Rule>, 4>& input, const TargetExists& exists) {
+Rules Rules::build(bool enabled, const std::array<std::vector<Rule>, layer_count>& input, const TargetExists& exists) {
     Rules result;
     result.enabled_ = enabled;
     for (auto layer : layers) {
@@ -134,7 +143,7 @@ Rules Rules::build(bool enabled, const std::array<std::vector<Rule>, 4>& input, 
     return result;
 }
 Rules Rules::from_json(const Json::Value& object, const TargetExists& exists) {
-    std::array<std::vector<Rule>, 4> parsed;
+    std::array<std::vector<Rule>, layer_count> parsed;
     // Absent reads as on; anything but a boolean is refused.
     bool enabled = true;
     if (present(object, "enabled")) {
@@ -168,11 +177,16 @@ Json::Value Rules::to_json() const {
     object["version"] = version;
     object["enabled"] = enabled_;
     for (auto layer : layers) {
+        // An empty class layer is left out: a daemon from before the layer
+        // refuses a key it does not know and would drop every rule with it, so
+        // a user who never wrote a class rule can still go back.
+        if (layer == Layer::klass && this->layer(layer).empty()) continue;
         Json::Value array(Json::arrayValue);
         for (const auto& rule : this->layer(layer)) {
             Json::Value item(Json::objectValue);
             if (rule.id) item["id"] = *rule.id;
             if (rule.port) item["port"] = *rule.port;
+            if (rule.cls) item["class"] = *rule.cls;
             item["target"] = target_key(rule.target);
             if (rule.vm) item["vm"] = *rule.vm;
             if (rule.controller) item["controller"] = *rule.controller;

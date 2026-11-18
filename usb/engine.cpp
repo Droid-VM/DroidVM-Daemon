@@ -63,7 +63,7 @@ std::optional<Decision> RuleEngine::decide(const EngineDevice& device, const Sta
         const auto& list = rules_.layer(layer);
         for (size_t index = 0; index < list.size(); ++index) {
             const auto& rule = list[index];
-            if (!rule.matches(device.id, device.port)) continue;
+            if (!rule.matches(device.id, device.port, device.classes)) continue;
             if (rule.target != Target::vm)
                 return Decision{device, layer, static_cast<int>(index), rule.target, std::nullopt, std::nullopt};
             if (state_of(*rule.vm) != VmState::running) continue;

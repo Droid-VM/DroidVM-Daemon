@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -18,10 +19,12 @@ struct EngineDevice {
     std::string sysfs, id, port;
     int devnum = 0;
     DeviceState state = DeviceState::idle;
+    // Its own class and its interfaces', two lowercase hex digits each: what a class rule reads.
+    std::set<std::string> classes;
 };
 struct Decision {
     EngineDevice device;
-    std::optional<Layer> layer; // null for the fifth zone's rule
+    std::optional<Layer> layer; // null for the default zone's rule
     int index = -1;
     Target target = Target::host;
     std::optional<std::string> vm, controller;

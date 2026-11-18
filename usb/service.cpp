@@ -341,7 +341,8 @@ int UsbService::set_rules(const Json::Value& json, const std::optional<std::stri
     { std::lock_guard lock(lock_); rules_persistence_ = persistence; }
     log("I", std::string("USB rules set: enabled=") + (rules.enabled() ? "true" : "false") +
         " exact=" + std::to_string(rules.layer(Layer::exact).size()) + " port=" + std::to_string(rules.layer(Layer::port).size()) +
-        " device=" + std::to_string(rules.layer(Layer::device).size()) + " any=" + std::to_string(rules.layer(Layer::any).size()));
+        " device=" + std::to_string(rules.layer(Layer::device).size()) + " class=" + std::to_string(rules.layer(Layer::klass).size()) +
+        " any=" + std::to_string(rules.layer(Layer::any).size()));
     int applied = 0;
     try {
         set_autoprobe(!rules.enabled());

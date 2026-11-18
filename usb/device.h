@@ -18,7 +18,7 @@ struct HostDevice {
     std::vector<Interface> interfaces; // sorted by name
     bool is_hub() const;
     DeviceState state() const;
-    EngineDevice engine() const { return {sysfs, id, port, devnum, state()}; }
+    EngineDevice engine() const;
     Json::Value to_json() const; // the wire fields of UsbHostDevice.toMap
 };
 // UsbHostDevice.fromSysfs; throws std::runtime_error for a device whose

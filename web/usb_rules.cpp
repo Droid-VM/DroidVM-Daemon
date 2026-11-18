@@ -62,7 +62,7 @@ Json::Value preview_catalog(const Json::Value& snapshot, const std::string& revi
             const auto& layer = decision["layer"];
             const auto number = decision["index"].asInt();
             if (layer.isNull() ? number != -1 :
-                ((layer != "exact" && layer != "port" && layer != "device" && layer != "any") || number < 0 || number > 8388608))
+                ((layer != "exact" && layer != "port" && layer != "device" && layer != "class" && layer != "any") || number < 0 || number > 8388608))
                 throw ServiceError(ErrorCode::unavailable, "Invalid USB preview rule");
             const auto& target = decision["target"];
             if (target != "host" && target != "vm" && target != "sink")

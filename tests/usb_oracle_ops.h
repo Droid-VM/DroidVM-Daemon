@@ -71,7 +71,7 @@ inline void engine(const Json::Value& test, Json::Value& row) {
     for (const auto& spec : test["devices"]) {
         const auto state = device_state(spec["state"].asString());
         if (!state) throw std::invalid_argument("device state");
-        EngineDevice device{spec["sysfs"].asString(), spec["id"].asString(), spec["port"].asString(), spec["devnum"].asInt(), *state};
+        EngineDevice device{spec["sysfs"].asString(), spec["id"].asString(), spec["port"].asString(), spec["devnum"].asInt(), *state, {}};
         devices.push_back(device);
         const auto decision = engine.decide(device, state_of, has);
         decisions.append(decision ? UsbService::decision_json(*decision) : Json::Value());

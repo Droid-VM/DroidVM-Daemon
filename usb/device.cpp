@@ -176,6 +176,12 @@ DeviceState HostDevice::state() const {
     if (claimed) return DeviceState::vmuse;
     return bound ? DeviceState::hostuse : DeviceState::idle;
 }
+EngineDevice HostDevice::engine() const {
+    EngineDevice device{sysfs, id, port, devnum, state(), {}};
+    if (!device_class.empty()) device.classes.insert(lower(device_class));
+    for (const auto& iface : interfaces) if (!iface.cls.empty()) device.classes.insert(lower(iface.cls));
+    return device;
+}
 Json::Value HostDevice::to_json() const {
     Json::Value obj(Json::objectValue);
     obj["sysfs"] = sysfs; obj["id"] = id; obj["port"] = port;
