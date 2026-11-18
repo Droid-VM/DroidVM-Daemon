@@ -136,7 +136,7 @@ std::optional<std::vector<int>> app_groups(uid_t uid, const std::string& cache) 
 std::vector<CpuCore> cpu_cores(const std::string& root) {
     std::vector<CpuCore> result;
     const auto fallback = static_cast<int>(std::clamp<long>(sysconf(_SC_NPROCESSORS_ONLN), 1, 4096));
-    for (const auto& core : read_cpu_topology(root, fallback)) result.push_back({core.index, core.capacity});
+    for (const auto& core : read_cpu_topology(root, fallback)) result.push_back({core.index, core.capacity, core.max_frequency_khz});
     return result;
 }
 std::optional<std::string> host_touchscreen(const std::string& directory) {

@@ -114,6 +114,26 @@ std::map<int32_t, int64_t> parse_capacity(const std::string& spec) {
     }
     return out;
 }
+// CpuPlacementPlan.perfRequestsFit: crosvm's virtual cpufreq needs every vCPU
+// below cpu_count bound, and each one's host cores in a single frequency
+// domain (it reads each core's frequency table and panics when a vCPU's cores
+// differ, or when a vCPU has none). A core of unknown frequency has no table.
+bool perf_requests_fit(const std::map<int32_t, CpuList>& affinity, int64_t vcpus, const HostFacts& host) {
+    std::map<int, int64_t> frequency;
+    for (const auto& core : host.cpu_cores) if (core.max_frequency_khz > 0) frequency[core.index] = core.max_frequency_khz;
+    for (int64_t vcpu = 0; vcpu < vcpus; ++vcpu) {
+        if (vcpu > INT32_MAX) return false;
+        const auto bound = affinity.find(static_cast<int32_t>(vcpu));
+        if (bound == affinity.end() || bound->second.empty()) return false;
+        int64_t domain = 0;
+        for (const auto cpu : bound->second) {
+            const auto at = frequency.find(cpu);
+            if (at == frequency.end() || (domain != 0 && domain != at->second)) return false;
+            domain = at->second;
+        }
+    }
+    return true;
+}
 void cpu_placement(const Json::Value& item, const HostFacts& host, std::vector<std::string>& args) {
     const auto affinity = parse_affinity(string(item, "cpu_affinity", ""));
     if (affinity.empty()) return;
@@ -172,6 +192,12 @@ void cpu_placement(const Json::Value& item, const HostFacts& host, std::vector<s
             args.push_back(compact_ranges(cluster));
         }
     }
+    // Per-vCPU performance requests: each vCPU gets a window of crosvm's virtual
+    // cpufreq device, and a guest request becomes that vCPU thread's
+    // utilization clamp. Default on, but only where crosvm would not panic.
+    if (boolean(item, "cpu_perf_requests", true) &&
+        perf_requests_fit(affinity, std::max<int64_t>(integer(item, "cpu_count", 1), 1), host))
+        args.push_back("--virt-cpufreq-upstream");
 }
 
 // --- VMScreenConfig ---

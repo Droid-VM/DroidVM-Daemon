@@ -22,7 +22,7 @@
 //           "vnc":{"<screen id>":{"host":s,"port":n,"password":s}}},
 //    "boot":{"uefi":b,"firmware":s,"vars":s,"vars_enabled":b,"kernel":s,"initrd":s,"cmdline":s},
 //    "host":{"data_dir":s,"has_kvm":b,"has_gunyah":b,"has_gzvm":b,"soc_name":s,
-//            "app_uid":n,"app_gids":[n,...],"cpu_cores":[{"index":n,"capacity":n},...],
+//            "app_uid":n,"app_gids":[n,...],"cpu_cores":[{"index":n,"capacity":n,"max_frequency_khz":n},...],
 //            "pflash_vars_size":n,"android_release":s,"strace_prebuilt_exists":b,
 //            "strace_in_path":s,"optimize_sdcard":b,"turnip_exists":b,
 //            "system_vulkan_hal":s,"viosnd_dump_exists":b}}
@@ -32,6 +32,9 @@ namespace droidvm::vm {
 struct CpuCore {
     int index = 0; // CpuUtils.CpuCore.index
     int64_t capacity = 0; // CpuUtils.CpuCore.capacity
+    // cpuinfo_max_freq; 0 = unknown (no cpufreq). Cores of one value share a
+    // frequency domain (CpuUtils.CpuCore.tier).
+    int64_t max_frequency_khz = 0;
 };
 struct HostFacts {
     std::string data_dir; // Constants.DATA_DIR; empty = compile-time /data/data/<package>
