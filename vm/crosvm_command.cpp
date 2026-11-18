@@ -790,13 +790,15 @@ struct Builder {
         if (!list.isArray()) return;
         static const Json::Value empty_object(Json::objectValue);
         int camera_seen = 0;
+        bool uvc_skipped = false;
         for (const auto& peripheral : list) {
             const auto type = java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types);
-            // One emulated USB (UVC) camera per row. A row left on "follow the
-            // system" hands over its position instead of an id, which is what
-            // makes two default rows land on two different cameras rather than
-            // both on the back one.
-            if (type == "VIRTIO_CAMERA") {
+            // USB_CAMERA: one emulated USB (UVC) camera per row on crosvm's
+            // xHCI. A row left on "follow the system" hands over its position
+            // among the USB camera rows instead of an id, which is what makes
+            // two default rows land on two different cameras rather than both
+            // on the back one.
+            if (type == "USB_CAMERA") {
                 std::string key;
                 if (present(peripheral, "host_device")) {
                     const auto& value = peripheral["host_device"];
@@ -805,7 +807,7 @@ struct Builder {
                 }
                 // An older crosvm refuses the unknown flag and the VM would not
                 // start at all; leave the camera out rather than the VM.
-                if (!host.crosvm_uvc_camera) continue;
+                if (!host.crosvm_uvc_camera) { uvc_skipped = true; continue; }
                 args.push_back("--uvc-camera");
                 args.push_back(key.empty() ? decimal(camera_seen) : key);
                 ++camera_seen;
@@ -827,6 +829,15 @@ struct Builder {
             args.push_back(sound_config(endpoints, peripheral, stripped));
             if (stripped) launch.warnings.push_back("this crosvm's AAudio backend has no latency mode; the sound card's endpoints start in its default");
         }
+        if (uvc_skipped) launch.warnings.push_back("peripheral usb_camera skipped: this crosvm has no --uvc-camera");
+    }
+    // Whether a USB_CAMERA row will be on the command line: it hangs off
+    // crosvm's xHCI, so the VM keeps its USB controller for it.
+    bool uvc_camera() const {
+        if (!host.crosvm_uvc_camera || !member(item, "peripherals").isArray()) return false;
+        for (const auto& peripheral : item["peripherals"])
+            if (java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "USB_CAMERA") return true;
+        return false;
     }
     // VpuConfig.codecDevicesAttached and appendCodecDevices: what the switch
     // itself buys, a hardware decoder and encoder (VpuConfig.CODEC_KINDS, in
@@ -1011,7 +1022,7 @@ struct Builder {
         bool xhci = false;
         if (member(item, "peripherals").isArray())
             for (const auto& peripheral : item["peripherals"]) xhci = xhci || java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "XHCI_USB";
-        if (!xhci) args.push_back("--no-usb");
+        if (!xhci && !uvc_camera()) args.push_back("--no-usb");
         if (!boolean(item, "sandbox", false)) args.push_back("--disable-sandbox");
         if (boolean(item, "hugepages", true)) args.push_back("--hugepages");
         const auto& lend = member(item, "prepare_lend_mthp");

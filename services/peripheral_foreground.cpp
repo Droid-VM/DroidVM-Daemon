@@ -25,11 +25,11 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
     if (!rows.isArray()) return request;
     for (const auto& row : rows) {
         const auto type = java_enum(row, "type", "VIRTIO_SOUND", peripheral_types);
-        // A camera row is a camera only when crosvm takes --uvc-camera (the
-        // same test the command builder makes); one listed on a crosvm without
-        // it never opens, and raising the camera type for it would show a
-        // privacy indicator for a camera nothing uses.
-        if (type == "VIRTIO_CAMERA" && facts.crosvm_uvc_camera) request.types |= foreground_type_camera;
+        // A USB camera row is a camera only when crosvm takes --uvc-camera
+        // (the same test the command builder makes); one listed on a crosvm
+        // without it never opens, and raising the camera type for it would
+        // show a privacy indicator for a camera nothing uses.
+        if (type == "USB_CAMERA" && facts.crosvm_uvc_camera) request.types |= foreground_type_camera;
     }
     // The GNSS receiver (the first row; the VM has one) reads the phone's
     // location through the app's uid, which needs the location type, and the
