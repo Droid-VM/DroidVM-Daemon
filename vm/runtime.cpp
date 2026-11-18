@@ -916,6 +916,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         // inside the option string, the older decoder switch is in the synopsis.
         host.crosvm_media_backend = crosvm_binary_mentions(data + "/usr/bin/crosvm", "msm-vidc");
         host.crosvm_media_vidc = supported("vidc=");
+        host.crosvm_media_camera = supported("camera_id");
         // The AAudio performance modes are parsed inside host_device; only the
         // binary itself can say whether this crosvm knows them.
         host.crosvm_sound_performance = crosvm_binary_mentions(data + "/usr/bin/crosvm", "power_saving") &&

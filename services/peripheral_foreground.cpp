@@ -3,6 +3,7 @@
 #include "vm/command_common.h"
 #include "store/vm_config.h"
 #include "vm/gnss_port.h"
+#include "vm/crosvm_command.h"
 #include <algorithm>
 
 namespace droidvm {
@@ -23,6 +24,11 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
     if (config::java_enum(config, "backend", "CROSVM", {"CROSVM", "QEMU"}) != "CROSVM") return request;
     const auto& rows = member(config, "peripherals");
     if (!rows.isArray()) return request;
+    vm::HostFacts camera_host;
+    camera_host.crosvm_media_camera = facts.crosvm_media_camera;
+    camera_host.has_kvm = facts.has_kvm;
+    camera_host.has_gunyah = facts.has_gunyah;
+    camera_host.app_uid = facts.app_uid;
     for (const auto& row : rows) {
         const auto type = java_enum(row, "type", "VIRTIO_SOUND", peripheral_types);
         // A USB camera row is a camera only when crosvm takes --uvc-camera
@@ -30,6 +36,9 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
         // without it never opens, and raising the camera type for it would
         // show a privacy indicator for a camera nothing uses.
         if (type == "USB_CAMERA" && facts.crosvm_uvc_camera) request.types |= foreground_type_camera;
+        // A virtio-media camera row only on a VM that really attaches it: the
+        // VPU switch on, Gunyah, the uid known -- the command builder's rule.
+        if (type == "VIRTIO_CAMERA" && vm::virtio_camera_attached(config, camera_host)) request.types |= foreground_type_camera;
     }
     // The GNSS receiver (the first row; the VM has one) reads the phone's
     // location through the app's uid, which needs the location type, and the

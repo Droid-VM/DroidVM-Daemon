@@ -30,7 +30,7 @@
 //            "crosvm_serial_name":b,"crosvm_input_vibrator":b,"crosvm_mbi_spis":b,
 //            "firmware_code_offset":n,"crosvm_sound_performance":b,
 //            "crosvm_virtio_mmio_console":b,"crosvm_media_backend":b,
-//            "crosvm_media_vidc":b}}
+//            "crosvm_media_vidc":b,"crosvm_media_camera":b}}
 // Output: {"name":...,"status":"ok","argv":[...],"env":[["KEY","VALUE"],...]}
 // or {"name":...,"status":"error","message":...}.
 namespace droidvm::vm {
@@ -103,6 +103,9 @@ struct HostFacts {
     // "vidc="): the older spelling of the msm_vidc decoder backend, which has
     // no AUTO and no encoder choice.
     bool crosvm_media_vidc = false;
+    // The installed crosvm's --virtio-media takes kind=camera (`run --help`
+    // lists "camera_id"). Without it a VIRTIO_CAMERA row is skipped.
+    bool crosvm_media_camera = false;
 };
 struct SerialRun {
     std::optional<std::pair<int, int>> pipe; // ResolvedSerial.pipe: {getOutputRemoteFd(), getInputRemoteFd()}
@@ -188,6 +191,11 @@ int64_t boot_guest_prealloc_mb(const Json::Value& item);
 // consume_system_mem and comes out of --mem. Read from the config alone, so
 // the virtio-media system-property override never adds an unbudgeted pool.
 int64_t boot_media_guest_mb(const Json::Value& item);
+// PeripheralType.VIRTIO_CAMERA.isAttachedTo plus what the launch needs: a
+// crosvm with the virtio-media camera, the VPU switch on, a Gunyah VM (the only
+// one passed media_host) and a resolved app uid. The command builder and the
+// peripheral foreground rule ask the same question.
+bool virtio_camera_attached(const Json::Value& item, const HostFacts& host);
 // VMScreenConfig.getTransportCap().getToken() for vm_vnc_info.
 std::string screen_transport_cap(const Json::Value& config, const std::string& id);
 }

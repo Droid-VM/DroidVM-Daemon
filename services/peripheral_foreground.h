@@ -36,6 +36,11 @@ struct ForegroundFacts {
     bool crosvm_uvc_camera = false; // HostFacts::crosvm_uvc_camera
     bool crosvm_serial_name = false; // HostFacts::crosvm_serial_name: the GNSS port exists
     bool host_gps_receiver = false; // vm::host_has_gps_receiver(), what AUTO resolves on
+    // What a VIRTIO_CAMERA row needs (vm::virtio_camera_attached): the
+    // virtio-media camera in crosvm, a Gunyah VM, the app uid crosvm runs it as.
+    bool crosvm_media_camera = false; // HostFacts::crosvm_media_camera
+    bool has_kvm = false, has_gunyah = false; // how an AUTO hypervisor resolves
+    int app_uid = -1;
 };
 // One request to the service: the intent extras it reads.
 struct ForegroundRequest {

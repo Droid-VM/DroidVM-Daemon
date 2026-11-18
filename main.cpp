@@ -659,7 +659,7 @@ int main(int argc, char** argv) {
                         }
                         return result;
                     };
-                    raise.facts = [data, cancelled = context.shutting_down] {
+                    raise.facts = [data, cancelled = context.shutting_down, app_uid = static_cast<int>(layout->owner())] {
                         droidvm::ForegroundFacts facts;
                         facts.crosvm_uvc_camera = droidvm::vm::crosvm_run_option_supported((data / "usr/bin/crosvm").string(),
                             (data / "usr/lib").string(), "--uvc-camera", cancelled);
@@ -668,6 +668,12 @@ int main(int argc, char** argv) {
                         // Only a VM with a GNSS row on AUTO needs the answer; asked
                         // once and cached, so cheap after the first such VM.
                         if (facts.crosvm_serial_name) facts.host_gps_receiver = droidvm::vm::host_has_gps_receiver();
+                        // A VIRTIO_CAMERA row counts where the launcher would attach it.
+                        facts.crosvm_media_camera = droidvm::vm::crosvm_run_option_supported((data / "usr/bin/crosvm").string(),
+                            (data / "usr/lib").string(), "camera_id", cancelled);
+                        facts.has_kvm = access("/dev/kvm", F_OK) == 0;
+                        facts.has_gunyah = access("/dev/gunyah", F_OK) == 0;
+                        facts.app_uid = app_uid;
                         return facts;
                     };
                     raise.run = [](const std::vector<std::string>& argv, std::string& output) {

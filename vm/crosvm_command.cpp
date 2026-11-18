@@ -813,6 +813,22 @@ struct Builder {
                 ++camera_seen;
                 continue;
             }
+            // VIRTIO_CAMERA: a host camera as a virtio-media capture device,
+            // one /dev/videoN, served out of the media_host pool the VPU switch
+            // buys -- so a device of the video unit, attached only while the
+            // switch is on (PeripheralType.isAttachedTo). The VM starts
+            // without the row and the launcher says which condition said no.
+            if (type == "VIRTIO_CAMERA") {
+                const char* skipped = nullptr;
+                if (!host.crosvm_media_camera) skipped = "peripheral virtio_camera skipped: this crosvm has no virtio-media camera device";
+                else if (!vpu_plan(item, host).enabled) skipped = "peripheral virtio_camera skipped: the camera needs this VM's video acceleration (VPU) switch, and it is off";
+                else if (!gunyah) skipped = "peripheral virtio_camera skipped: it serves buffers from the media_host pool, which only a Gunyah VM is passed";
+                else if (host.app_uid <= 0) skipped = "cannot resolve app uid; camera device skipped";
+                if (skipped) { launch.warnings.push_back(skipped); continue; }
+                args.push_back("--virtio-media");
+                args.push_back(camera_config(peripheral));
+                continue;
+            }
             // VIRTIO_GYROSCOPE is motion_sensors(), after the other input
             // devices; XHCI_USB and the unbacked types only log.
             if (type != "VIRTIO_SOUND") continue;
@@ -830,6 +846,26 @@ struct Builder {
             if (stripped) launch.warnings.push_back("this crosvm's AAudio backend has no latency mode; the sound card's endpoints start in its default");
         }
         if (uvc_skipped) launch.warnings.push_back("peripheral usb_camera skipped: this crosvm has no --uvc-camera");
+    }
+    // CrosvmBackendInstance.buildCameraConfig. "Let the host pick" (an empty
+    // host_device) leaves camera_id out: camera_id="" would parse as a camera
+    // whose id is the empty string. The card is what the guest reads back as
+    // the V4L2 card name: the host's own label for the camera, or a fixed one
+    // for a row saved before the picker ran. Both are quoted, so a comma in a
+    // label stays inside the value.
+    std::string camera_config(const Json::Value& peripheral) const {
+        const auto text = [&](const char* key) {
+            if (!present(peripheral, key)) return std::string();
+            const auto& value = peripheral[key];
+            if (!value.isString()) throw std::runtime_error("Expected type STRING");
+            return value.asString();
+        };
+        std::string cfg = "kind=camera";
+        if (const auto id = text("host_device"); !id.empty()) cfg += ",camera_id=\"" + quotable(id) + "\"";
+        auto label = text("host_label");
+        if (label.empty()) label = "DroidVM camera";
+        cfg += ",card=\"" + quotable(label) + "\",uid=" + decimal(host.app_uid);
+        return cfg;
     }
     // Whether a USB_CAMERA row will be on the command line: it hangs off
     // crosvm's xHCI, so the VM keeps its USB controller for it.
@@ -1168,6 +1204,9 @@ int64_t boot_guest_prealloc_mb(const Json::Value& item) {
     const auto pool = boot_guest_pool_mb(item);
     if (pool <= 0) return mb;
     return mb + std::max<int64_t>(std::min<int64_t>(integer(item, "gpu_guest_prealloc_mb", pool), pool), 0);
+}
+bool virtio_camera_attached(const Json::Value& item, const HostFacts& host) {
+    return host.crosvm_media_camera && vpu_plan(item, host).enabled && resolves_to_gunyah(item, host) && host.app_uid > 0;
 }
 int64_t boot_media_guest_mb(const Json::Value& item) {
     if (!boolean(item, "vpu_enabled", false)) return 0;
