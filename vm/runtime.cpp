@@ -276,6 +276,7 @@ VmRuntime::VmRuntime(std::string id, Json::Value config, const RuntimeContext& c
         context_.state_changed = {};
         context_.input_status = {};
         context_.vibrator_status = {};
+        context_.trackpad_status = {};
         context_.vibrator_release = {};
         context_.warn = [](const std::string&) {};
         context_.info = [](const std::string&) {};
@@ -907,6 +908,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         host.crosvm_uvc_camera = supported("--uvc-camera");
         host.crosvm_trackpad_contacts = supported("contacts");
         host.crosvm_trackpad_touch_size = supported("touch-size");
+        host.crosvm_trackpad_haptics = supported("haptics");
         if (host.crosvm_trackpad_contacts) {
             host.trackpad_side_units = trackpad_side_units();
             host.touch_contact_size = host_touch_reports_contact_size();
@@ -962,11 +964,13 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
     if (command.input_bridge) {
         // crosvm is the client of these sockets; they must exist before it starts.
         // What the guest says back: the keyboard's lamps go to the grab
-        // manager, the vibrator's rumble to the phone's motor.
+        // manager, the vibrator's rumble and the trackpad's haptics to the
+        // phone's motor.
         InputBridge::Status status;
-        if (context_.input_status || context_.vibrator_status)
+        if (context_.input_status || context_.vibrator_status || context_.trackpad_status)
             status = [this](const std::string& screen, int channel, std::string records) {
                 if (channel == input_channel_vibrator) { if (context_.vibrator_status) context_.vibrator_status(id_, std::move(records)); }
+                else if (channel == input_channel_trackpad) { if (context_.trackpad_status) context_.trackpad_status(id_, std::move(records)); }
                 else if (context_.input_status) context_.input_status(id_, screen, std::move(records));
             };
         try { input_.listen(command.input_sockets, std::move(status)); }

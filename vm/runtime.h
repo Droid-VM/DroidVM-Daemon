@@ -87,6 +87,8 @@ struct RuntimeContext {
     // HostVibrator: the force-feedback records a VM's vibrator sends back, and
     // the VM stopping (its rumble stops with it).
     std::function<void(const std::string& id, std::string records)> vibrator_status;
+    // What a VM's guest sent its trackpad: haptic feedback for the phone's motor.
+    std::function<void(const std::string& id, std::string records)> trackpad_status;
     std::function<void(const std::string& id)> vibrator_release;
 };
 // One VMInstance: its config, console streams and at most one VMM process.

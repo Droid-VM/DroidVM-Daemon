@@ -741,6 +741,10 @@ struct Builder {
         auto spec = "trackpad[path=" + path + ",width=" + side + ",height=" + side + ",res=" + decimal(trackpad_units_per_mm) +
             ",contacts=" + decimal(trackpad_contacts);
         if (host.crosvm_trackpad_touch_size) spec += std::string(",touch-size=") + (host.touch_contact_size ? "true" : "false");
+        // The waveforms a guest's driver can send back, which the phone's motor
+        // plays; no guest's own driver reads them, so a guest without one sees
+        // the trackpad it always did.
+        if (host.crosvm_trackpad_haptics) spec += ",haptics=true";
         args.push_back("--input");
         args.push_back(spec + ",name=DroidVM Trackpad]");
     }

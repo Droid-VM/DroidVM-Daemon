@@ -631,6 +631,7 @@ int main(int argc, char** argv) {
                     };
                     vibrator = std::make_unique<droidvm::input::HostVibrator>(std::move(motor));
                     context.vibrator_status = [&](const std::string& id, std::string records) { vibrator->on_guest_status(id, records); };
+                    context.trackpad_status = [&](const std::string& id, std::string records) { vibrator->on_trackpad_status(id, records); };
                     context.vibrator_release = [&](const std::string& id) { vibrator->release(id); };
                 }
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {

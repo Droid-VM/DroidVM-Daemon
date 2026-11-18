@@ -57,9 +57,11 @@ void InputBridge::accept(Slot& slot) {
         if (closed_) break;
         if (slot.peer) shutdown(slot.peer->get(), SHUT_RDWR);
         slot.peer = peer;
-        // Only the keyboard (guest LED status) and the vibrator (the rumble the
-        // guest wants) say anything back.
-        if (slot.socket.channel != keyboard && slot.socket.channel != input_channel_vibrator) continue;
+        // Only the keyboard (guest LED status), the vibrator (the rumble the
+        // guest wants) and the trackpad (haptic feedback a guest's driver
+        // sends it) say anything back.
+        if (slot.socket.channel != keyboard && slot.socket.channel != input_channel_vibrator &&
+            slot.socket.channel != input_channel_trackpad) continue;
         // Delivered in whole 8-byte records.
         slot.readers.emplace_back([this, peer, screen = slot.socket.screen, channel = slot.socket.channel] {
             std::string held;

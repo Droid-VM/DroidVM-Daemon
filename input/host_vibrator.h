@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <chrono>
 #include <condition_variable>
+#include <optional>
 #include <functional>
 #include <map>
 #include <memory>
@@ -22,6 +24,15 @@
 // the strongest. Each change is a one-shot of at most hold_ms, so a guest that
 // stops talking mid-rumble (crashed, or its VM killed) cannot leave the motor
 // running; a VM's rumble also stops when the VM does.
+//
+// A VM's trackpad (crosvm trackpad[haptics=true]) plays haptic feedback here
+// too, for guest drivers written for it: EV_FF records on the TRACKPAD channel,
+// the code a waveform of the HID Haptics page by the low byte of its usage, the
+// value its intensity in percent (bits 0-7, 0 for full), how many times more to
+// play it (bits 8-15) and the milliseconds from one start to the next (bits
+// 16-31). A click, a press and a release are short one-shots; the continuous
+// ones join the rumbles, stopped by a stop, the strongest winning. A click while
+// something rumbles is dropped: replacing the rumble would cut it short.
 namespace droidvm::input {
 // The phone's motor.
 class VibratorMotor {
@@ -62,6 +73,8 @@ public:
     HostVibrator& operator=(const HostVibrator&) = delete;
     // Whole evdev records [vm]'s guest sent its vibrator. Never blocks on the motor.
     void on_guest_status(const std::string& vm, std::string_view records);
+    // Whole evdev records [vm]'s guest sent its trackpad. Never blocks on the motor.
+    void on_trackpad_status(const std::string& vm, std::string_view records);
     // [vm] stopped: whatever it was playing stops with it.
     void release(const std::string& vm);
     // Brings the motor to the strongest wanted magnitude (the worker's step).
@@ -72,11 +85,18 @@ public:
     static int amplitude_of(int magnitude);
 private:
     int wanted() const; // mutex_ held
+    // A train of clicks from a trackpad: [remaining] more after the one due at [next].
+    struct Clicks {
+        int amplitude = 255, remaining = 0, period_ms = 100;
+        std::chrono::steady_clock::time_point next;
+    };
+    void click_due(); // the worker's: plays a click that is due
     void run();
     Hooks hooks_;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
-    std::map<std::string, int> magnitudes_; // rumbling VMs only
+    std::map<std::string, int> magnitudes_; // rumbling VMs (and VM trackpads) only
+    std::optional<Clicks> clicks_;
     int playing_ = 0;
     bool resolved_ = false, closing_ = false, dirty_ = false;
     std::unique_ptr<VibratorMotor> motor_;

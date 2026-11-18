@@ -18,6 +18,13 @@ namespace droidvm::input {
 namespace {
 constexpr uint16_t ev_ff = 0x15, ff_rumble = 0x50;
 constexpr size_t record_bytes = 8;
+// The trackpad's haptic waveforms: the HID Haptics page's (0x0e) usages
+// 0x1002..0x1007 by their low byte, as crosvm declares them.
+constexpr uint16_t haptic_stop = 0x02, haptic_click = 0x03, haptic_buzz = 0x04, haptic_rumble = 0x05,
+    haptic_press = 0x06, haptic_release = 0x07;
+constexpr const char* trackpad_key = "/trackpad"; // a VM's trackpad beside its vibrator
+constexpr int click_ms = 12; // about what one of the platform's click primitives lasts
+constexpr int max_repeats = 20, default_period_ms = 100, max_period_ms = 1000;
 
 // android.hardware.vibrator.IVibrator (stable AIDL): the transaction codes are
 // FIRST_CALL_TRANSACTION plus the method's position in the frozen interface.
@@ -160,13 +167,66 @@ HostVibrator::~HostVibrator() {
 void HostVibrator::run() {
     std::unique_lock lock(mutex_);
     while (!closing_) {
-        wake_.wait(lock, [this] { return closing_ || dirty_; });
+        if (clicks_) wake_.wait_until(lock, clicks_->next, [this] { return closing_ || dirty_; });
+        else wake_.wait(lock, [this] { return closing_ || dirty_; });
         if (closing_) break;
         dirty_ = false;
         lock.unlock();
-        try { step(); } catch (...) {}
+        try { step(); click_due(); } catch (...) {}
         lock.lock();
     }
+}
+void HostVibrator::on_trackpad_status(const std::string& vm, std::string_view records) {
+    {
+        std::lock_guard lock(mutex_);
+        const auto key = vm + trackpad_key;
+        for (size_t at = 0; at + record_bytes <= records.size(); at += record_bytes) {
+            uint8_t bytes[record_bytes];
+            std::memcpy(bytes, records.data() + at, record_bytes);
+            const uint16_t type = static_cast<uint16_t>(bytes[0] | bytes[1] << 8);
+            const uint16_t code = static_cast<uint16_t>(bytes[2] | bytes[3] << 8);
+            const uint32_t value = static_cast<uint32_t>(bytes[4]) | static_cast<uint32_t>(bytes[5]) << 8 |
+                static_cast<uint32_t>(bytes[6]) << 16 | static_cast<uint32_t>(bytes[7]) << 24;
+            if (type != ev_ff) continue;
+            const int intensity = static_cast<int>(value & 0xff);
+            const double scale = intensity == 0 ? 1.0 : std::min(100, intensity) / 100.0;
+            switch (code) {
+            case haptic_stop: magnitudes_.erase(key); break;
+            case haptic_buzz:
+            case haptic_rumble: magnitudes_[key] = std::max(1, static_cast<int>(std::lround(scale * 0xffff))); break;
+            case haptic_click:
+            case haptic_press:
+            case haptic_release: {
+                if (clicks_) break; // one train at a time
+                const int period = static_cast<int>(value >> 16);
+                Clicks train;
+                // A release is the lighter tick a haptic touchpad gives as the finger lets go.
+                train.amplitude = std::max(1, static_cast<int>(std::lround(scale * (code == haptic_release ? 160 : 255))));
+                train.remaining = std::min(max_repeats, static_cast<int>((value >> 8) & 0xff));
+                train.period_ms = period == 0 ? default_period_ms : std::min(max_period_ms, period);
+                train.next = std::chrono::steady_clock::now();
+                clicks_ = train;
+                break;
+            }
+            default: break;
+            }
+        }
+        dirty_ = true;
+    }
+    wake_.notify_all();
+}
+void HostVibrator::click_due() {
+    int amplitude;
+    {
+        std::lock_guard lock(mutex_);
+        if (!clicks_ || std::chrono::steady_clock::now() < clicks_->next) return;
+        amplitude = clicks_->amplitude;
+        if (clicks_->remaining-- > 0) clicks_->next += std::chrono::milliseconds(clicks_->period_ms);
+        else clicks_.reset();
+        if (playing_ != 0) return; // a click while something rumbles is dropped
+    }
+    if (!motor_) return;
+    if (!motor_->play(click_ms, amplitude) && hooks_.log) hooks_.log("WARN", std::string("HostVibrator: ") + motor_->name() + " refused");
 }
 void HostVibrator::on_guest_status(const std::string& vm, std::string_view records) {
     {
@@ -190,7 +250,9 @@ void HostVibrator::on_guest_status(const std::string& vm, std::string_view recor
 void HostVibrator::release(const std::string& vm) {
     {
         std::lock_guard lock(mutex_);
-        if (!magnitudes_.erase(vm)) return;
+        bool was = magnitudes_.erase(vm) != 0;
+        was = magnitudes_.erase(vm + trackpad_key) != 0 || was;
+        if (!was) return;
         dirty_ = true;
     }
     wake_.notify_all();
@@ -212,7 +274,7 @@ void HostVibrator::step() {
     {
         std::lock_guard lock(mutex_);
         magnitude = wanted();
-        if (magnitude == playing_) return;
+        if (magnitude == playing_ && (resolved_ || !clicks_)) return;
         playing_ = magnitude;
     }
     // The motor is only touched here, on one thread.

@@ -72,6 +72,8 @@ struct HostFacts {
     // mode has no device to drive, so none is emitted.
     bool crosvm_trackpad_contacts = false;
     bool crosvm_trackpad_touch_size = false;
+    // ...and haptics=true (HID Haptics waveforms back on the trackpad's socket).
+    bool crosvm_trackpad_haptics = false;
     // The trackpad's side in units (trackpad_side_units()) and whether the
     // phone's panel reports contact size; filled at launch.
     int64_t trackpad_side_units = 300 * 20;
