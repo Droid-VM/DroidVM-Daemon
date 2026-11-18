@@ -5,6 +5,7 @@
 #include "runtime/log.h"
 #include "runtime/cleanup.h"
 #include "services/system.h"
+#include "services/peripheral_foreground.h"
 #include "services/system_blit_probe.h"
 #include "services/hugepage.h"
 #include "services/android_display.h"
@@ -466,6 +467,9 @@ int main(int argc, char** argv) {
             // first, then this owner hands any manual session to its sentinel.
             std::unique_ptr<droidvm::AndroidDisplayService> android_display;
             std::unique_ptr<droidvm::VmService> vms;
+            // Destroyed before vms and after the worker shutdown guard has
+            // stopped them; its worker reads vms until it is joined.
+            std::unique_ptr<droidvm::PeripheralForeground> foreground;
             droidvm::LegacyEvents legacy_events;
             droidvm::TaskLimits task_limits;
             task_limits.background_workers = 2;
@@ -590,6 +594,8 @@ int main(int argc, char** argv) {
                         catch (const std::exception& error) { if (log) log->write("WARN", std::string("usb: state hook failed: ") + error.what()); }
                     if (keyboard) try { keyboard->on_vm_state(id, name, droidvm::vm::command::lower(droidvm::vm_state_name(state))); }
                         catch (const std::exception& error) { if (log) log->write("WARN", std::string("keyboard: state hook failed: ") + error.what()); }
+                    // Never blocks: the raiser recomputes on its own thread.
+                    if (foreground) foreground->changed();
                 };
                 context.input_status = [&](const std::string& id, const std::string& screen, std::string records) {
                     if (keyboard) keyboard->on_guest_status(id, screen, records);
@@ -597,6 +603,43 @@ int main(int argc, char** argv) {
                 // The coordinator loads the inventory itself; it must attach to an empty service.
                 vms = configuration_owner ? std::make_unique<droidvm::VmService>(context, host_preferences.get(), usb_acm.get(), disk_defaults.get())
                     : std::make_unique<droidvm::VmService>(files.get(), context, host_preferences.get(), usb_acm.get(), disk_defaults.get());
+                // The app's foreground service for peripherals that need a
+                // foreground uid; only the installed app's own data directory
+                // may drive it (a fixture daemon must not start app services).
+                if (same) {
+                    droidvm::PeripheralForeground::Hooks raise;
+                    raise.package = DROIDVM_PACKAGE_NAME;
+                    raise.user = static_cast<int>(layout->owner() / 100000); // UserHandle.PER_USER_RANGE
+                    raise.snapshot = [&, internal] {
+                        std::vector<droidvm::PeripheralForeground::VmView> result;
+                        for (const auto& row : vms->list(internal)) {
+                            std::shared_ptr<droidvm::vm::VmRuntime> runtime;
+                            try { runtime = vms->runtime(internal, droidvm::config::uuid(row)); }
+                            catch (const droidvm::ServiceError& error) {
+                                if (error.code() == droidvm::ErrorCode::not_found) continue;
+                                throw;
+                            }
+                            result.push_back({runtime->state(), runtime->config()});
+                        }
+                        return result;
+                    };
+                    raise.facts = [data, cancelled = context.shutting_down] {
+                        droidvm::ForegroundFacts facts;
+                        facts.crosvm_uvc_camera = droidvm::vm::crosvm_run_option_supported((data / "usr/bin/crosvm").string(),
+                            (data / "usr/lib").string(), "--uvc-camera", cancelled);
+                        return facts;
+                    };
+                    raise.run = [](const std::vector<std::string>& argv, std::string& output) {
+                        droidvm::ChildOptions options;
+                        options.argv = argv;
+                        const auto result = droidvm::Child(options).communicate({}, std::chrono::seconds(20), 64u << 10);
+                        output = result.output + result.error;
+                        while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) output.pop_back();
+                        return result.timed_out ? -1 : result.exit_code;
+                    };
+                    raise.log = [&](const char* level, const std::string& text) { if (log) log->write(level, text); };
+                    foreground = std::make_unique<droidvm::PeripheralForeground>(std::move(raise));
+                }
                 if (same) {
                     droidvm::HugepageProcessOptions options;
                     options.running_vms = [&, internal] {

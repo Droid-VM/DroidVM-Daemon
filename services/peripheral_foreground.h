@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include "vm/runtime.h"
+#include <json/json.h>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+// Keeps the app's PeripheralForegroundService in step with the VMs this daemon
+// runs (the job of the Java daemon's PeripheralForegroundControl).
+//
+// crosvm runs under the app's uid but outside ActivityManager, so host APIs
+// gated on a foreground uid (the camera's AppOp) only work while some process
+// ActivityManager manages holds the uid foreground. A foreground service in
+// the app does that, and only a root caller may start one while the app is in
+// the background, which is why the daemon raises it: as root, through
+//   am start-foreground-service --user <u> -n <pkg>/<service> --ei types <mask>
+// and `am stopservice` once no running VM needs it.
+//
+// The rule is one pure function, foreground_request(): a VM that is not
+// STOPPED is a VM whose devices exist (STARTING counts: the request goes out
+// before crosvm is spawned, and the guest opens a camera seconds into its
+// boot), and only rows the backend really attaches count.
+namespace droidvm {
+// android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_*
+inline constexpr int foreground_type_location = 0x08;
+inline constexpr int foreground_type_camera = 0x40;
+// What a launch would attach, as far as the foreground rule needs to know.
+struct ForegroundFacts {
+    bool crosvm_uvc_camera = false; // HostFacts::crosvm_uvc_camera
+};
+// One request to the service: the intent extras it reads.
+struct ForegroundRequest {
+    int types = 0; // EXTRA_TYPES; 0 stops the service
+    // Extension points, each one more extra on the same intent and folded the
+    // same way over every VM (see PeripheralForegroundService):
+    //  - GNSS: a VIRTIO_GNSS row adds foreground_type_location and its
+    //    sources go in a "gnss_sources" int extra.
+    //  - camera_keep_screen_on (default on): with foreground_type_camera in
+    //    types, a "keep_screen_on" boolean extra the service holds a display
+    //    wake lock for.
+    bool operator==(const ForegroundRequest&) const = default;
+};
+// The request one VM in [state] with [config] (migrated VM JSON) makes.
+ForegroundRequest foreground_request(vm::State state, const Json::Value& config, const ForegroundFacts& facts);
+// The union over every VM.
+ForegroundRequest foreground_union(const std::vector<ForegroundRequest>& requests);
+// The `am` command line for [request]: a start for a non-zero mask, a stop for zero.
+std::vector<std::string> foreground_command(const ForegroundRequest& request, const std::string& package, int user);
+// Whether `am` took the request. A start refused by ActivityManager prints
+// "Error: ..." (no service, permission, background start); a stop of a service
+// that is not running is fine.
+bool foreground_accepted(const ForegroundRequest& request, int exit_code, const std::string& output);
+inline constexpr const char* peripheral_foreground_service = "cn.classfun.droidvm.lib.peripheral.PeripheralForegroundService";
+
+class PeripheralForeground {
+public:
+    struct VmView { vm::State state = vm::State::stopped; Json::Value config; };
+    struct Hooks {
+        std::function<std::vector<VmView>()> snapshot; // every VM this daemon runs
+        std::function<ForegroundFacts()> facts;
+        // Runs argv; returns exit code (negative: could not run), output in [output].
+        std::function<int(const std::vector<std::string>& argv, std::string& output)> run;
+        std::function<void(const char* level, const std::string& text)> log;
+        std::string package;
+        int user = 0;
+        // A refused request is not remembered: it is retried after these
+        // delays (the last repeats) while it is still wanted, and on the next
+        // state change.
+        std::vector<std::chrono::milliseconds> retry = {std::chrono::seconds(2), std::chrono::seconds(10), std::chrono::seconds(60)};
+    };
+    explicit PeripheralForeground(Hooks hooks);
+    // Stops the service if it was raised, then joins the worker.
+    ~PeripheralForeground();
+    PeripheralForeground(const PeripheralForeground&) = delete;
+    PeripheralForeground& operator=(const PeripheralForeground&) = delete;
+    // Any VM changed state. Never blocks: `am` takes a second and the caller
+    // is the VM's own state transition.
+    void changed();
+    // Waits until the worker has nothing pending (tests).
+    void settle();
+private:
+    void work();
+    bool apply(const ForegroundRequest& wanted);
+    Hooks hooks_;
+    std::mutex mutex_;
+    std::condition_variable wake_, idle_;
+    bool dirty_ = false, closing_ = false, busy_ = false;
+    // What the service was last given; empty after a refusal, so the next
+    // pass asks again even for the same request.
+    std::optional<ForegroundRequest> applied_ = ForegroundRequest{};
+    size_t failures_ = 0;
+    std::thread worker_;
+};
+}
