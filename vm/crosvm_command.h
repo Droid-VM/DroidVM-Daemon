@@ -85,6 +85,9 @@ struct HostFacts {
     // The installed crosvm lists --virtio-mmio-snd; an MMIO VM's sound cards
     // stay on PCI without it.
     bool crosvm_virtio_mmio_snd = false;
+    // The installed crosvm lists --virtio-mmio-media; the virtio-media devices
+    // stay on PCI without it.
+    bool crosvm_virtio_mmio_media = false;
     // The installed crosvm's --serial takes name=NAME (a named virtio-console
     // port). Without it the GNSS receiver's port is left out.
     bool crosvm_serial_name = false;

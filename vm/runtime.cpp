@@ -915,6 +915,7 @@ bool VmRuntime::launch(const Json::Value& config, const BootPlan& plan, std::str
         }
         host.crosvm_motion_magnetometer = supported("magnetometer");
         host.crosvm_virtio_mmio_snd = supported("--virtio-mmio-snd");
+        host.crosvm_virtio_mmio_media = supported("--virtio-mmio-media");
         // The --serial synopsis: "...,[hardware=HW,name=NAME,num=NUM,...".
         host.crosvm_serial_name = supported("hardware=HW,name=NAME");
         host.crosvm_input_vibrator = supported("vibrator");

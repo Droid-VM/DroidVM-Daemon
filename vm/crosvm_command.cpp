@@ -23,7 +23,7 @@ const Names sound_underruns{"SILENCE", "REPEAT", "WSOLA", "LPC"};
 const Names serial_hardware{"SERIAL", "SBSA", "VIRTIO_CONSOLE"};
 const Names serial_backends{"SINK", "APP_CONSOLE", "FILE", "UNIX", "UNIX_STREAM", "PTY", "STDOUT", "SYSLOG", "USB_ACM"};
 const Names kms_planes{"SPLIT", "SINGLE"};
-const Names virtio_transports{"PCI", "MMIO"};
+const Names virtio_transports{"PCI", "MMIO", "CUSTOM"};
 // VmmLogLevel: what --log-level crosvm does with no flag, and what a filter
 // may be at most.
 constexpr const char* vmm_log_level_key = "log_level";
@@ -369,6 +369,24 @@ struct Builder {
     // VirtioTransport.fromItem: how the guest finds its virtio devices. A
     // config without the key is a PCI VM, what crosvm does with no flag.
     bool mmio() const { return java_enum(item, "virtio_transport", "PCI", virtio_transports) == "MMIO"; }
+    // Whether [device_class] (block, input, net, gpu, snd, media, console) goes
+    // to virtio-mmio: all of them on an MMIO VM, the ones listed in virtio_mmio
+    // on a CUSTOM VM (a guest with drivers for both buses, such as macOS).
+    bool mmio_for(const char* device_class) const {
+        const auto transport = java_enum(item, "virtio_transport", "PCI", virtio_transports);
+        if (transport == "MMIO") return true;
+        if (transport != "CUSTOM") return false;
+        const auto& list = member(item, "virtio_mmio");
+        if (list.isArray()) for (const auto& value : list)
+            if (value.isString() && value.asString() == device_class) return true;
+        return false;
+    }
+    // A device the extra options add by hand (e.g. "--virtio-snd").
+    bool extra_has(const char* option) const {
+        const auto& options = member(item, "extra_options");
+        if (options.isArray()) for (const auto& value : options) if (value.isString() && value.asString() == option) return true;
+        return false;
+    }
     // MotionSensors.rowOf: the first VIRTIO_GYROSCOPE row (crosvm has one motion device).
     const Json::Value* motion_row() const {
         const auto& list = member(item, "peripherals");
@@ -475,7 +493,7 @@ struct Builder {
                 arg += ",lock=false";
                 if (readonly) arg += ",ro=true";
                 // A disk is the one virtio device crosvm moves to MMIO one at a time.
-                args.push_back(mmio() ? "--virtio-mmio-block" : "--block");
+                args.push_back(mmio_for("block") ? "--virtio-mmio-block" : "--block");
             } else continue;
             args.push_back(arg);
         }
@@ -753,19 +771,19 @@ struct Builder {
     // A switch already among the extra options -- how such a VM was configured
     // before the setting existed -- is not repeated.
     void virtio_transport(CrosvmLaunch& launch) {
-        if (!mmio()) return;
         std::set<std::string> extra;
         const auto& options = member(item, "extra_options");
         if (options.isArray()) for (const auto& option : options) if (option.isString()) extra.insert(option.asString());
-        for (const char* flag : {"--virtio-mmio-input", "--virtio-mmio-net", "--virtio-mmio-gpu"})
-            if (!extra.contains(flag)) args.push_back(flag);
+        for (const auto& [name, flag] : {std::pair{"input", "--virtio-mmio-input"}, std::pair{"net", "--virtio-mmio-net"},
+                                         std::pair{"gpu", "--virtio-mmio-gpu"}})
+            if (mmio_for(name) && !extra.contains(flag)) args.push_back(flag);
         // The sound card's switch only when there is a card: it moves every
         // --virtio-snd the peripheral list emits.
-        bool sound = false;
+        bool sound = extra.contains("--virtio-snd");
         const auto& list = member(item, "peripherals");
         if (list.isArray()) for (const auto& peripheral : list)
             sound = sound || java_enum(peripheral, "type", "VIRTIO_SOUND", peripheral_types) == "VIRTIO_SOUND";
-        if (sound && !extra.contains("--virtio-mmio-snd")) {
+        if (sound && mmio_for("snd") && !extra.contains("--virtio-mmio-snd")) {
             if (host.crosvm_virtio_mmio_snd) args.push_back("--virtio-mmio-snd");
             else launch.warnings.push_back("this crosvm has no --virtio-mmio-snd; the sound card stays on PCI");
         }
@@ -777,10 +795,19 @@ struct Builder {
         const auto& ports = member(item, "serial_ports");
         if (ports.isArray()) for (const auto& port : ports)
             console = console || java_enum(port, "hardware", "SERIAL", serial_hardware) == "VIRTIO_CONSOLE";
-        if (console && !extra.contains("--virtio-mmio-console")) {
+        if (console && mmio_for("console") && !extra.contains("--virtio-mmio-console")) {
             if (host.crosvm_virtio_mmio_console) args.push_back("--virtio-mmio-console");
             else launch.warnings.push_back("this crosvm has no --virtio-mmio-console; the virtio-console ports stay on PCI");
         }
+    }
+    // The virtio-media devices (the VPU's codecs, virtio-media cameras, or ones
+    // the extra options add) to virtio-mmio. After they are emitted, since the
+    // switch only means something when there is one.
+    void virtio_mmio_media(CrosvmLaunch& launch) {
+        if (!mmio_for("media") || extra_has("--virtio-mmio-media")) return;
+        if (std::find(args.begin(), args.end(), "--virtio-media") == args.end() && !extra_has("--virtio-media")) return;
+        if (host.crosvm_virtio_mmio_media) args.push_back("--virtio-mmio-media");
+        else launch.warnings.push_back("this crosvm has no --virtio-mmio-media; the video devices stay on PCI");
     }
     // HostAudioTable.PATH; the dump path is a literal in the Java too.
     // HostAudioDevices.ATTR_SEPARATOR: a host_device key is the endpoint, then
@@ -1168,6 +1195,7 @@ struct Builder {
         virtio_transport(launch);
         peripherals(launch);
         codec_devices(launch);
+        virtio_mmio_media(launch);
         serials(launch);
         mbi(launch);
         extra_options(item, args);
