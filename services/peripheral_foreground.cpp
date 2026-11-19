@@ -39,6 +39,12 @@ ForegroundRequest foreground_request(vm::State state, const Json::Value& config,
         // A virtio-media camera row only on a VM that really attaches it: the
         // VPU switch on, Gunyah, the uid known -- the command builder's rule.
         if (type == "VIRTIO_CAMERA" && vm::virtio_camera_attached(config, camera_host)) request.types |= foreground_type_camera;
+        // virtio-snd plays through an app-uid helper that ActivityManager does
+        // not manage, and Android 17 mutes background playback from a uid that
+        // does not hold the foreground-audio capability. mediaPlayback is the
+        // type that grants it; measured on Android 17, playback survives
+        // backgrounding while the service carries it.
+        if (type == "VIRTIO_SOUND") request.types |= foreground_type_media_playback;
     }
     // The bit comes from the mask itself: a VM that raises the camera type
     // and has not switched the display hold off.

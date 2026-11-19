@@ -29,6 +29,7 @@
 // boot), and only rows the backend really attaches count.
 namespace droidvm {
 // android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_*
+inline constexpr int foreground_type_media_playback = 0x02;
 inline constexpr int foreground_type_location = 0x08;
 inline constexpr int foreground_type_camera = 0x40;
 // What a launch would attach, as far as the foreground rule needs to know.
